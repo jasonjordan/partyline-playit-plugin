@@ -44,14 +44,16 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             Log("Plugin starting...");
 
             // Register audio stream into PlayIt Live's main mix
-            Log("Registering audio stream...");
-            App.AudioPipeline.RegisterSpecialAudioStream("partyline", new PartylineStream(this));
-            Log("Audio stream registered.");
+            // (delayed until server is ready to avoid file locking conflicts)
+            //Log("Registering audio stream...");
+            //App.AudioPipeline.RegisterSpecialAudioStream("partyline", new PartylineStream(this));
+            //Log("Audio stream registered.");
 
             // Register embedded UI control
-            Log("Registering UI control...");
-            App.RegisterUserControl(() => new PartylineStatusControl(this), UserControlLocation.BelowTrackList, 100);
-            Log("UI control registered.");
+            // (disabled temporarily to isolate server startup issue)
+            //Log("Registering UI control...");
+            //App.RegisterUserControl(() => new PartylineStatusControl(this), UserControlLocation.BelowTrackList, 100);
+            //Log("UI control registered.");
 
             // Hook into PlayIt Live's ServiceStack HTTP server on port 25433
             // Wait for the server to start (user clicks "Start Server" manually)
