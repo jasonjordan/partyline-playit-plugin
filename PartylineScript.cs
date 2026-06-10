@@ -70,59 +70,53 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
     private void WaitAndHook()
     {
-        // Wait until ServiceStack server is actually listening
-        Log("Waiting for ServiceStack server to start...");
-        bool hooked = false;
-        for (int i = 0; i < 300; i++) // Wait up to 5 minutes
+        Log("Waiting for ServiceStack server...");
+        // Give PlayIt Live a few seconds to start
+        Thread.Sleep(5000);
+
+        try
         {
-            Thread.Sleep(2000);
-            if (_cts.IsCancellationRequested) return;
-
-            try
+            Type hostType = null;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
-                Type hostType = null;
-                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-                {
-                    hostType = asm.GetType("ServiceStack.ServiceStackHost");
-                    if (hostType != null) break;
-                }
-                if (hostType == null) continue;
+                hostType = asm.GetType("ServiceStack.ServiceStackHost");
+                if (hostType != null) break;
+            }
 
-                var instanceProp = hostType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
-                if (instanceProp == null) continue;
-
-                var instance = instanceProp.GetValue(null);
-                if (instance == null) continue;
-
-                // Check ReadyAt property directly
-                var readyAtProp = instance.GetType().GetProperty("ReadyAt", BindingFlags.Public | BindingFlags.Instance);
-                if (readyAtProp != null)
-                {
-                    var readyAt = readyAtProp.GetValue(instance);
-                    if (readyAt == null)
-                    {
-                        if (i % 10 == 0) Log("Server not ready yet (ReadyAt is null), waiting...");
-                        continue;
-                    }
-                    Log("Server is ready! ReadyAt = " + readyAt);
-                }
-                else
-                {
-                    // No ReadyAt - just wait a bit after finding instance
-                    Log("No ReadyAt property found, waiting 5s then hooking...");
-                    Thread.Sleep(5000);
-                }
-
-                HookIntoServiceStack();
-                hooked = true;
+            if (hostType == null)
+            {
+                Log("ERROR: ServiceStackHost type not found");
                 return;
             }
-            catch (Exception ex)
+
+            var instanceProp = hostType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
+            var instance = instanceProp.GetValue(null);
+
+            if (instance == null)
             {
-                Log("WaitAndHook check error: " + ex.Message);
+                Log("Instance is null after 5s, waiting more...");
+                for (int i = 0; i < 60; i++)
+                {
+                    Thread.Sleep(2000);
+                    if (_cts.IsCancellationRequested) return;
+                    instance = instanceProp.GetValue(null);
+                    if (instance != null) break;
+                }
             }
+
+            if (instance == null)
+            {
+                Log("ERROR: Instance never became non-null");
+                return;
+            }
+
+            Log("Found instance: " + instance.GetType().FullName + ". Hooking now.");
+            HookIntoServiceStack();
         }
-        Log("Timed out waiting for ServiceStack server.");
+        catch (Exception ex)
+        {
+            Log("WaitAndHook error: " + ex.ToString());
+        }
     }
 
     private void HookIntoServiceStack()
