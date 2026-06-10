@@ -48,15 +48,17 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     private void StartServer()
     {
         // Try port 25433 with /partyline/ prefix (shared with PlayIt Live)
-        if (!TryListen($"http://+:{_activePort}{URL_PATH}"))
+        string prefix = "http://+:" + _activePort + URL_PATH;
+        if (!TryListen(prefix))
         {
             // Try registering URL ACL
             TryRegisterUrlAcl(_activePort);
-            if (!TryListen($"http://+:{_activePort}{URL_PATH}"))
+            if (!TryListen(prefix))
             {
                 // Fallback to port 8080
                 _activePort = 8080;
-                if (!TryListen($"http://+:{_activePort}{URL_PATH}"))
+                prefix = "http://+:" + _activePort + URL_PATH;
+                if (!TryListen(prefix))
                 {
                     App.Log("Partyline: Failed to start HTTP server");
                     return;
@@ -64,7 +66,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             }
         }
 
-        App.Log($"Partyline: Listening on port {_activePort}");
+        App.Log("Partyline: Listening on port " + _activePort);
 
         while (!_cts.IsCancellationRequested)
         {
@@ -74,7 +76,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
                 ThreadPool.QueueUserWorkItem(_ => HandleRequest(ctx));
             }
             catch (HttpListenerException) { break; }
-            catch (Exception ex) { App.Log($"Partyline error: {ex.Message}"); }
+            catch (Exception ex) { App.Log("Partyline error: " + ex.Message); }
         }
     }
 
@@ -98,7 +100,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             var psi = new System.Diagnostics.ProcessStartInfo
             {
                 FileName = "netsh",
-                Arguments = $"http add urlacl url=http://+:{port}{URL_PATH} user=Everyone",
+                Arguments = "http add urlacl url=http://+:" + port + URL_PATH + " user=Everyone",
                 Verb = "runas",
                 UseShellExecute = true,
                 CreateNoWindow = true
@@ -128,7 +130,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
                     ServeHtml(ctx.Response, GetCoHostPage());
                     break;
                 case "api/status":
-                    ServeJson(ctx.Response, $"{{\"connected\":{_cohosts.Count}}}");
+                    ServeJson(ctx.Response, "{\"connected\":" + _cohosts.Count + "}");
                     break;
                 default:
                     ctx.Response.StatusCode = 404;
@@ -149,7 +151,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         var id = Guid.NewGuid().ToString("N").Substring(0, 8);
         var cohost = new CoHostConnection(id, ws);
         _cohosts[id] = cohost;
-        App.Log($"Partyline: Co-host {id} connected");
+        App.Log("Partyline: Co-host " + id + " connected");
 
         var buffer = new byte[8192];
         try
@@ -185,7 +187,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         {
             CoHostConnection removed;
             _cohosts.TryRemove(id, out removed);
-            App.Log($"Partyline: Co-host {id} disconnected");
+            App.Log("Partyline: Co-host " + id + " disconnected");
             try { ws.Dispose(); } catch { }
         }
     }
@@ -213,7 +215,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
     // Public accessors for UI
     public int GetCoHostCount() { return _cohosts.Count; }
-    public string GetLink() { return $"http://{Dns.GetHostName()}:{_activePort}/partyline/join"; }
+    public string GetLink() { return "http://" + Dns.GetHostName() + ":" + _activePort + "/partyline/join"; }
 
     public void MuteAll()
     {
@@ -274,8 +276,8 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
     public override void Cleanup()
     {
-        _cts?.Cancel();
-        _listener?.Stop();
+        if (_cts != null) _cts.Cancel();
+        if (_listener != null) _listener.Stop();
         KickAll();
     }
 
@@ -386,7 +388,7 @@ public class CoHostConnection
 {
     public string Id { get; set; }
     public WebSocket Socket { get; set; }
-    public float Volume { get; set; } = 1.0f;
+    public float Volume { get; set; }
     public bool Muted { get; set; }
     public float LastLevel { get; set; }
 
@@ -394,6 +396,9 @@ public class CoHostConnection
     {
         Id = id;
         Socket = socket;
+        Volume = 1.0f;
+        Muted = false;
+        LastLevel = 0f;
     }
 }
 
@@ -467,13 +472,13 @@ public class PartylineStatusControl : UserControl
         Controls.Add(layout);
 
         _timer = new Timer { Interval = 1000 };
-        _timer.Tick += (s, e) => { _label.Text = $"🎙️ Partyline: {_plugin.GetCoHostCount()} connected"; };
+        _timer.Tick += (s, e) => { _label.Text = "🎙️ Partyline: " + _plugin.GetCoHostCount() + " connected"; };
         _timer.Start();
     }
 
     protected override void Dispose(bool disposing)
     {
-        _timer?.Stop(); _timer?.Dispose();
+        if (_timer != null) { _timer.Stop(); _timer.Dispose(); }
         base.Dispose(disposing);
     }
 }
