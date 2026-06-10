@@ -16,6 +16,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     private CancellationTokenSource _cts;
     private int _activePort = 25434;
     private static string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Partyline", "partyline.log");
+    private SettingsManager _settingsManager = new SettingsManager();
 
     // Co-host sessions
     private ConcurrentDictionary<string, CoHostState> _cohosts = new ConcurrentDictionary<string, CoHostState>();
@@ -464,6 +465,12 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     {
         if (_cts != null) _cts.Cancel();
         KickAll();
+    }
+
+    public override void Configure()
+    {
+        var form = new PartylineConfigForm(_settingsManager);
+        form.ShowDialog();
     }
 
     private string GetCoHostPage()
@@ -1102,6 +1109,268 @@ public class SettingsManager
 
         sb.Append("\"");
         return sb.ToString();
+    }
+}
+
+public class PartylineConfigForm : Form
+{
+    private SettingsManager _settingsManager;
+    private List<CoHostAccount> _accounts;
+    private DataGridView _grid;
+    private Panel _editPanel;
+    private TextBox _txtUsername;
+    private TextBox _txtPassword;
+    private TextBox _txtDisplayName;
+    private Button _btnSave;
+    private Button _btnCancel;
+    private Button _btnAdd;
+    private int _editingIndex;
+
+    public PartylineConfigForm(SettingsManager settingsManager)
+    {
+        _settingsManager = settingsManager;
+        _accounts = _settingsManager.Load();
+        _editingIndex = -1;
+        InitializeFormComponents();
+        LoadGrid();
+    }
+
+    private void InitializeFormComponents()
+    {
+        Text = "Partyline Co-Host Configuration";
+        Width = 550;
+        Height = 480;
+        StartPosition = FormStartPosition.CenterParent;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
+
+        Label lblTitle = new Label();
+        lblTitle.Text = "Co-Host Accounts:";
+        lblTitle.Location = new System.Drawing.Point(12, 12);
+        lblTitle.AutoSize = true;
+        lblTitle.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+        Controls.Add(lblTitle);
+
+        // DataGridView for account list
+        _grid = new DataGridView();
+        _grid.Location = new System.Drawing.Point(12, 36);
+        _grid.Size = new System.Drawing.Size(510, 200);
+        _grid.AllowUserToAddRows = false;
+        _grid.AllowUserToDeleteRows = false;
+        _grid.AllowUserToResizeRows = false;
+        _grid.ReadOnly = true;
+        _grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        _grid.MultiSelect = false;
+        _grid.RowHeadersVisible = false;
+        _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+        _grid.BackgroundColor = System.Drawing.SystemColors.Window;
+
+        DataGridViewTextBoxColumn colUsername = new DataGridViewTextBoxColumn();
+        colUsername.Name = "Username";
+        colUsername.HeaderText = "Username";
+        colUsername.FillWeight = 35;
+        _grid.Columns.Add(colUsername);
+
+        DataGridViewTextBoxColumn colDisplay = new DataGridViewTextBoxColumn();
+        colDisplay.Name = "DisplayName";
+        colDisplay.HeaderText = "Display Name";
+        colDisplay.FillWeight = 35;
+        _grid.Columns.Add(colDisplay);
+
+        DataGridViewButtonColumn colEdit = new DataGridViewButtonColumn();
+        colEdit.Name = "Edit";
+        colEdit.HeaderText = "";
+        colEdit.Text = "Edit";
+        colEdit.UseColumnTextForButtonValue = true;
+        colEdit.FillWeight = 15;
+        _grid.Columns.Add(colEdit);
+
+        DataGridViewButtonColumn colDelete = new DataGridViewButtonColumn();
+        colDelete.Name = "Delete";
+        colDelete.HeaderText = "";
+        colDelete.Text = "Delete";
+        colDelete.UseColumnTextForButtonValue = true;
+        colDelete.FillWeight = 15;
+        _grid.Columns.Add(colDelete);
+
+        _grid.CellContentClick += OnGridCellContentClick;
+        Controls.Add(_grid);
+
+        // Add button
+        _btnAdd = new Button();
+        _btnAdd.Text = "+ Add Co-Host";
+        _btnAdd.Location = new System.Drawing.Point(12, 244);
+        _btnAdd.Size = new System.Drawing.Size(120, 28);
+        _btnAdd.Click += OnAddClick;
+        Controls.Add(_btnAdd);
+
+        // Edit panel
+        _editPanel = new Panel();
+        _editPanel.Location = new System.Drawing.Point(12, 280);
+        _editPanel.Size = new System.Drawing.Size(510, 150);
+        _editPanel.Visible = false;
+
+        Label lblSep = new Label();
+        lblSep.Text = "Add/Edit Co-Host:";
+        lblSep.Location = new System.Drawing.Point(0, 0);
+        lblSep.AutoSize = true;
+        lblSep.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+        _editPanel.Controls.Add(lblSep);
+
+        Label lblUser = new Label();
+        lblUser.Text = "Username:";
+        lblUser.Location = new System.Drawing.Point(0, 28);
+        lblUser.AutoSize = true;
+        _editPanel.Controls.Add(lblUser);
+
+        _txtUsername = new TextBox();
+        _txtUsername.Location = new System.Drawing.Point(100, 25);
+        _txtUsername.Size = new System.Drawing.Size(200, 22);
+        _editPanel.Controls.Add(_txtUsername);
+
+        Label lblPass = new Label();
+        lblPass.Text = "Password:";
+        lblPass.Location = new System.Drawing.Point(0, 56);
+        lblPass.AutoSize = true;
+        _editPanel.Controls.Add(lblPass);
+
+        _txtPassword = new TextBox();
+        _txtPassword.Location = new System.Drawing.Point(100, 53);
+        _txtPassword.Size = new System.Drawing.Size(200, 22);
+        _txtPassword.UseSystemPasswordChar = true;
+        _editPanel.Controls.Add(_txtPassword);
+
+        Label lblDisplayName = new Label();
+        lblDisplayName.Text = "Display Name:";
+        lblDisplayName.Location = new System.Drawing.Point(0, 84);
+        lblDisplayName.AutoSize = true;
+        _editPanel.Controls.Add(lblDisplayName);
+
+        _txtDisplayName = new TextBox();
+        _txtDisplayName.Location = new System.Drawing.Point(100, 81);
+        _txtDisplayName.Size = new System.Drawing.Size(200, 22);
+        _editPanel.Controls.Add(_txtDisplayName);
+
+        _btnSave = new Button();
+        _btnSave.Text = "Save";
+        _btnSave.Location = new System.Drawing.Point(100, 115);
+        _btnSave.Size = new System.Drawing.Size(80, 28);
+        _btnSave.Click += OnSaveClick;
+        _editPanel.Controls.Add(_btnSave);
+
+        _btnCancel = new Button();
+        _btnCancel.Text = "Cancel";
+        _btnCancel.Location = new System.Drawing.Point(190, 115);
+        _btnCancel.Size = new System.Drawing.Size(80, 28);
+        _btnCancel.Click += OnCancelClick;
+        _editPanel.Controls.Add(_btnCancel);
+
+        Controls.Add(_editPanel);
+    }
+
+    private void LoadGrid()
+    {
+        _grid.Rows.Clear();
+        for (int i = 0; i < _accounts.Count; i++)
+        {
+            CoHostAccount acct = _accounts[i];
+            _grid.Rows.Add(acct.Username, acct.DisplayName);
+        }
+    }
+
+    private void OnGridCellContentClick(object sender, DataGridViewCellEventArgs e)
+    {
+        if (e.RowIndex < 0) return;
+
+        if (_grid.Columns[e.ColumnIndex].Name == "Edit")
+        {
+            BeginEdit(e.RowIndex);
+        }
+        else if (_grid.Columns[e.ColumnIndex].Name == "Delete")
+        {
+            _accounts.RemoveAt(e.RowIndex);
+            _settingsManager.Save(_accounts);
+            LoadGrid();
+            HideEditPanel();
+        }
+    }
+
+    private void OnAddClick(object sender, EventArgs e)
+    {
+        _editingIndex = -1;
+        _txtUsername.Text = "";
+        _txtPassword.Text = "";
+        _txtDisplayName.Text = "";
+        _txtUsername.Enabled = true;
+        _editPanel.Visible = true;
+    }
+
+    private void BeginEdit(int index)
+    {
+        if (index < 0 || index >= _accounts.Count) return;
+        _editingIndex = index;
+        CoHostAccount acct = _accounts[index];
+        _txtUsername.Text = acct.Username;
+        _txtPassword.Text = acct.Password;
+        _txtDisplayName.Text = acct.DisplayName;
+        _txtUsername.Enabled = false;
+        _editPanel.Visible = true;
+    }
+
+    private void OnSaveClick(object sender, EventArgs e)
+    {
+        string username = _txtUsername.Text.Trim();
+        string password = _txtPassword.Text;
+        string displayName = _txtDisplayName.Text.Trim();
+
+        if (string.IsNullOrEmpty(username))
+        {
+            MessageBox.Show("Username is required.", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (string.IsNullOrEmpty(password))
+        {
+            MessageBox.Show("Password is required.", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (_editingIndex < 0)
+        {
+            // Adding new account
+            CoHostAccount newAcct = new CoHostAccount();
+            newAcct.Username = username;
+            newAcct.Password = password;
+            newAcct.DisplayName = string.IsNullOrEmpty(displayName) ? username : displayName;
+            _accounts.Add(newAcct);
+        }
+        else
+        {
+            // Editing existing account
+            CoHostAccount existing = _accounts[_editingIndex];
+            existing.Username = username;
+            existing.Password = password;
+            existing.DisplayName = string.IsNullOrEmpty(displayName) ? username : displayName;
+        }
+
+        _settingsManager.Save(_accounts);
+        LoadGrid();
+        HideEditPanel();
+    }
+
+    private void OnCancelClick(object sender, EventArgs e)
+    {
+        HideEditPanel();
+    }
+
+    private void HideEditPanel()
+    {
+        _editPanel.Visible = false;
+        _editingIndex = -1;
+        _txtUsername.Text = "";
+        _txtPassword.Text = "";
+        _txtDisplayName.Text = "";
     }
 }
 
