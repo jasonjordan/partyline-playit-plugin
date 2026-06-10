@@ -18,7 +18,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     private static string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Partyline", "partyline.log");
 
     // Co-host sessions
-    private ConcurrentDictionary<string, CoHostConnection> _cohosts = new ConcurrentDictionary<string, CoHostConnection>();
+    private ConcurrentDictionary<string, CoHostState> _cohosts = new ConcurrentDictionary<string, CoHostState>();
 
     // Audio ring buffer for mixed co-host audio (44100Hz mono 16-bit)
     private short[] _ringBuffer = new short[44100 * 2];
@@ -454,8 +454,8 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     public int GetCoHostCount() { return _cohosts.Count; }
     public string GetLink() { return "https://" + Dns.GetHostName() + ":25434/partyline/join"; }
 
-    public void MuteAll() { foreach (var c in _cohosts.Values) c.Muted = true; }
-    public void UnmuteAll() { foreach (var c in _cohosts.Values) c.Muted = false; }
+    public void MuteAll() { foreach (var c in _cohosts.Values) c.IsMuted = true; }
+    public void UnmuteAll() { foreach (var c in _cohosts.Values) c.IsMuted = false; }
     public void KickAll() { _cohosts.Clear(); }
 
     internal string GetCoHostPageHtml() { return GetCoHostPage(); }
@@ -541,21 +541,568 @@ function pttOff(){sending=false;document.getElementById('ptt').className='btn pt
     }
 }
 
+// --- AuthenticationManager ---
+
+public class AuthenticationManager
+{
+    private List<CoHostAccount> _accounts;
+    private ConcurrentDictionary<string, ActiveSession> _sessions;
+    private readonly object _accountsLock;
+
+    public AuthenticationManager()
+    {
+        _accounts = new List<CoHostAccount>();
+        _sessions = new ConcurrentDictionary<string, ActiveSession>();
+        _accountsLock = new object();
+    }
+
+    public AuthResult Authenticate(string username, string password)
+    {
+        if (username == null || password == null)
+        {
+            AuthResult failResult = new AuthResult();
+            failResult.Success = false;
+            failResult.Error = "Invalid credentials";
+            return failResult;
+        }
+
+        CoHostAccount matchedAccount = null;
+
+        lock (_accountsLock)
+        {
+            for (int i = 0; i < _accounts.Count; i++)
+            {
+                CoHostAccount acct = _accounts[i];
+                if (acct.Username != null && acct.Password != null &&
+                    acct.Username.Equals(username, StringComparison.OrdinalIgnoreCase) &&
+                    acct.Password.Equals(password, StringComparison.Ordinal))
+                {
+                    matchedAccount = acct;
+                    break;
+                }
+            }
+        }
+
+        if (matchedAccount == null)
+        {
+            AuthResult failResult = new AuthResult();
+            failResult.Success = false;
+            failResult.Error = "Invalid credentials";
+            return failResult;
+        }
+
+        string token = Guid.NewGuid().ToString("N");
+        ActiveSession session = new ActiveSession();
+        session.Token = token;
+        session.CohostId = matchedAccount.Username;
+        session.DisplayName = matchedAccount.DisplayName;
+        session.CreatedAt = DateTime.UtcNow;
+
+        _sessions[token] = session;
+
+        AuthResult successResult = new AuthResult();
+        successResult.Success = true;
+        successResult.Token = token;
+        successResult.DisplayName = matchedAccount.DisplayName;
+        return successResult;
+    }
+
+    public bool ValidateToken(string token, out string cohostId)
+    {
+        cohostId = null;
+        if (token == null)
+        {
+            return false;
+        }
+
+        ActiveSession session;
+        if (_sessions.TryGetValue(token, out session))
+        {
+            cohostId = session.CohostId;
+            return true;
+        }
+
+        return false;
+    }
+
+    public void InvalidateSession(string cohostId)
+    {
+        if (cohostId == null)
+        {
+            return;
+        }
+
+        List<string> tokensToRemove = new List<string>();
+        foreach (var kvp in _sessions)
+        {
+            if (kvp.Value.CohostId != null &&
+                kvp.Value.CohostId.Equals(cohostId, StringComparison.OrdinalIgnoreCase))
+            {
+                tokensToRemove.Add(kvp.Key);
+            }
+        }
+
+        for (int i = 0; i < tokensToRemove.Count; i++)
+        {
+            ActiveSession removed;
+            _sessions.TryRemove(tokensToRemove[i], out removed);
+        }
+    }
+
+    public void InvalidateAllSessions()
+    {
+        _sessions.Clear();
+    }
+
+    public void SetAccounts(List<CoHostAccount> accounts)
+    {
+        if (accounts == null)
+        {
+            accounts = new List<CoHostAccount>();
+        }
+
+        lock (_accountsLock)
+        {
+            _accounts = new List<CoHostAccount>(accounts);
+        }
+    }
+}
+
 // --- Supporting classes ---
 
-public class CoHostConnection
+public class CoHostAccount
 {
-    public string Id { get; set; }
-    public float Volume { get; set; }
-    public bool Muted { get; set; }
-    public float LastLevel { get; set; }
+    private string _username;
+    private string _password;
+    private string _displayName;
 
-    public CoHostConnection(string id)
+    public string Username
     {
-        Id = id;
-        Volume = 1.0f;
-        Muted = false;
-        LastLevel = 0f;
+        get { return _username; }
+        set { _username = value; }
+    }
+
+    public string Password
+    {
+        get { return _password; }
+        set { _password = value; }
+    }
+
+    public string DisplayName
+    {
+        get { return _displayName; }
+        set { _displayName = value; }
+    }
+}
+
+public class ActiveSession
+{
+    private string _token;
+    private string _cohostId;
+    private string _displayName;
+    private DateTime _createdAt;
+
+    public string Token
+    {
+        get { return _token; }
+        set { _token = value; }
+    }
+
+    public string CohostId
+    {
+        get { return _cohostId; }
+        set { _cohostId = value; }
+    }
+
+    public string DisplayName
+    {
+        get { return _displayName; }
+        set { _displayName = value; }
+    }
+
+    public DateTime CreatedAt
+    {
+        get { return _createdAt; }
+        set { _createdAt = value; }
+    }
+}
+
+public class AuthResult
+{
+    private bool _success;
+    private string _token;
+    private string _displayName;
+    private string _error;
+
+    public bool Success
+    {
+        get { return _success; }
+        set { _success = value; }
+    }
+
+    public string Token
+    {
+        get { return _token; }
+        set { _token = value; }
+    }
+
+    public string DisplayName
+    {
+        get { return _displayName; }
+        set { _displayName = value; }
+    }
+
+    public string Error
+    {
+        get { return _error; }
+        set { _error = value; }
+    }
+}
+
+public class CoHostState
+{
+    private bool _isLive;
+    private bool _isMuted;
+    private bool _isConnected;
+    private CoHostAudioBuffer _buffer;
+
+    public bool IsLive
+    {
+        get { return _isLive; }
+        set { _isLive = value; }
+    }
+
+    public bool IsMuted
+    {
+        get { return _isMuted; }
+        set { _isMuted = value; }
+    }
+
+    public bool IsConnected
+    {
+        get { return _isConnected; }
+        set { _isConnected = value; }
+    }
+
+    public CoHostAudioBuffer Buffer
+    {
+        get { return _buffer; }
+        set { _buffer = value; }
+    }
+}
+
+public class CoHostAudioBuffer
+{
+    private readonly short[] _buffer;
+    private int _writePos;
+    private int _readPos;
+    private int _availableSamples;
+    private float _peakLevel;
+    private readonly object _lock;
+
+    public CoHostAudioBuffer()
+    {
+        _buffer = new short[44100 * 2];
+        _writePos = 0;
+        _readPos = 0;
+        _availableSamples = 0;
+        _peakLevel = 0f;
+        _lock = new object();
+    }
+
+    public void Write(byte[] pcmBytes, int count)
+    {
+        int sampleCount = count / 2;
+        lock (_lock)
+        {
+            float maxAbs = 0f;
+            for (int i = 0; i < sampleCount; i++)
+            {
+                short sample = BitConverter.ToInt16(pcmBytes, i * 2);
+                _buffer[_writePos] = sample;
+                _writePos = (_writePos + 1) % _buffer.Length;
+
+                float absVal = Math.Abs((float)sample) / 32768f;
+                if (absVal > maxAbs)
+                {
+                    maxAbs = absVal;
+                }
+            }
+
+            _availableSamples += sampleCount;
+            if (_availableSamples > _buffer.Length)
+            {
+                // Overflow: advance read pointer to discard oldest
+                int overflow = _availableSamples - _buffer.Length;
+                _readPos = (_readPos + overflow) % _buffer.Length;
+                _availableSamples = _buffer.Length;
+            }
+
+            if (maxAbs > _peakLevel)
+            {
+                _peakLevel = maxAbs;
+            }
+        }
+    }
+
+    public int Read(short[] output, int sampleCount)
+    {
+        lock (_lock)
+        {
+            int toRead = Math.Min(sampleCount, _availableSamples);
+
+            for (int i = 0; i < toRead; i++)
+            {
+                output[i] = _buffer[_readPos];
+                _readPos = (_readPos + 1) % _buffer.Length;
+            }
+
+            // Pad with silence if insufficient samples
+            for (int i = toRead; i < sampleCount; i++)
+            {
+                output[i] = 0;
+            }
+
+            _availableSamples -= toRead;
+            return toRead;
+        }
+    }
+
+    public float GetPeakLevel()
+    {
+        lock (_lock)
+        {
+            float level = _peakLevel;
+            _peakLevel = _peakLevel * 0.95f;
+            return level;
+        }
+    }
+
+    public void Clear()
+    {
+        lock (_lock)
+        {
+            Array.Clear(_buffer, 0, _buffer.Length);
+            _writePos = 0;
+            _readPos = 0;
+            _availableSamples = 0;
+            _peakLevel = 0f;
+        }
+    }
+}
+
+public class SettingsManager
+{
+    private static readonly string SettingsPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "Partyline",
+        "cohosts.json");
+
+    public List<CoHostAccount> Load()
+    {
+        try
+        {
+            if (!File.Exists(SettingsPath))
+            {
+                NewPlugin.LogStatic("Settings file not found at " + SettingsPath + ", starting with empty list");
+                return new List<CoHostAccount>();
+            }
+
+            string json = File.ReadAllText(SettingsPath, Encoding.UTF8);
+            return ParseAccountsJson(json);
+        }
+        catch (Exception ex)
+        {
+            NewPlugin.LogStatic("ERROR loading settings: " + ex.Message);
+            return new List<CoHostAccount>();
+        }
+    }
+
+    private List<CoHostAccount> ParseAccountsJson(string json)
+    {
+        // Simple JSON parser for our known format:
+        // {"accounts":[{"username":"x","password":"y","displayName":"z"}, ...]}
+        var result = new List<CoHostAccount>();
+
+        int accountsIdx = json.IndexOf("\"accounts\"");
+        if (accountsIdx < 0)
+        {
+            NewPlugin.LogStatic("Settings file has no accounts key, starting with empty list");
+            return result;
+        }
+
+        // Find the array start
+        int arrayStart = json.IndexOf('[', accountsIdx);
+        if (arrayStart < 0) return result;
+
+        int arrayEnd = json.LastIndexOf(']');
+        if (arrayEnd < 0) return result;
+
+        string arrayContent = json.Substring(arrayStart + 1, arrayEnd - arrayStart - 1);
+
+        // Split into objects by finding matched braces
+        int depth = 0;
+        int objStart = -1;
+        for (int i = 0; i < arrayContent.Length; i++)
+        {
+            char c = arrayContent[i];
+            if (c == '{')
+            {
+                if (depth == 0) objStart = i;
+                depth++;
+            }
+            else if (c == '}')
+            {
+                depth--;
+                if (depth == 0 && objStart >= 0)
+                {
+                    string objStr = arrayContent.Substring(objStart, i - objStart + 1);
+                    CoHostAccount account = ParseAccountObject(objStr);
+                    if (account != null) result.Add(account);
+                    objStart = -1;
+                }
+            }
+        }
+
+        NewPlugin.LogStatic("Loaded " + result.Count + " co-host accounts from settings");
+        return result;
+    }
+
+    private CoHostAccount ParseAccountObject(string objJson)
+    {
+        var account = new CoHostAccount();
+        account.Username = ExtractJsonStringValue(objJson, "username");
+        account.Password = ExtractJsonStringValue(objJson, "password");
+        account.DisplayName = ExtractJsonStringValue(objJson, "displayName");
+        return account;
+    }
+
+    private string ExtractJsonStringValue(string json, string key)
+    {
+        string searchKey = "\"" + key + "\"";
+        int keyIdx = json.IndexOf(searchKey);
+        if (keyIdx < 0) return null;
+
+        int colonIdx = json.IndexOf(':', keyIdx + searchKey.Length);
+        if (colonIdx < 0) return null;
+
+        // Find the opening quote of the value
+        int valueStart = json.IndexOf('"', colonIdx + 1);
+        if (valueStart < 0) return null;
+
+        // Find the closing quote (handle escaped quotes)
+        int valueEnd = valueStart + 1;
+        while (valueEnd < json.Length)
+        {
+            if (json[valueEnd] == '"' && json[valueEnd - 1] != '\\')
+                break;
+            valueEnd++;
+        }
+
+        if (valueEnd >= json.Length) return null;
+        return json.Substring(valueStart + 1, valueEnd - valueStart - 1)
+            .Replace("\\\"", "\"")
+            .Replace("\\\\", "\\")
+            .Replace("\\n", "\n")
+            .Replace("\\r", "\r")
+            .Replace("\\t", "\t");
+    }
+    }
+
+    public void Save(List<CoHostAccount> accounts)
+    {
+        try
+        {
+            string dir = Path.GetDirectoryName(SettingsPath);
+            if (!Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            var sb = new StringBuilder();
+            sb.Append("{");
+            sb.Append("\"accounts\":[");
+
+            for (int i = 0; i < accounts.Count; i++)
+            {
+                if (i > 0)
+                {
+                    sb.Append(",");
+                }
+
+                sb.Append("{");
+                sb.Append("\"username\":");
+                sb.Append(EscapeJsonString(accounts[i].Username));
+                sb.Append(",\"password\":");
+                sb.Append(EscapeJsonString(accounts[i].Password));
+                sb.Append(",\"displayName\":");
+                sb.Append(EscapeJsonString(accounts[i].DisplayName));
+                sb.Append("}");
+            }
+
+            sb.Append("]}");
+
+            File.WriteAllText(SettingsPath, sb.ToString(), Encoding.UTF8);
+            NewPlugin.LogStatic("Saved " + accounts.Count + " co-host accounts to settings");
+        }
+        catch (Exception ex)
+        {
+            NewPlugin.LogStatic("ERROR saving settings: " + ex.Message);
+            throw;
+        }
+    }
+
+    private static string EscapeJsonString(string value)
+    {
+        if (value == null)
+        {
+            return "null";
+        }
+
+        var sb = new StringBuilder();
+        sb.Append("\"");
+
+        foreach (char c in value)
+        {
+            switch (c)
+            {
+                case '"':
+                    sb.Append("\\\"");
+                    break;
+                case '\\':
+                    sb.Append("\\\\");
+                    break;
+                case '\b':
+                    sb.Append("\\b");
+                    break;
+                case '\f':
+                    sb.Append("\\f");
+                    break;
+                case '\n':
+                    sb.Append("\\n");
+                    break;
+                case '\r':
+                    sb.Append("\\r");
+                    break;
+                case '\t':
+                    sb.Append("\\t");
+                    break;
+                default:
+                    if (c < ' ')
+                    {
+                        sb.Append("\\u");
+                        sb.Append(((int)c).ToString("x4"));
+                    }
+                    else
+                    {
+                        sb.Append(c);
+                    }
+                    break;
+            }
+        }
+
+        sb.Append("\"");
+        return sb.ToString();
     }
 }
 
