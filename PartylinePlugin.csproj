@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>Library</OutputType>
+    <AssemblyName>PartylinePlugin</AssemblyName>
+    <RootNamespace>Partyline</RootNamespace>
+    <LangVersion>9.0</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SIPSorcery" Version="6.2.4" />
+    <PackageReference Include="SIPSorceryMedia.Windows" Version="1.2.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Update HintPath to your PlayIt Live install location -->
+    <Reference Include="PlayItLive">
+      <HintPath>C:\Program Files (x86)\PlayIt Live\PlayItLive.exe</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Net.Http" />
+  </ItemGroup>
+
+</Project>
