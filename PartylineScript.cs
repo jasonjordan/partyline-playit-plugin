@@ -349,6 +349,39 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             var contentTypeProp = resType.GetProperty("ContentType");
             var outputStreamProp = resType.GetProperty("OutputStream");
 
+            // Check if this is an audio POST
+            if (subPath == "audio")
+            {
+                // Read the request body (PCM audio data)
+                var reqType = request.GetType();
+                var inputStreamProp = reqType.GetProperty("InputStream");
+                if (inputStreamProp != null)
+                {
+                    var inputStream = inputStreamProp.GetValue(request) as Stream;
+                    if (inputStream != null)
+                    {
+                        using (var ms = new MemoryStream())
+                        {
+                            inputStream.CopyTo(ms);
+                            var data = ms.ToArray();
+                            if (data.Length > 0)
+                            {
+                                WritePcmSamples(data, data.Length);
+                            }
+                        }
+                    }
+                }
+
+                contentTypeProp.SetValue(response, "text/plain");
+                var stream = outputStreamProp.GetValue(response) as Stream;
+                if (stream != null)
+                {
+                    var bytes = Encoding.UTF8.GetBytes("OK");
+                    stream.Write(bytes, 0, bytes.Length);
+                }
+                return;
+            }
+
             string body;
             string contentType;
 
@@ -369,11 +402,11 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             }
 
             contentTypeProp.SetValue(response, contentType);
-            var stream = outputStreamProp.GetValue(response) as Stream;
-            if (stream != null)
+            var outStream = outputStreamProp.GetValue(response) as Stream;
+            if (outStream != null)
             {
                 var bytes = Encoding.UTF8.GetBytes(body);
-                stream.Write(bytes, 0, bytes.Length);
+                outStream.Write(bytes, 0, bytes.Length);
             }
         }
         catch (Exception ex)
@@ -473,8 +506,9 @@ PUSH TO TALK</button>
 <div class='info'>Hold the button to talk. Release to mute.</div>
 </div>
 <script>
-let ws,ctx,src,proc,sending=false;
+let ctx,src,proc,sending=false,connected=false;
 const SR=44100,BUF=4096;
+const BASE=location.origin+'/partyline';
 async function connect(){
  document.getElementById('st').className='status s-wait';
  document.getElementById('st').innerText='Connecting...';
@@ -485,16 +519,15 @@ async function connect(){
   src=ctx.createMediaStreamSource(stream);
   proc=ctx.createScriptProcessor(BUF,1,1);
   src.connect(proc);proc.connect(ctx.destination);
-  ws=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/partyline/ws');
-  ws.binaryType='arraybuffer';
-  ws.onopen=()=>{document.getElementById('st').className='status s-on';document.getElementById('st').innerText='Connected ✓';document.getElementById('ptt').disabled=false;};
-  ws.onclose=()=>{document.getElementById('st').className='status s-off';document.getElementById('st').innerText='Disconnected';document.getElementById('ptt').disabled=true;document.getElementById('conn').disabled=false;sending=false;};
-  ws.onerror=()=>{ws.close();};
+  connected=true;
+  document.getElementById('st').className='status s-on';
+  document.getElementById('st').innerText='Connected ✓';
+  document.getElementById('ptt').disabled=false;
   proc.onaudioprocess=(e)=>{
-   if(!sending||!ws||ws.readyState!==1)return;
+   if(!sending||!connected)return;
    const d=e.inputBuffer.getChannelData(0);const p=new Int16Array(d.length);
    for(let i=0;i<d.length;i++)p[i]=Math.max(-32768,Math.min(32767,Math.round(d[i]*32767)));
-   ws.send(p.buffer);
+   fetch(BASE+'/audio',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:p.buffer}).catch(()=>{});
    let m=0;for(let i=0;i<d.length;i++){let v=Math.abs(d[i]);if(v>m)m=v;}
    document.getElementById('vu').style.width=(m*100)+'%';
   };
