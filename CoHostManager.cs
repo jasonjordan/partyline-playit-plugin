@@ -6,7 +6,6 @@ using System.Threading.Tasks;
 using Newtonsoft.Json;
 using PlayIt.PluginEngine;
 using SIPSorcery.Net;
-using SIPSorceryMedia.Abstractions;
 
 namespace Partyline
 {
@@ -58,7 +57,7 @@ namespace Partyline
             var audioTrack = new MediaStreamTrack(SDPMediaTypesEnum.audio, false,
                 new List<SDPAudioVideoMediaFormat>
                 {
-                    new SDPAudioVideoMediaFormat(new AudioFormat(AudioCodecsEnum.OPUS, 111, 48000, 2))
+                    new SDPAudioVideoMediaFormat(SDPWellKnownMediaFormatsEnum.OPUS)
                 });
             pc.addTrack(audioTrack);
 
