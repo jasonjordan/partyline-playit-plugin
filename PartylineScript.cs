@@ -1007,7 +1007,6 @@ public class SettingsManager
             .Replace("\\r", "\r")
             .Replace("\\t", "\t");
     }
-    }
 
     public void Save(List<CoHostAccount> accounts)
     {
