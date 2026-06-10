@@ -2,10 +2,10 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Net;
-using System.Net.WebSockets;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,10 +14,9 @@ using PlayIt.PluginEngine;
 
 public class NewPlugin : Plugin<IPlayItLiveApp>
 {
-    private HttpListener _listener;
     private CancellationTokenSource _cts;
     private Thread _serverThread;
-    private int _activePort = 25433;
+    private int _activePort = 8888;
     private const string URL_PATH = "/partyline/";
     private static string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Partyline", "partyline.log");
 
@@ -73,62 +72,50 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     {
         try
         {
-            // Try localhost binding (doesn't require admin/URL ACL)
-            // Use a unique port that won't conflict with PlayIt Live
-            int[] portsToTry = new int[] { 8888, 9000, 9090, 7777 };
-            string prefix = null;
-            bool bound = false;
-
-            foreach (int port in portsToTry)
+            // Approach: Find PlayIt Live's HttpListener via reflection and add our prefix
+            // PlayIt Live uses ServiceStack which wraps an HttpListener
+            Log("Searching for HttpListener in AppDomain...");
+            
+            System.Net.HttpListener existingListener = null;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
-                prefix = "http://localhost:" + port + URL_PATH;
-                Log("Attempting to listen on: " + prefix);
-                if (TryListen(prefix))
+                foreach (var type in SafeGetTypes(asm))
                 {
-                    _activePort = port;
-                    bound = true;
-                    break;
-                }
-            }
-
-            // Also try wildcard binding with a unique port (for LAN access)
-            if (!bound)
-            {
-                foreach (int port in portsToTry)
-                {
-                    prefix = "http://*:" + port + URL_PATH;
-                    Log("Attempting wildcard on: " + prefix);
-                    if (TryListen(prefix))
+                    if (type.FullName != null && type.FullName.Contains("HttpListenerBase"))
                     {
-                        _activePort = port;
-                        bound = true;
-                        break;
+                        Log("Found type: " + type.FullName);
+                        // Look for the Listener property
+                        var listenerField = type.GetField("Listener", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                        if (listenerField != null)
+                        {
+                            Log("Found Listener field on " + type.FullName);
+                        }
                     }
                 }
             }
 
-            if (!bound)
-            {
-                Log("Failed to bind to any port. Giving up.");
-                return;
-            }
-
-            Log("HTTP listener started successfully on port " + _activePort);
+            // If we can't hook into the existing listener, use TcpListener instead
+            // TcpListener doesn't use HTTP.sys, so no URL ACL conflicts
+            Log("Starting raw TcpListener on port 8888...");
+            var tcpListener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Any, 8888);
+            tcpListener.Start();
+            _activePort = 8888;
+            Log("TcpListener started on port " + _activePort);
 
             while (!_cts.IsCancellationRequested)
             {
                 try
                 {
-                    var ctx = _listener.GetContext();
-                    ThreadPool.QueueUserWorkItem(_ => HandleRequest(ctx));
+                    var client = tcpListener.AcceptTcpClient();
+                    ThreadPool.QueueUserWorkItem(_ => HandleTcpClient(client));
                 }
-                catch (HttpListenerException ex)
+                catch (System.Net.Sockets.SocketException ex)
                 {
-                    Log("HttpListenerException: " + ex.Message);
+                    Log("SocketException: " + ex.Message);
                     break;
                 }
-                catch (Exception ex) { Log("Request loop error: " + ex.Message); }
             }
+            tcpListener.Stop();
         }
         catch (Exception ex)
         {
@@ -136,103 +123,179 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         }
     }
 
-    private bool TryListen(string prefix)
+    private Type[] SafeGetTypes(System.Reflection.Assembly asm)
     {
-        try
-        {
-            var l = new HttpListener();
-            l.Prefixes.Add(prefix);
-            l.Start();
-            _listener = l;
-            Log("Successfully bound to " + prefix);
-            return true;
-        }
-        catch (Exception ex)
-        {
-            Log("TryListen failed for " + prefix + ": " + ex.Message);
-            return false;
-        }
+        try { return asm.GetTypes(); }
+        catch { return new Type[0]; }
     }
 
-    private void HandleRequest(HttpListenerContext ctx)
+    private void HandleTcpClient(System.Net.Sockets.TcpClient client)
     {
-        var path = ctx.Request.Url.AbsolutePath.Replace("/partyline", "").TrimStart('/');
-
         try
         {
-            if (ctx.Request.IsWebSocketRequest)
+            var stream = client.GetStream();
+            var reader = new StreamReader(stream);
+            var writer = new StreamWriter(stream);
+            writer.AutoFlush = true;
+
+            // Read HTTP request line
+            string requestLine = reader.ReadLine();
+            if (requestLine == null) { client.Close(); return; }
+
+            // Read headers
+            string line;
+            string upgradeHeader = null;
+            string wsKey = null;
+            while ((line = reader.ReadLine()) != null && line != "")
             {
-                HandleWebSocket(ctx).Wait();
-                return;
+                if (line.StartsWith("Upgrade:", StringComparison.OrdinalIgnoreCase))
+                    upgradeHeader = line.Substring(8).Trim();
+                if (line.StartsWith("Sec-WebSocket-Key:", StringComparison.OrdinalIgnoreCase))
+                    wsKey = line.Substring(18).Trim();
             }
 
-            switch (path)
+            // Parse path
+            string[] parts = requestLine.Split(' ');
+            string method = parts[0];
+            string path = parts.Length > 1 ? parts[1] : "/";
+            path = path.Replace("/partyline", "").TrimStart('/');
+
+            if (upgradeHeader != null && upgradeHeader.ToLower() == "websocket" && wsKey != null)
             {
-                case "":
-                case "join":
-                    ServeHtml(ctx.Response, GetCoHostPage());
-                    break;
-                case "api/status":
-                    ServeJson(ctx.Response, "{\"connected\":" + _cohosts.Count + "}");
-                    break;
-                default:
-                    ctx.Response.StatusCode = 404;
-                    ServeText(ctx.Response, "Not found");
-                    break;
+                // WebSocket upgrade
+                HandleWebSocketUpgrade(stream, wsKey);
             }
-        }
-        catch (Exception ex)
-        {
-            try { ctx.Response.StatusCode = 500; ServeText(ctx.Response, ex.Message); } catch { }
-        }
-    }
-
-    private async Task HandleWebSocket(HttpListenerContext ctx)
-    {
-        var wsCtx = await ctx.AcceptWebSocketAsync(null);
-        var ws = wsCtx.WebSocket;
-        var id = Guid.NewGuid().ToString("N").Substring(0, 8);
-        var cohost = new CoHostConnection(id, ws);
-        _cohosts[id] = cohost;
-        App.Log("Partyline: Co-host " + id + " connected");
-
-        var buffer = new byte[8192];
-        try
-        {
-            while (ws.State == WebSocketState.Open && !_cts.IsCancellationRequested)
+            else
             {
-                var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), _cts.Token);
-                if (result.MessageType == WebSocketMessageType.Close) break;
+                // Regular HTTP
+                string responseBody = "";
+                string contentType = "text/html; charset=utf-8";
+                int statusCode = 200;
 
-                if (result.MessageType == WebSocketMessageType.Binary && !cohost.Muted)
+                if (path == "" || path == "join" || path == "join/")
                 {
-                    // Buffer contains 16-bit PCM mono samples from the browser
-                    int sampleCount = result.Count / 2;
+                    responseBody = GetCoHostPage();
+                }
+                else if (path == "api/status")
+                {
+                    contentType = "application/json";
+                    responseBody = "{\"connected\":" + _cohosts.Count + "}";
+                }
+                else
+                {
+                    statusCode = 404;
+                    responseBody = "Not found";
+                    contentType = "text/plain";
+                }
+
+                string response = "HTTP/1.1 " + statusCode + " OK\r\n" +
+                    "Content-Type: " + contentType + "\r\n" +
+                    "Content-Length: " + Encoding.UTF8.GetByteCount(responseBody) + "\r\n" +
+                    "Connection: close\r\n" +
+                    "\r\n" +
+                    responseBody;
+                byte[] responseBytes = Encoding.UTF8.GetBytes(response);
+                stream.Write(responseBytes, 0, responseBytes.Length);
+            }
+            client.Close();
+        }
+        catch (Exception ex)
+        {
+            Log("HandleTcpClient error: " + ex.Message);
+            try { client.Close(); } catch { }
+        }
+    }
+
+    private void HandleWebSocketUpgrade(System.Net.Sockets.NetworkStream stream, string wsKey)
+    {
+        // Perform WebSocket handshake
+        string acceptKey = Convert.ToBase64String(
+            System.Security.Cryptography.SHA1.Create().ComputeHash(
+                Encoding.UTF8.GetBytes(wsKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+
+        string handshake = "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n";
+        byte[] handshakeBytes = Encoding.UTF8.GetBytes(handshake);
+        stream.Write(handshakeBytes, 0, handshakeBytes.Length);
+
+        var id = Guid.NewGuid().ToString("N").Substring(0, 8);
+        Log("WebSocket co-host " + id + " connected");
+
+        // Read WebSocket frames
+        try
+        {
+            while (!_cts.IsCancellationRequested)
+            {
+                // Read frame header
+                int b1 = stream.ReadByte();
+                if (b1 == -1) break;
+                int b2 = stream.ReadByte();
+                if (b2 == -1) break;
+
+                bool fin = (b1 & 0x80) != 0;
+                int opcode = b1 & 0x0F;
+                bool masked = (b2 & 0x80) != 0;
+                int payloadLen = b2 & 0x7F;
+
+                if (opcode == 8) break; // Close frame
+
+                if (payloadLen == 126)
+                {
+                    int hi = stream.ReadByte();
+                    int lo = stream.ReadByte();
+                    payloadLen = (hi << 8) | lo;
+                }
+                else if (payloadLen == 127)
+                {
+                    // 8-byte length - skip for audio frames (shouldn't be this big)
+                    byte[] lenBytes = new byte[8];
+                    stream.Read(lenBytes, 0, 8);
+                    payloadLen = (int)BitConverter.ToInt64(lenBytes, 0);
+                }
+
+                byte[] mask = new byte[4];
+                if (masked) stream.Read(mask, 0, 4);
+
+                byte[] payload = new byte[payloadLen];
+                int read = 0;
+                while (read < payloadLen)
+                {
+                    int n = stream.Read(payload, read, payloadLen - read);
+                    if (n == 0) break;
+                    read += n;
+                }
+
+                // Unmask
+                if (masked)
+                {
+                    for (int i = 0; i < payload.Length; i++)
+                        payload[i] = (byte)(payload[i] ^ mask[i % 4]);
+                }
+
+                // Binary frame = audio data (16-bit PCM)
+                if (opcode == 2 && payload.Length > 0)
+                {
+                    int sampleCount = payload.Length / 2;
                     lock (_audioLock)
                     {
                         for (int i = 0; i < sampleCount; i++)
                         {
-                            short sample = BitConverter.ToInt16(buffer, i * 2);
-                            // Apply volume
-                            sample = (short)(sample * cohost.Volume);
-                            // Mix (add) into ring buffer
+                            short sample = BitConverter.ToInt16(payload, i * 2);
                             int mixed = _ringBuffer[_writePos] + sample;
                             _ringBuffer[_writePos] = (short)Math.Max(-32768, Math.Min(32767, mixed));
                             _writePos = (_writePos + 1) % _ringBuffer.Length;
                         }
                     }
-                    cohost.LastLevel = sampleCount > 0 ? Math.Abs(BitConverter.ToInt16(buffer, 0)) / 32768f : 0f;
                 }
             }
         }
-        catch { }
-        finally
+        catch (Exception ex)
         {
-            CoHostConnection removed;
-            _cohosts.TryRemove(id, out removed);
-            App.Log("Partyline: Co-host " + id + " disconnected");
-            try { ws.Dispose(); } catch { }
+            Log("WebSocket error for " + id + ": " + ex.Message);
         }
+        Log("WebSocket co-host " + id + " disconnected");
     }
 
     // Called by PlayIt Live's audio pipeline when it needs samples
@@ -272,10 +335,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
     public void KickAll()
     {
-        foreach (var c in _cohosts.Values)
-        {
-            try { c.Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Kicked", CancellationToken.None); } catch { }
-        }
+        _cohosts.Clear();
     }
 
     public IEnumerable<CoHostConnection> GetConnections() { return _cohosts.Values; }
@@ -283,44 +343,12 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     public void Kick(string id)
     {
         CoHostConnection c;
-        if (_cohosts.TryGetValue(id, out c))
-        {
-            try { c.Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Kicked", CancellationToken.None); } catch { }
-        }
-    }
-
-    private void ServeHtml(HttpListenerResponse resp, string html)
-    {
-        resp.ContentType = "text/html; charset=utf-8";
-        var bytes = Encoding.UTF8.GetBytes(html);
-        resp.ContentLength64 = bytes.Length;
-        resp.OutputStream.Write(bytes, 0, bytes.Length);
-        resp.OutputStream.Close();
-    }
-
-    private void ServeJson(HttpListenerResponse resp, string json)
-    {
-        resp.ContentType = "application/json";
-        resp.Headers.Add("Access-Control-Allow-Origin", "*");
-        var bytes = Encoding.UTF8.GetBytes(json);
-        resp.ContentLength64 = bytes.Length;
-        resp.OutputStream.Write(bytes, 0, bytes.Length);
-        resp.OutputStream.Close();
-    }
-
-    private void ServeText(HttpListenerResponse resp, string text)
-    {
-        resp.ContentType = "text/plain";
-        var bytes = Encoding.UTF8.GetBytes(text);
-        resp.ContentLength64 = bytes.Length;
-        resp.OutputStream.Write(bytes, 0, bytes.Length);
-        resp.OutputStream.Close();
+        _cohosts.TryRemove(id, out c);
     }
 
     public override void Cleanup()
     {
         if (_cts != null) _cts.Cancel();
-        if (_listener != null) _listener.Stop();
         KickAll();
     }
 
@@ -430,15 +458,13 @@ function pttOff(){sending=false;document.getElementById('ptt').className='btn pt
 public class CoHostConnection
 {
     public string Id { get; set; }
-    public WebSocket Socket { get; set; }
     public float Volume { get; set; }
     public bool Muted { get; set; }
     public float LastLevel { get; set; }
 
-    public CoHostConnection(string id, WebSocket socket)
+    public CoHostConnection(string id)
     {
         Id = id;
-        Socket = socket;
         Volume = 1.0f;
         Muted = false;
         LastLevel = 0f;
