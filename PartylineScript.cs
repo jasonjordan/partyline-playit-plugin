@@ -72,9 +72,10 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     {
         // Wait until ServiceStack server is actually listening
         Log("Waiting for ServiceStack server to start...");
-        for (int i = 0; i < 120; i++) // Wait up to 2 minutes
+        bool hooked = false;
+        for (int i = 0; i < 300; i++) // Wait up to 5 minutes
         {
-            Thread.Sleep(1000);
+            Thread.Sleep(2000);
             if (_cts.IsCancellationRequested) return;
 
             try
@@ -93,16 +94,27 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
                 var instance = instanceProp.GetValue(null);
                 if (instance == null) continue;
 
-                // Check if IsReady
-                var isReadyMethod = hostType.GetMethod("IsReady", BindingFlags.Public | BindingFlags.Static);
-                if (isReadyMethod != null)
+                // Check ReadyAt property directly
+                var readyAtProp = instance.GetType().GetProperty("ReadyAt", BindingFlags.Public | BindingFlags.Instance);
+                if (readyAtProp != null)
                 {
-                    bool ready = (bool)isReadyMethod.Invoke(null, null);
-                    if (!ready) continue;
+                    var readyAt = readyAtProp.GetValue(instance);
+                    if (readyAt == null)
+                    {
+                        if (i % 10 == 0) Log("Server not ready yet (ReadyAt is null), waiting...");
+                        continue;
+                    }
+                    Log("Server is ready! ReadyAt = " + readyAt);
+                }
+                else
+                {
+                    // No ReadyAt - just wait a bit after finding instance
+                    Log("No ReadyAt property found, waiting 5s then hooking...");
+                    Thread.Sleep(5000);
                 }
 
-                Log("ServiceStack server is ready. Hooking in...");
                 HookIntoServiceStack();
+                hooked = true;
                 return;
             }
             catch (Exception ex)
