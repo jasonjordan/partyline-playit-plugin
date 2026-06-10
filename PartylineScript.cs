@@ -152,7 +152,16 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         // we build the delegate using System.Linq.Expressions.
 
         var pathInfoProp = iHttpRequestType.GetProperty("PathInfo");
-        Log("PathInfo property: " + (pathInfoProp != null ? "found" : "NOT FOUND"));
+        if (pathInfoProp == null)
+        {
+            // PathInfo is on IRequest (parent interface), not IHttpRequest directly
+            foreach (var iface in iHttpRequestType.GetInterfaces())
+            {
+                pathInfoProp = iface.GetProperty("PathInfo");
+                if (pathInfoProp != null) break;
+            }
+        }
+        Log("PathInfo property: " + (pathInfoProp != null ? "found on " + pathInfoProp.DeclaringType.Name : "NOT FOUND"));
 
         // Build: (IHttpRequest req) => { var p = req.PathInfo; if p starts with /partyline return handler; else return null; }
         var reqParam = System.Linq.Expressions.Expression.Parameter(iHttpRequestType, "req");
