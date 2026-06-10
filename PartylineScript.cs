@@ -14,7 +14,7 @@ using PlayIt.PluginEngine;
 public class NewPlugin : Plugin<IPlayItLiveApp>
 {
     private CancellationTokenSource _cts;
-    private int _activePort = 25433;
+    private int _activePort = 25434;
     private static string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Partyline", "partyline.log");
 
     // Co-host sessions
@@ -55,7 +55,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             //App.RegisterUserControl(() => new PartylineStatusControl(this), UserControlLocation.BelowTrackList, 100);
             //Log("UI control registered.");
 
-            // Hook into PlayIt Live's ServiceStack HTTP server on port 25433
+            // Hook into PlayIt Live's ServiceStack HTTP server on port 25434
             // Wait for the server to start (user clicks "Start Server" manually)
             var hookThread = new Thread(() => WaitAndHook()) { IsBackground = true, Name = "PartylineHook" };
             hookThread.Start();
@@ -127,7 +127,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
     private void HookIntoServiceStack()
     {
-        Log("Hooking into ServiceStack on port 25433...");
+        Log("Hooking into ServiceStack on port 25434...");
 
         // Find ServiceStackHost.Instance
         Type hostType = null;
@@ -333,7 +333,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     }
 
     public int GetCoHostCount() { return _cohosts.Count; }
-    public string GetLink() { return "https://" + Dns.GetHostName() + ":25433/partyline/join"; }
+    public string GetLink() { return "https://" + Dns.GetHostName() + ":25434/partyline/join"; }
 
     public void MuteAll() { foreach (var c in _cohosts.Values) c.Muted = true; }
     public void UnmuteAll() { foreach (var c in _cohosts.Values) c.Muted = false; }
