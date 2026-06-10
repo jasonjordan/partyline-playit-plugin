@@ -426,7 +426,7 @@ public class PartylineStatusControl : UserControl
     private NewPlugin _plugin;
     private Label _label;
     private Button _mixerBtn;
-    private Timer _timer;
+    private System.Windows.Forms.Timer _timer;
 
     public PartylineStatusControl(NewPlugin plugin)
     {
@@ -462,7 +462,7 @@ public class PartylineStatusControl : UserControl
         {
             Clipboard.SetText(_plugin.GetLink());
             _mixerBtn.Text = "Copied ✓";
-            var t = new Timer { Interval = 2000 };
+            var t = new System.Windows.Forms.Timer { Interval = 2000 };
             t.Tick += (s2, e2) => { _mixerBtn.Text = "Copy Link"; t.Stop(); t.Dispose(); };
             t.Start();
         };
@@ -471,7 +471,7 @@ public class PartylineStatusControl : UserControl
         layout.Controls.Add(_mixerBtn);
         Controls.Add(layout);
 
-        _timer = new Timer { Interval = 1000 };
+        _timer = new System.Windows.Forms.Timer { Interval = 1000 };
         _timer.Tick += (s, e) => { _label.Text = "🎙️ Partyline: " + _plugin.GetCoHostCount() + " connected"; };
         _timer.Start();
     }
