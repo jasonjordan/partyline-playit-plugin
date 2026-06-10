@@ -19,6 +19,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     private Thread _serverThread;
     private int _activePort = 25433;
     private const string URL_PATH = "/partyline/";
+    private static string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Partyline", "partyline.log");
 
     // Co-host sessions
     private ConcurrentDictionary<string, CoHostConnection> _cohosts = new ConcurrentDictionary<string, CoHostConnection>();
@@ -28,55 +29,95 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     private int _writePos = 0;
     private readonly object _audioLock = new object();
 
+    private static void Log(string message)
+    {
+        try
+        {
+            string dir = Path.GetDirectoryName(_logPath);
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            File.AppendAllText(_logPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + message + Environment.NewLine);
+        }
+        catch { }
+    }
+
     public override void Run()
     {
-        _cts = new CancellationTokenSource();
+        try
+        {
+            _cts = new CancellationTokenSource();
+            Log("Plugin starting...");
 
-        // Register audio stream into PlayIt Live's main mix
-        App.AudioPipeline.RegisterSpecialAudioStream("partyline", new PartylineStream(this));
+            // Register audio stream into PlayIt Live's main mix
+            Log("Registering audio stream...");
+            App.AudioPipeline.RegisterSpecialAudioStream("partyline", new PartylineStream(this));
+            Log("Audio stream registered.");
 
-        // Register embedded UI control
-        App.RegisterUserControl(() => new PartylineStatusControl(this), UserControlLocation.BelowTrackList, 100);
+            // Register embedded UI control
+            Log("Registering UI control...");
+            App.RegisterUserControl(() => new PartylineStatusControl(this), UserControlLocation.BelowTrackList, 100);
+            Log("UI control registered.");
 
-        // Start HTTP/WebSocket server
-        _serverThread = new Thread(StartServer) { IsBackground = true, Name = "Partyline" };
-        _serverThread.Start();
+            // Start HTTP/WebSocket server
+            _serverThread = new Thread(StartServer) { IsBackground = true, Name = "Partyline" };
+            _serverThread.Start();
 
-        App.Log("Partyline plugin started");
+            Log("Plugin started successfully.");
+        }
+        catch (Exception ex)
+        {
+            Log("FATAL in Run(): " + ex.ToString());
+        }
     }
 
     private void StartServer()
     {
-        // Try port 25433 with /partyline/ prefix (shared with PlayIt Live)
-        string prefix = "http://+:" + _activePort + URL_PATH;
-        if (!TryListen(prefix))
+        try
         {
-            // Try registering URL ACL
-            TryRegisterUrlAcl(_activePort);
+            string prefix = "http://+:" + _activePort + URL_PATH;
+            Log("Attempting to listen on: " + prefix);
+
+            // First, try to listen (will work if URL ACL already registered)
             if (!TryListen(prefix))
             {
-                // Fallback to port 8080
-                _activePort = 8080;
-                prefix = "http://+:" + _activePort + URL_PATH;
+                // URL ACL not registered yet — register it
+                Log("Listen failed, attempting to register URL ACL...");
+                bool aclResult = TryRegisterUrlAcl(_activePort);
+                Log("URL ACL registration result: " + aclResult);
+
+                // Retry after registration
                 if (!TryListen(prefix))
                 {
-                    App.Log("Partyline: Failed to start HTTP server");
-                    return;
+                    Log("Still cannot listen after URL ACL registration. Trying fallback port 8080...");
+                    _activePort = 8080;
+                    prefix = "http://+:" + _activePort + URL_PATH;
+                    if (!TryListen(prefix))
+                    {
+                        Log("Fallback port 8080 also failed. Giving up.");
+                        return;
+                    }
                 }
             }
-        }
 
-        App.Log("Partyline: Listening on port " + _activePort);
+            Log("HTTP listener started successfully on port " + _activePort);
 
-        while (!_cts.IsCancellationRequested)
-        {
-            try
+            while (!_cts.IsCancellationRequested)
             {
-                var ctx = _listener.GetContext();
-                ThreadPool.QueueUserWorkItem(_ => HandleRequest(ctx));
+                try
+                {
+                    var ctx = _listener.GetContext();
+                    ThreadPool.QueueUserWorkItem(_ => HandleRequest(ctx));
+                }
+                catch (HttpListenerException ex)
+                {
+                    Log("HttpListenerException: " + ex.Message);
+                    break;
+                }
+                catch (Exception ex) { Log("Request loop error: " + ex.Message); }
             }
-            catch (HttpListenerException) { break; }
-            catch (Exception ex) { App.Log("Partyline error: " + ex.Message); }
+        }
+        catch (Exception ex)
+        {
+            Log("FATAL in StartServer: " + ex.ToString());
         }
     }
 
@@ -88,27 +129,40 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             l.Prefixes.Add(prefix);
             l.Start();
             _listener = l;
+            Log("Successfully bound to " + prefix);
             return true;
         }
-        catch { return false; }
+        catch (Exception ex)
+        {
+            Log("TryListen failed for " + prefix + ": " + ex.Message);
+            return false;
+        }
     }
 
-    private void TryRegisterUrlAcl(int port)
+    private bool TryRegisterUrlAcl(int port)
     {
         try
         {
+            string args = "http add urlacl url=http://+:" + port + URL_PATH + " user=Everyone";
+            Log("Running netsh: " + args);
             var psi = new System.Diagnostics.ProcessStartInfo
             {
                 FileName = "netsh",
-                Arguments = "http add urlacl url=http://+:" + port + URL_PATH + " user=Everyone",
+                Arguments = args,
                 Verb = "runas",
                 UseShellExecute = true,
                 CreateNoWindow = true
             };
             var proc = System.Diagnostics.Process.Start(psi);
             proc.WaitForExit(10000);
+            Log("netsh exit code: " + proc.ExitCode);
+            return proc.ExitCode == 0;
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Log("TryRegisterUrlAcl error: " + ex.Message);
+            return false;
+        }
     }
 
     private void HandleRequest(HttpListenerContext ctx)
