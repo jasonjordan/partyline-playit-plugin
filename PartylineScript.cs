@@ -240,7 +240,39 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         var insertMethod = listType.GetMethod("Insert");
         insertMethod.Invoke(handlersList, new object[] { 0, del });
         Log("SUCCESS: Inserted handler at position 0 in RawHttpHandlers");
-        Log("Partyline is now available at https://localhost:25433/partyline/join");
+
+        // ServiceStack caches RawHttpHandlers into an internal array - rebuild it
+        try
+        {
+            var toArrayMethod = handlersList.GetType().GetMethod("ToArray");
+            var array = toArrayMethod.Invoke(handlersList, null);
+            var arrayField = instance.GetType().GetField("RawHttpHandlersArray", BindingFlags.NonPublic | BindingFlags.Instance);
+            if (arrayField != null)
+            {
+                arrayField.SetValue(instance, array);
+                Log("Rebuilt RawHttpHandlersArray cache");
+            }
+            else
+            {
+                // Try property
+                var arrayProp = hostType.GetProperty("RawHttpHandlersArray", BindingFlags.NonPublic | BindingFlags.Instance);
+                if (arrayProp != null && arrayProp.CanWrite)
+                {
+                    arrayProp.SetValue(instance, array);
+                    Log("Rebuilt RawHttpHandlersArray via property");
+                }
+                else
+                {
+                    Log("WARNING: Could not rebuild RawHttpHandlersArray - handler may not be called");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("WARNING: Array rebuild failed: " + ex.Message);
+        }
+
+        Log("Partyline is now available at https://localhost:" + _activePort + "/partyline/join");
     }
 
     private void LogLoadedAssemblies()
