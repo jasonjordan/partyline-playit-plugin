@@ -267,6 +267,41 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         insertMethod.Invoke(handlersList, new object[] { 0, del });
         Log("Handler inserted");
 
+        // CRITICAL: Rebuild the internal cached array
+        // ServiceStack reads from RawHttpHandlersArray (Func[]), not the List
+        Type searchType = instance.GetType();
+        bool rebuilt = false;
+        while (searchType != null && !rebuilt)
+        {
+            foreach (var f in searchType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+            {
+                if (f.Name.Contains("RawHttpHandler") && f.FieldType.IsArray)
+                {
+                    var toArray = handlersList.GetType().GetMethod("ToArray");
+                    var newArray = toArray.Invoke(handlersList, null);
+                    f.SetValue(instance, newArray);
+                    Log("Rebuilt cached array: " + f.Name + " (length=" + ((Array)newArray).Length + ")");
+                    rebuilt = true;
+                    break;
+                }
+            }
+            searchType = searchType.BaseType;
+        }
+        if (!rebuilt)
+        {
+            Log("WARNING: Could not find cached array field. Listing candidate fields:");
+            searchType = instance.GetType();
+            while (searchType != null)
+            {
+                foreach (var f in searchType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                {
+                    if (f.FieldType.IsArray || f.Name.Contains("Handler") || f.Name.Contains("Raw"))
+                        Log("  " + searchType.Name + "." + f.Name + " : " + f.FieldType.Name);
+                }
+                searchType = searchType.BaseType;
+            }
+        }
+
         Log("Partyline available at https://localhost:" + _activePort + "/partyline/join");
     }
 
