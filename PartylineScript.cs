@@ -73,29 +73,44 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     {
         try
         {
-            string prefix = "http://+:" + _activePort + URL_PATH;
-            Log("Attempting to listen on: " + prefix);
+            // Try localhost binding (doesn't require admin/URL ACL)
+            // Use a unique port that won't conflict with PlayIt Live
+            int[] portsToTry = new int[] { 8888, 9000, 9090, 7777 };
+            string prefix = null;
+            bool bound = false;
 
-            // First, try to listen (will work if URL ACL already registered)
-            if (!TryListen(prefix))
+            foreach (int port in portsToTry)
             {
-                // URL ACL not registered yet — register it
-                Log("Listen failed, attempting to register URL ACL...");
-                bool aclResult = TryRegisterUrlAcl(_activePort);
-                Log("URL ACL registration result: " + aclResult);
-
-                // Retry after registration
-                if (!TryListen(prefix))
+                prefix = "http://localhost:" + port + URL_PATH;
+                Log("Attempting to listen on: " + prefix);
+                if (TryListen(prefix))
                 {
-                    Log("Still cannot listen after URL ACL registration. Trying fallback port 8080...");
-                    _activePort = 8080;
-                    prefix = "http://+:" + _activePort + URL_PATH;
-                    if (!TryListen(prefix))
+                    _activePort = port;
+                    bound = true;
+                    break;
+                }
+            }
+
+            // Also try wildcard binding with a unique port (for LAN access)
+            if (!bound)
+            {
+                foreach (int port in portsToTry)
+                {
+                    prefix = "http://*:" + port + URL_PATH;
+                    Log("Attempting wildcard on: " + prefix);
+                    if (TryListen(prefix))
                     {
-                        Log("Fallback port 8080 also failed. Giving up.");
-                        return;
+                        _activePort = port;
+                        bound = true;
+                        break;
                     }
                 }
+            }
+
+            if (!bound)
+            {
+                Log("Failed to bind to any port. Giving up.");
+                return;
             }
 
             Log("HTTP listener started successfully on port " + _activePort);
@@ -135,32 +150,6 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         catch (Exception ex)
         {
             Log("TryListen failed for " + prefix + ": " + ex.Message);
-            return false;
-        }
-    }
-
-    private bool TryRegisterUrlAcl(int port)
-    {
-        try
-        {
-            string args = "http add urlacl url=http://+:" + port + URL_PATH + " user=Everyone";
-            Log("Running netsh: " + args);
-            var psi = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "netsh",
-                Arguments = args,
-                Verb = "runas",
-                UseShellExecute = true,
-                CreateNoWindow = true
-            };
-            var proc = System.Diagnostics.Process.Start(psi);
-            proc.WaitForExit(10000);
-            Log("netsh exit code: " + proc.ExitCode);
-            return proc.ExitCode == 0;
-        }
-        catch (Exception ex)
-        {
-            Log("TryRegisterUrlAcl error: " + ex.Message);
             return false;
         }
     }
