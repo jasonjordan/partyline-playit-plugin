@@ -36,6 +36,11 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         catch { }
     }
 
+    public static void LogStatic(string message)
+    {
+        Log(message);
+    }
+
     public override void Run()
     {
         try
@@ -203,90 +208,143 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
         // The list is List<Func<ServiceStack.Web.IHttpRequest, System.Web.IHttpHandler>>
         // We need to add a Func that accepts IHttpRequest and returns IHttpHandler (or null).
-        // Since we can't reference ServiceStack.Web.IHttpRequest at compile time,
-        // we build the delegate using System.Linq.Expressions.
+        // We'll use CustomActionHandler (ServiceStack's built-in handler class)
+        // which implements IServiceStackHandler properly.
 
         var pathInfoProp = iHttpRequestType.GetProperty("PathInfo");
         if (pathInfoProp == null)
         {
-            // PathInfo is on IRequest (parent interface), not IHttpRequest directly
             foreach (var iface in iHttpRequestType.GetInterfaces())
             {
                 pathInfoProp = iface.GetProperty("PathInfo");
                 if (pathInfoProp != null) break;
             }
         }
-        Log("PathInfo property: " + (pathInfoProp != null ? "found on " + pathInfoProp.DeclaringType.Name : "NOT FOUND"));
+        Log("PathInfo: " + (pathInfoProp != null ? "found" : "NOT FOUND"));
 
-        // Build: (IHttpRequest req) => { var p = req.PathInfo; if p starts with /partyline return handler; else return null; }
-        var reqParam = System.Linq.Expressions.Expression.Parameter(iHttpRequestType, "req");
-        var pathExpr = System.Linq.Expressions.Expression.Property(reqParam, pathInfoProp);
+        // Find CustomActionHandler type
+        Type customHandlerType = null;
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            customHandlerType = asm.GetType("ServiceStack.Host.Handlers.CustomActionHandler");
+            if (customHandlerType != null) break;
+        }
+        Log("CustomActionHandler: " + (customHandlerType != null ? "found" : "NOT FOUND"));
 
-        var startsWithMethod = typeof(string).GetMethod("StartsWith", new Type[] { typeof(string) });
-        var checkExpr = System.Linq.Expressions.Expression.Call(pathExpr, startsWithMethod, System.Linq.Expressions.Expression.Constant("/partyline"));
+        // Find IRequest and IResponse types for the Action<IRequest, IResponse>
+        Type iRequestType = null;
+        Type iResponseType = null;
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            if (iRequestType == null) iRequestType = asm.GetType("ServiceStack.Web.IRequest");
+            if (iResponseType == null) iResponseType = asm.GetType("ServiceStack.Web.IResponse");
+        }
+        Log("IRequest: " + (iRequestType != null ? "found" : "NOT FOUND"));
+        Log("IResponse: " + (iResponseType != null ? "found" : "NOT FOUND"));
 
-        // Build the handler construction: new PartylineHttpHandler(plugin, pathInfo)
-        var pluginConst = System.Linq.Expressions.Expression.Constant(this);
-        var handlerCtor = typeof(PartylineHttpHandler).GetConstructor(new Type[] { typeof(NewPlugin), typeof(string) });
-        var newHandlerExpr = System.Linq.Expressions.Expression.New(handlerCtor, pluginConst, pathExpr);
+        // Store references for runtime use
+        _pathInfoProp = pathInfoProp;
+        _customHandlerType = customHandlerType;
+        _iRequestType = iRequestType;
+        _iResponseType = iResponseType;
 
-        var nullExpr = System.Linq.Expressions.Expression.Constant(null, typeof(System.Web.IHttpHandler));
-        var condExpr = System.Linq.Expressions.Expression.Condition(checkExpr, 
-            System.Linq.Expressions.Expression.Convert(newHandlerExpr, typeof(System.Web.IHttpHandler)), 
-            nullExpr);
+        // Build expression: (req) => this.CreateHandler(req.PathInfo)
+        // CreateHandler returns System.Web.IHttpHandler (CustomActionHandler implements it)
+        var reqParam = Expression.Parameter(iHttpRequestType, "req");
+        var castExpr = Expression.Convert(reqParam, pathInfoProp.DeclaringType);
+        var pathExpr = Expression.Property(castExpr, pathInfoProp);
+
+        var createHandlerMethod = typeof(NewPlugin).GetMethod("CreateHandler", BindingFlags.Public | BindingFlags.Instance);
+        var pluginConst = Expression.Constant(this);
+        var callExpr = Expression.Call(pluginConst, createHandlerMethod, pathExpr);
 
         var funcTypeFromList = handlersList.GetType().GetGenericArguments()[0];
-        var lambda = System.Linq.Expressions.Expression.Lambda(funcTypeFromList, condExpr, reqParam);
+        var lambda = Expression.Lambda(funcTypeFromList, callExpr, reqParam);
         var del = lambda.Compile();
-
-        Log("Compiled lambda delegate successfully");
+        Log("Lambda compiled");
 
         // Insert at position 0
-        var listType = handlersList.GetType();
-        var insertMethod = listType.GetMethod("Insert");
+        var insertMethod = handlersList.GetType().GetMethod("Insert");
         insertMethod.Invoke(handlersList, new object[] { 0, del });
-        Log("SUCCESS: Inserted handler at position 0 in RawHttpHandlers");
+        Log("Handler inserted");
 
-        // ServiceStack caches RawHttpHandlers into an internal array - rebuild it
+        Log("Partyline available at https://localhost:" + _activePort + "/partyline/join");
+    }
+
+    // These are set during hook setup
+    private PropertyInfo _pathInfoProp;
+    private Type _customHandlerType;
+    private Type _iRequestType;
+    private Type _iResponseType;
+
+    // Called by the expression tree lambda for each request
+    public System.Web.IHttpHandler CreateHandler(string pathInfo)
+    {
+        if (pathInfo == null || !pathInfo.StartsWith("/partyline")) return null;
+
         try
         {
-            var toArrayMethod = handlersList.GetType().GetMethod("ToArray");
-            var array = toArrayMethod.Invoke(handlersList, null);
-            var arrayField = instance.GetType().GetField("RawHttpHandlersArray", BindingFlags.NonPublic | BindingFlags.Instance);
-            if (arrayField != null)
+            // Create Action<IRequest, IResponse> delegate
+            var actionType = typeof(Action<,>).MakeGenericType(_iRequestType, _iResponseType);
+            var handleMethod = typeof(NewPlugin).GetMethod("HandlePartylineRequest", BindingFlags.Public | BindingFlags.Instance);
+            var action = Delegate.CreateDelegate(actionType, this, handleMethod);
+
+            // new CustomActionHandler(action)
+            var ctor = _customHandlerType.GetConstructor(new Type[] { actionType });
+            var handler = ctor.Invoke(new object[] { action });
+            return (System.Web.IHttpHandler)handler;
+        }
+        catch (Exception ex)
+        {
+            Log("CreateHandler error: " + ex.Message);
+            return null;
+        }
+    }
+
+    // Called by CustomActionHandler when it processes the request
+    public void HandlePartylineRequest(object request, object response)
+    {
+        try
+        {
+            // Get PathInfo from request
+            string pathInfo = _pathInfoProp.GetValue(request) as string;
+            string subPath = (pathInfo ?? "").Replace("/partyline", "").TrimStart('/');
+
+            // Get response OutputStream and ContentType
+            var resType = response.GetType();
+            var contentTypeProp = resType.GetProperty("ContentType");
+            var outputStreamProp = resType.GetProperty("OutputStream");
+
+            string body;
+            string contentType;
+
+            if (subPath == "" || subPath == "join" || subPath == "join/")
             {
-                arrayField.SetValue(instance, array);
-                Log("Rebuilt RawHttpHandlersArray cache");
+                contentType = "text/html; charset=utf-8";
+                body = GetCoHostPageHtml();
+            }
+            else if (subPath == "api/status")
+            {
+                contentType = "application/json";
+                body = "{\"connected\":" + _cohosts.Count + "}";
             }
             else
             {
-                // Try property
-                var arrayProp = hostType.GetProperty("RawHttpHandlersArray", BindingFlags.NonPublic | BindingFlags.Instance);
-                if (arrayProp != null && arrayProp.CanWrite)
-                {
-                    arrayProp.SetValue(instance, array);
-                    Log("Rebuilt RawHttpHandlersArray via property");
-                }
-                else
-                {
-                    Log("WARNING: Could not rebuild RawHttpHandlersArray - handler may not be called");
-                }
+                contentType = "text/plain";
+                body = "Not found";
+            }
+
+            contentTypeProp.SetValue(response, contentType);
+            var stream = outputStreamProp.GetValue(response) as Stream;
+            if (stream != null)
+            {
+                var bytes = Encoding.UTF8.GetBytes(body);
+                stream.Write(bytes, 0, bytes.Length);
             }
         }
         catch (Exception ex)
         {
-            Log("WARNING: Array rebuild failed: " + ex.Message);
-        }
-
-        Log("Partyline is now available at https://localhost:" + _activePort + "/partyline/join");
-    }
-
-    private void LogLoadedAssemblies()
-    {
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            if (asm.FullName.Contains("ServiceStack") || asm.FullName.Contains("PlayIt"))
-                Log("  Assembly: " + asm.FullName);
+            Log("HandlePartylineRequest error: " + ex.Message);
         }
     }
 
@@ -448,6 +506,7 @@ public class RequestInterceptor
 }
 
 // Custom HTTP handler for /partyline/ requests
+// Must implement IServiceStackHandler for ServiceStack to execute it
 public class PartylineHttpHandler : System.Web.IHttpHandler
 {
     private NewPlugin _plugin;
@@ -461,25 +520,69 @@ public class PartylineHttpHandler : System.Web.IHttpHandler
 
     public bool IsReusable { get { return false; } }
 
+    public string RequestName { get { return "Partyline"; } }
+
     public void ProcessRequest(System.Web.HttpContext context)
     {
-        string subPath = _path.Replace("/partyline", "").TrimStart('/');
-        var response = context.Response;
+        // Not used by ServiceStack's HttpListener host
+    }
 
-        if (subPath == "" || subPath == "join" || subPath == "join/")
+    // This is what ServiceStack actually calls
+    public void ProcessRequest(object httpReq, object httpRes, string operationName)
+    {
+        ProcessRequestInternal(httpRes);
+    }
+
+    public System.Threading.Tasks.Task ProcessRequestAsync(object httpReq, object httpRes, string operationName)
+    {
+        ProcessRequestInternal(httpRes);
+        return System.Threading.Tasks.Task.FromResult(0);
+    }
+
+    private void ProcessRequestInternal(object httpRes)
+    {
+        try
         {
-            response.ContentType = "text/html; charset=utf-8";
-            response.Write(_plugin.GetCoHostPageHtml());
+            // httpRes implements IResponse which has OutputStream, ContentType, StatusCode, Close()
+            var resType = httpRes.GetType();
+            var contentTypeProp = resType.GetProperty("ContentType");
+            var outputStreamProp = resType.GetProperty("OutputStream");
+            var closeMethod = resType.GetMethod("Close", new Type[0]);
+
+            string subPath = _path.Replace("/partyline", "").TrimStart('/');
+            string body;
+            string contentType;
+
+            if (subPath == "" || subPath == "join" || subPath == "join/")
+            {
+                contentType = "text/html; charset=utf-8";
+                body = _plugin.GetCoHostPageHtml();
+            }
+            else if (subPath == "api/status")
+            {
+                contentType = "application/json";
+                body = "{\"connected\":" + _plugin.GetCoHostCount() + "}";
+            }
+            else
+            {
+                contentType = "text/plain";
+                body = "Not found";
+            }
+
+            if (contentTypeProp != null) contentTypeProp.SetValue(httpRes, contentType);
+
+            var stream = outputStreamProp.GetValue(httpRes) as Stream;
+            if (stream != null)
+            {
+                var bytes = Encoding.UTF8.GetBytes(body);
+                stream.Write(bytes, 0, bytes.Length);
+            }
+
+            if (closeMethod != null) closeMethod.Invoke(httpRes, null);
         }
-        else if (subPath == "api/status")
+        catch (Exception ex)
         {
-            response.ContentType = "application/json";
-            response.Write("{\"connected\":" + _plugin.GetCoHostCount() + "}");
-        }
-        else
-        {
-            response.StatusCode = 404;
-            response.Write("Not found");
+            NewPlugin.LogStatic("Handler error: " + ex.Message);
         }
     }
 }
