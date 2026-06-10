@@ -3,28 +3,24 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
-using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
-using System.Threading.Tasks;
 using System.Windows.Forms;
 using PlayIt.PluginEngine;
 
 public class NewPlugin : Plugin<IPlayItLiveApp>
 {
     private CancellationTokenSource _cts;
-    private Thread _serverThread;
-    private int _activePort = 8888;
-    private const string URL_PATH = "/partyline/";
+    private int _activePort = 25433;
     private static string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Partyline", "partyline.log");
 
     // Co-host sessions
     private ConcurrentDictionary<string, CoHostConnection> _cohosts = new ConcurrentDictionary<string, CoHostConnection>();
 
     // Audio ring buffer for mixed co-host audio (44100Hz mono 16-bit)
-    private short[] _ringBuffer = new short[44100 * 2]; // ~2 seconds
+    private short[] _ringBuffer = new short[44100 * 2];
     private int _writePos = 0;
     private readonly object _audioLock = new object();
 
@@ -56,9 +52,8 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             App.RegisterUserControl(() => new PartylineStatusControl(this), UserControlLocation.BelowTrackList, 100);
             Log("UI control registered.");
 
-            // Start HTTP/WebSocket server
-            _serverThread = new Thread(StartServer) { IsBackground = true, Name = "Partyline" };
-            _serverThread.Start();
+            // Hook into PlayIt Live's ServiceStack HTTP server on port 25433
+            HookIntoServiceStack();
 
             Log("Plugin started successfully.");
         }
@@ -68,234 +63,124 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         }
     }
 
-    private void StartServer()
+    private void HookIntoServiceStack()
     {
-        try
+        Log("Hooking into ServiceStack on port 25433...");
+
+        // Find ServiceStackHost.Instance
+        Type hostType = null;
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
-            // Approach: Find PlayIt Live's HttpListener via reflection and add our prefix
-            // PlayIt Live uses ServiceStack which wraps an HttpListener
-            Log("Searching for HttpListener in AppDomain...");
-            
-            System.Net.HttpListener existingListener = null;
+            hostType = asm.GetType("ServiceStack.ServiceStackHost");
+            if (hostType != null) break;
+        }
+
+        if (hostType == null)
+        {
+            Log("ERROR: ServiceStack.ServiceStackHost type not found in loaded assemblies");
+            LogLoadedAssemblies();
+            return;
+        }
+
+        Log("Found ServiceStackHost type: " + hostType.FullName);
+
+        var instanceProp = hostType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
+        if (instanceProp == null)
+        {
+            Log("ERROR: Instance property not found");
+            return;
+        }
+
+        var instance = instanceProp.GetValue(null);
+        if (instance == null)
+        {
+            Log("ERROR: ServiceStackHost.Instance is null");
+            return;
+        }
+
+        Log("Got AppHost instance: " + instance.GetType().FullName);
+
+        // Get RawHttpHandlers list
+        var rawProp = instance.GetType().GetProperty("RawHttpHandlers", BindingFlags.Public | BindingFlags.Instance);
+        if (rawProp == null)
+        {
+            // Try on the base type
+            rawProp = hostType.GetProperty("RawHttpHandlers", BindingFlags.Public | BindingFlags.Instance);
+        }
+
+        if (rawProp == null)
+        {
+            Log("ERROR: RawHttpHandlers property not found");
+            return;
+        }
+
+        var handlersList = rawProp.GetValue(instance);
+        Log("Got RawHttpHandlers list: " + handlersList.GetType().FullName);
+
+        // The list is List<Func<IHttpRequest, IHttpHandler>>
+        // Find the types
+        Type iHttpRequestType = null;
+        Type iHttpHandlerType = null;
+
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            if (iHttpRequestType == null)
+                iHttpRequestType = asm.GetType("ServiceStack.Web.IHttpRequest");
+            if (iHttpHandlerType == null)
+                iHttpHandlerType = asm.GetType("ServiceStack.Web.IHttpHandler");
+        }
+
+        if (iHttpRequestType == null)
+        {
+            Log("ERROR: Could not find ServiceStack.Web.IHttpRequest");
+            return;
+        }
+        if (iHttpHandlerType == null)
+        {
+            Log("ERROR: Could not find ServiceStack.Web.IHttpHandler - trying System.Web.IHttpHandler");
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
-                foreach (var type in SafeGetTypes(asm))
-                {
-                    if (type.FullName != null && type.FullName.Contains("HttpListenerBase"))
-                    {
-                        Log("Found type: " + type.FullName);
-                        // Look for the Listener property
-                        var listenerField = type.GetField("Listener", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                        if (listenerField != null)
-                        {
-                            Log("Found Listener field on " + type.FullName);
-                        }
-                    }
-                }
+                iHttpHandlerType = asm.GetType("System.Web.IHttpHandler");
+                if (iHttpHandlerType != null) break;
             }
-
-            // If we can't hook into the existing listener, use TcpListener instead
-            // TcpListener doesn't use HTTP.sys, so no URL ACL conflicts
-            Log("Starting raw TcpListener on port 8888...");
-            var tcpListener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Any, 8888);
-            tcpListener.Start();
-            _activePort = 8888;
-            Log("TcpListener started on port " + _activePort);
-
-            while (!_cts.IsCancellationRequested)
-            {
-                try
-                {
-                    var client = tcpListener.AcceptTcpClient();
-                    ThreadPool.QueueUserWorkItem(_ => HandleTcpClient(client));
-                }
-                catch (System.Net.Sockets.SocketException ex)
-                {
-                    Log("SocketException: " + ex.Message);
-                    break;
-                }
-            }
-            tcpListener.Stop();
         }
-        catch (Exception ex)
+
+        Log("IHttpRequest type: " + (iHttpRequestType != null ? iHttpRequestType.FullName : "null"));
+        Log("IHttpHandler type: " + (iHttpHandlerType != null ? iHttpHandlerType.FullName : "null"));
+
+        // Create our handler delegate: Func<IHttpRequest, IHttpHandler>
+        // Our method returns null for non-partyline paths (ServiceStack continues normal processing)
+        // For /partyline/ paths, we return a custom handler
+        var funcType = typeof(Func<,>).MakeGenericType(iHttpRequestType, iHttpHandlerType);
+        var wrapper = new RequestInterceptor(this, iHttpRequestType, iHttpHandlerType);
+        var method = typeof(RequestInterceptor).GetMethod("Intercept");
+        var del = Delegate.CreateDelegate(funcType, wrapper, method);
+
+        // Add to the list
+        var addMethod = handlersList.GetType().GetMethod("Insert");
+        if (addMethod != null)
         {
-            Log("FATAL in StartServer: " + ex.ToString());
+            // Insert at position 0 so we get first dibs
+            addMethod.Invoke(handlersList, new object[] { 0, del });
+            Log("SUCCESS: Registered handler at position 0 in RawHttpHandlers");
         }
+        else
+        {
+            var addMethod2 = handlersList.GetType().GetMethod("Add");
+            addMethod2.Invoke(handlersList, new object[] { del });
+            Log("SUCCESS: Added handler to RawHttpHandlers");
+        }
+
+        Log("Partyline is now available at https://localhost:25433/partyline/join");
     }
 
-    private Type[] SafeGetTypes(System.Reflection.Assembly asm)
+    private void LogLoadedAssemblies()
     {
-        try { return asm.GetTypes(); }
-        catch { return new Type[0]; }
-    }
-
-    private void HandleTcpClient(System.Net.Sockets.TcpClient client)
-    {
-        try
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
-            var stream = client.GetStream();
-            var reader = new StreamReader(stream);
-            var writer = new StreamWriter(stream);
-            writer.AutoFlush = true;
-
-            // Read HTTP request line
-            string requestLine = reader.ReadLine();
-            if (requestLine == null) { client.Close(); return; }
-
-            // Read headers
-            string line;
-            string upgradeHeader = null;
-            string wsKey = null;
-            while ((line = reader.ReadLine()) != null && line != "")
-            {
-                if (line.StartsWith("Upgrade:", StringComparison.OrdinalIgnoreCase))
-                    upgradeHeader = line.Substring(8).Trim();
-                if (line.StartsWith("Sec-WebSocket-Key:", StringComparison.OrdinalIgnoreCase))
-                    wsKey = line.Substring(18).Trim();
-            }
-
-            // Parse path
-            string[] parts = requestLine.Split(' ');
-            string method = parts[0];
-            string path = parts.Length > 1 ? parts[1] : "/";
-            path = path.Replace("/partyline", "").TrimStart('/');
-
-            if (upgradeHeader != null && upgradeHeader.ToLower() == "websocket" && wsKey != null)
-            {
-                // WebSocket upgrade
-                HandleWebSocketUpgrade(stream, wsKey);
-            }
-            else
-            {
-                // Regular HTTP
-                string responseBody = "";
-                string contentType = "text/html; charset=utf-8";
-                int statusCode = 200;
-
-                if (path == "" || path == "join" || path == "join/")
-                {
-                    responseBody = GetCoHostPage();
-                }
-                else if (path == "api/status")
-                {
-                    contentType = "application/json";
-                    responseBody = "{\"connected\":" + _cohosts.Count + "}";
-                }
-                else
-                {
-                    statusCode = 404;
-                    responseBody = "Not found";
-                    contentType = "text/plain";
-                }
-
-                string response = "HTTP/1.1 " + statusCode + " OK\r\n" +
-                    "Content-Type: " + contentType + "\r\n" +
-                    "Content-Length: " + Encoding.UTF8.GetByteCount(responseBody) + "\r\n" +
-                    "Connection: close\r\n" +
-                    "\r\n" +
-                    responseBody;
-                byte[] responseBytes = Encoding.UTF8.GetBytes(response);
-                stream.Write(responseBytes, 0, responseBytes.Length);
-            }
-            client.Close();
+            if (asm.FullName.Contains("ServiceStack") || asm.FullName.Contains("PlayIt"))
+                Log("  Assembly: " + asm.FullName);
         }
-        catch (Exception ex)
-        {
-            Log("HandleTcpClient error: " + ex.Message);
-            try { client.Close(); } catch { }
-        }
-    }
-
-    private void HandleWebSocketUpgrade(System.Net.Sockets.NetworkStream stream, string wsKey)
-    {
-        // Perform WebSocket handshake
-        string acceptKey = Convert.ToBase64String(
-            System.Security.Cryptography.SHA1.Create().ComputeHash(
-                Encoding.UTF8.GetBytes(wsKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
-
-        string handshake = "HTTP/1.1 101 Switching Protocols\r\n" +
-            "Upgrade: websocket\r\n" +
-            "Connection: Upgrade\r\n" +
-            "Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n";
-        byte[] handshakeBytes = Encoding.UTF8.GetBytes(handshake);
-        stream.Write(handshakeBytes, 0, handshakeBytes.Length);
-
-        var id = Guid.NewGuid().ToString("N").Substring(0, 8);
-        Log("WebSocket co-host " + id + " connected");
-
-        // Read WebSocket frames
-        try
-        {
-            while (!_cts.IsCancellationRequested)
-            {
-                // Read frame header
-                int b1 = stream.ReadByte();
-                if (b1 == -1) break;
-                int b2 = stream.ReadByte();
-                if (b2 == -1) break;
-
-                bool fin = (b1 & 0x80) != 0;
-                int opcode = b1 & 0x0F;
-                bool masked = (b2 & 0x80) != 0;
-                int payloadLen = b2 & 0x7F;
-
-                if (opcode == 8) break; // Close frame
-
-                if (payloadLen == 126)
-                {
-                    int hi = stream.ReadByte();
-                    int lo = stream.ReadByte();
-                    payloadLen = (hi << 8) | lo;
-                }
-                else if (payloadLen == 127)
-                {
-                    // 8-byte length - skip for audio frames (shouldn't be this big)
-                    byte[] lenBytes = new byte[8];
-                    stream.Read(lenBytes, 0, 8);
-                    payloadLen = (int)BitConverter.ToInt64(lenBytes, 0);
-                }
-
-                byte[] mask = new byte[4];
-                if (masked) stream.Read(mask, 0, 4);
-
-                byte[] payload = new byte[payloadLen];
-                int read = 0;
-                while (read < payloadLen)
-                {
-                    int n = stream.Read(payload, read, payloadLen - read);
-                    if (n == 0) break;
-                    read += n;
-                }
-
-                // Unmask
-                if (masked)
-                {
-                    for (int i = 0; i < payload.Length; i++)
-                        payload[i] = (byte)(payload[i] ^ mask[i % 4]);
-                }
-
-                // Binary frame = audio data (16-bit PCM)
-                if (opcode == 2 && payload.Length > 0)
-                {
-                    int sampleCount = payload.Length / 2;
-                    lock (_audioLock)
-                    {
-                        for (int i = 0; i < sampleCount; i++)
-                        {
-                            short sample = BitConverter.ToInt16(payload, i * 2);
-                            int mixed = _ringBuffer[_writePos] + sample;
-                            _ringBuffer[_writePos] = (short)Math.Max(-32768, Math.Min(32767, mixed));
-                            _writePos = (_writePos + 1) % _ringBuffer.Length;
-                        }
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Log("WebSocket error for " + id + ": " + ex.Message);
-        }
-        Log("WebSocket co-host " + id + " disconnected");
     }
 
     // Called by PlayIt Live's audio pipeline when it needs samples
@@ -310,7 +195,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             for (int i = 0; i < sampleCount; i++)
             {
                 output[i] = _ringBuffer[readPos];
-                _ringBuffer[readPos] = 0; // Clear after reading
+                _ringBuffer[readPos] = 0;
                 readPos = (readPos + 1) % _ringBuffer.Length;
             }
         }
@@ -319,32 +204,29 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         return length;
     }
 
-    // Public accessors for UI
+    internal void WritePcmSamples(byte[] data, int count)
+    {
+        int sampleCount = count / 2;
+        lock (_audioLock)
+        {
+            for (int i = 0; i < sampleCount; i++)
+            {
+                short sample = BitConverter.ToInt16(data, i * 2);
+                int mixed = _ringBuffer[_writePos] + sample;
+                _ringBuffer[_writePos] = (short)Math.Max(-32768, Math.Min(32767, mixed));
+                _writePos = (_writePos + 1) % _ringBuffer.Length;
+            }
+        }
+    }
+
     public int GetCoHostCount() { return _cohosts.Count; }
-    public string GetLink() { return "http://" + Dns.GetHostName() + ":" + _activePort + "/partyline/join"; }
+    public string GetLink() { return "https://" + Dns.GetHostName() + ":25433/partyline/join"; }
 
-    public void MuteAll()
-    {
-        foreach (var c in _cohosts.Values) c.Muted = true;
-    }
+    public void MuteAll() { foreach (var c in _cohosts.Values) c.Muted = true; }
+    public void UnmuteAll() { foreach (var c in _cohosts.Values) c.Muted = false; }
+    public void KickAll() { _cohosts.Clear(); }
 
-    public void UnmuteAll()
-    {
-        foreach (var c in _cohosts.Values) c.Muted = false;
-    }
-
-    public void KickAll()
-    {
-        _cohosts.Clear();
-    }
-
-    public IEnumerable<CoHostConnection> GetConnections() { return _cohosts.Values; }
-
-    public void Kick(string id)
-    {
-        CoHostConnection c;
-        _cohosts.TryRemove(id, out c);
-    }
+    internal string GetCoHostPageHtml() { return GetCoHostPage(); }
 
     public override void Cleanup()
     {
@@ -392,64 +274,110 @@ PUSH TO TALK</button>
 <div class='info'>Hold the button to talk. Release to mute.</div>
 </div>
 <script>
-let ws, ctx, src, proc, sending=false;
-const SAMPLE_RATE=44100, BUFFER_SIZE=4096;
-
+let ws,ctx,src,proc,sending=false;
+const SR=44100,BUF=4096;
 async function connect(){
  document.getElementById('st').className='status s-wait';
  document.getElementById('st').innerText='Connecting...';
  document.getElementById('conn').disabled=true;
  try{
-  const stream=await navigator.mediaDevices.getUserMedia({audio:{sampleRate:SAMPLE_RATE,channelCount:1,echoCancellation:true}});
-  ctx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SAMPLE_RATE});
+  const stream=await navigator.mediaDevices.getUserMedia({audio:{sampleRate:SR,channelCount:1,echoCancellation:true}});
+  ctx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
   src=ctx.createMediaStreamSource(stream);
-  proc=ctx.createScriptProcessor(BUFFER_SIZE,1,1);
-  src.connect(proc);
-  proc.connect(ctx.destination);
-
-  const proto=location.protocol==='https:'?'wss:':'ws:';
-  ws=new WebSocket(proto+'//'+location.host+'/partyline/ws');
+  proc=ctx.createScriptProcessor(BUF,1,1);
+  src.connect(proc);proc.connect(ctx.destination);
+  ws=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/partyline/ws');
   ws.binaryType='arraybuffer';
-
-  ws.onopen=()=>{
-   document.getElementById('st').className='status s-on';
-   document.getElementById('st').innerText='Connected ✓';
-   document.getElementById('ptt').disabled=false;
-  };
-  ws.onclose=()=>{
-   document.getElementById('st').className='status s-off';
-   document.getElementById('st').innerText='Disconnected';
-   document.getElementById('ptt').disabled=true;
-   document.getElementById('conn').disabled=false;
-   sending=false;
-  };
-  ws.onerror=()=>{ ws.close(); };
-
+  ws.onopen=()=>{document.getElementById('st').className='status s-on';document.getElementById('st').innerText='Connected ✓';document.getElementById('ptt').disabled=false;};
+  ws.onclose=()=>{document.getElementById('st').className='status s-off';document.getElementById('st').innerText='Disconnected';document.getElementById('ptt').disabled=true;document.getElementById('conn').disabled=false;sending=false;};
+  ws.onerror=()=>{ws.close();};
   proc.onaudioprocess=(e)=>{
    if(!sending||!ws||ws.readyState!==1)return;
-   const input=e.inputBuffer.getChannelData(0);
-   const pcm16=new Int16Array(input.length);
-   for(let i=0;i<input.length;i++){
-    pcm16[i]=Math.max(-32768,Math.min(32767,Math.round(input[i]*32767)));
-   }
-   ws.send(pcm16.buffer);
-   // VU
-   let max=0;
-   for(let i=0;i<input.length;i++){let v=Math.abs(input[i]);if(v>max)max=v;}
-   document.getElementById('vu').style.width=(max*100)+'%';
+   const d=e.inputBuffer.getChannelData(0);const p=new Int16Array(d.length);
+   for(let i=0;i<d.length;i++)p[i]=Math.max(-32768,Math.min(32767,Math.round(d[i]*32767)));
+   ws.send(p.buffer);
+   let m=0;for(let i=0;i<d.length;i++){let v=Math.abs(d[i]);if(v>m)m=v;}
+   document.getElementById('vu').style.width=(m*100)+'%';
   };
- }catch(err){
-  document.getElementById('st').className='status s-off';
-  document.getElementById('st').innerText='Error: '+err.message;
-  document.getElementById('conn').disabled=false;
- }
+ }catch(err){document.getElementById('st').className='status s-off';document.getElementById('st').innerText='Error: '+err.message;document.getElementById('conn').disabled=false;}
 }
-
 function pttOn(){sending=true;document.getElementById('ptt').className='btn ptt ptt-on';document.getElementById('ptt').innerText='🎙️ LIVE';}
 function pttOff(){sending=false;document.getElementById('ptt').className='btn ptt ptt-off';document.getElementById('ptt').innerText='PUSH TO TALK';document.getElementById('vu').style.width='0%';}
 </script>
 </body>
 </html>";
+    }
+}
+
+// --- Handler that intercepts /partyline/ requests from ServiceStack ---
+public class RequestInterceptor
+{
+    private NewPlugin _plugin;
+    private Type _requestType;
+    private Type _handlerType;
+
+    public RequestInterceptor(NewPlugin plugin, Type requestType, Type handlerType)
+    {
+        _plugin = plugin;
+        _requestType = requestType;
+        _handlerType = handlerType;
+    }
+
+    // This method signature must match Func<IHttpRequest, IHttpHandler>
+    // Return null to let ServiceStack handle it normally
+    // Return a handler to intercept
+    public object Intercept(object httpRequest)
+    {
+        try
+        {
+            // Get PathInfo from the request
+            var pathInfoProp = _requestType.GetProperty("PathInfo");
+            if (pathInfoProp == null) return null;
+
+            string pathInfo = pathInfoProp.GetValue(httpRequest) as string;
+            if (pathInfo == null || !pathInfo.StartsWith("/partyline")) return null;
+
+            // This is our request! Return a custom handler
+            return new PartylineHttpHandler(_plugin, pathInfo);
+        }
+        catch { return null; }
+    }
+}
+
+// Custom HTTP handler for /partyline/ requests
+public class PartylineHttpHandler : System.Web.IHttpHandler
+{
+    private NewPlugin _plugin;
+    private string _path;
+
+    public PartylineHttpHandler(NewPlugin plugin, string path)
+    {
+        _plugin = plugin;
+        _path = path;
+    }
+
+    public bool IsReusable { get { return false; } }
+
+    public void ProcessRequest(System.Web.HttpContext context)
+    {
+        string subPath = _path.Replace("/partyline", "").TrimStart('/');
+        var response = context.Response;
+
+        if (subPath == "" || subPath == "join" || subPath == "join/")
+        {
+            response.ContentType = "text/html; charset=utf-8";
+            response.Write(_plugin.GetCoHostPageHtml());
+        }
+        else if (subPath == "api/status")
+        {
+            response.ContentType = "application/json";
+            response.Write("{\"connected\":" + _plugin.GetCoHostCount() + "}");
+        }
+        else
+        {
+            response.StatusCode = 404;
+            response.Write("Not found");
+        }
     }
 }
 
@@ -471,7 +399,6 @@ public class CoHostConnection
     }
 }
 
-// Implements PlayIt Live's ISpecialAudioStream
 public class PartylineStream : ISpecialAudioStream
 {
     private NewPlugin _plugin;
@@ -489,7 +416,6 @@ public class PartylineStreamContainer : IStreamContainer
     public void Cleanup() { }
 }
 
-// Embedded status control for PlayIt Live UI
 public class PartylineStatusControl : UserControl
 {
     private NewPlugin _plugin;
@@ -530,8 +456,9 @@ public class PartylineStatusControl : UserControl
         _mixerBtn.Click += (s, e) =>
         {
             Clipboard.SetText(_plugin.GetLink());
-            _mixerBtn.Text = "Copied ✓";
-            var t = new System.Windows.Forms.Timer { Interval = 2000 };
+            _mixerBtn.Text = "Copied!";
+            var t = new System.Windows.Forms.Timer();
+            t.Interval = 2000;
             t.Tick += (s2, e2) => { _mixerBtn.Text = "Copy Link"; t.Stop(); t.Dispose(); };
             t.Start();
         };
@@ -540,7 +467,8 @@ public class PartylineStatusControl : UserControl
         layout.Controls.Add(_mixerBtn);
         Controls.Add(layout);
 
-        _timer = new System.Windows.Forms.Timer { Interval = 1000 };
+        _timer = new System.Windows.Forms.Timer();
+        _timer.Interval = 1000;
         _timer.Tick += (s, e) => { _label.Text = "🎙️ Partyline: " + _plugin.GetCoHostCount() + " connected"; };
         _timer.Start();
     }
