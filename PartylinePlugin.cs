@@ -50,7 +50,19 @@ namespace Partyline
             _menuItem.DropDownItems.Add(new ToolStripSeparator());
             _menuItem.DropDownItems.Add(new ToolStripMenuItem("Disconnect All", null, OnDisconnectAll));
 
-            App.GetMenuStrip()?.Items.Add(_menuItem);
+            // Find the main form's menu strip
+            var mainForm = Application.OpenForms.Count > 0 ? Application.OpenForms[0] : null;
+            if (mainForm != null)
+            {
+                foreach (Control c in mainForm.Controls)
+                {
+                    if (c is MenuStrip menuStrip)
+                    {
+                        menuStrip.Items.Add(_menuItem);
+                        break;
+                    }
+                }
+            }
         }
 
         private void StartServer()

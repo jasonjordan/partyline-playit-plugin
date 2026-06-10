@@ -24,8 +24,6 @@ namespace Partyline
         private int _writePos;
         private int _readPos;
 
-        private bool _registered;
-
         public CoHostManager(IAudioPipeline pipeline)
         {
             _pipeline = pipeline;
@@ -33,7 +31,6 @@ namespace Partyline
 
             // Register our audio stream into PlayIt Live's mixer
             pipeline.RegisterSpecialAudioStream("partyline-cohost", new PartylineAudioStream(this));
-            _registered = true;
         }
 
         /// <summary>
@@ -57,7 +54,7 @@ namespace Partyline
             var audioTrack = new MediaStreamTrack(SDPMediaTypesEnum.audio, false,
                 new List<SDPAudioVideoMediaFormat>
                 {
-                    new SDPAudioVideoMediaFormat(SDPWellKnownMediaFormatsEnum.OPUS)
+                    new SDPAudioVideoMediaFormat(SDPWellKnownMediaFormatsEnum.PCMU)
                 });
             pc.addTrack(audioTrack);
 
@@ -66,8 +63,9 @@ namespace Partyline
             {
                 if (mediaType == SDPMediaTypesEnum.audio)
                 {
-                    // Decode Opus → PCM and write to mix buffer
-                    var session = _sessions.GetValueOrDefault(sessionId);
+                    // Decode → PCM and write to mix buffer
+                    CoHostSession session;
+                    _sessions.TryGetValue(sessionId, out session);
                     session?.OnAudioReceived(rtpPacket.Payload);
                 }
             };
@@ -106,11 +104,15 @@ namespace Partyline
         public void AddIceCandidate(string json)
         {
             var data = JsonConvert.DeserializeObject<Dictionary<string, string>>(json);
-            var sessionId = data.GetValueOrDefault("sessionId");
-            var candidate = data.GetValueOrDefault("candidate");
-            var sdpMid = data.GetValueOrDefault("sdpMid");
+            string sessionId = null;
+            string candidate = null;
+            string sdpMid = null;
+            data.TryGetValue("sessionId", out sessionId);
+            data.TryGetValue("candidate", out candidate);
+            data.TryGetValue("sdpMid", out sdpMid);
 
-            if (sessionId != null && _sessions.TryGetValue(sessionId, out var session))
+            CoHostSession session;
+            if (sessionId != null && _sessions.TryGetValue(sessionId, out session))
             {
                 session.PeerConnection.addIceCandidate(new RTCIceCandidateInit
                 {
