@@ -54,7 +54,9 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             Log("UI control registered.");
 
             // Hook into PlayIt Live's ServiceStack HTTP server on port 25433
-            HookIntoServiceStack();
+            // Wait for the server to start (user clicks "Start Server" manually)
+            var hookThread = new Thread(() => WaitAndHook()) { IsBackground = true, Name = "PartylineHook" };
+            hookThread.Start();
 
             Log("Plugin started successfully.");
         }
@@ -62,6 +64,51 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         {
             Log("FATAL in Run(): " + ex.ToString());
         }
+    }
+
+    private void WaitAndHook()
+    {
+        // Wait until ServiceStack server is actually listening
+        Log("Waiting for ServiceStack server to start...");
+        for (int i = 0; i < 120; i++) // Wait up to 2 minutes
+        {
+            Thread.Sleep(1000);
+            if (_cts.IsCancellationRequested) return;
+
+            try
+            {
+                Type hostType = null;
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    hostType = asm.GetType("ServiceStack.ServiceStackHost");
+                    if (hostType != null) break;
+                }
+                if (hostType == null) continue;
+
+                var instanceProp = hostType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
+                if (instanceProp == null) continue;
+
+                var instance = instanceProp.GetValue(null);
+                if (instance == null) continue;
+
+                // Check if IsReady
+                var isReadyMethod = hostType.GetMethod("IsReady", BindingFlags.Public | BindingFlags.Static);
+                if (isReadyMethod != null)
+                {
+                    bool ready = (bool)isReadyMethod.Invoke(null, null);
+                    if (!ready) continue;
+                }
+
+                Log("ServiceStack server is ready. Hooking in...");
+                HookIntoServiceStack();
+                return;
+            }
+            catch (Exception ex)
+            {
+                Log("WaitAndHook check error: " + ex.Message);
+            }
+        }
+        Log("Timed out waiting for ServiceStack server.");
     }
 
     private void HookIntoServiceStack()
