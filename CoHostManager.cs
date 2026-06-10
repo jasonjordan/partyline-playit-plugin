@@ -51,12 +51,7 @@ namespace Partyline
             });
 
             // We want to receive audio from the co-host
-            var audioTrack = new MediaStreamTrack(SDPMediaTypesEnum.audio, false,
-                new List<SDPAudioVideoMediaFormat>
-                {
-                    new SDPAudioVideoMediaFormat(SDPWellKnownMediaFormatsEnum.PCMU)
-                });
-            pc.addTrack(audioTrack);
+            pc.addTrack(new MediaStreamTrack(SDPMediaTypesEnum.audio, false, new List<SDPAudioVideoMediaFormat>()));
 
             // Handle incoming audio from co-host
             pc.OnRtpPacketReceived += (ep, mediaType, rtpPacket) =>
