@@ -139,7 +139,6 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         if (hostType == null)
         {
             Log("ERROR: ServiceStack.ServiceStackHost type not found in loaded assemblies");
-            LogLoadedAssemblies();
             return;
         }
 
@@ -471,119 +470,6 @@ function pttOff(){sending=false;document.getElementById('ptt').className='btn pt
 </script>
 </body>
 </html>";
-    }
-}
-
-// --- Handler that intercepts /partyline/ requests from ServiceStack ---
-public class RequestInterceptor
-{
-    private NewPlugin _plugin;
-    private PropertyInfo _pathInfoProp;
-
-    public RequestInterceptor(NewPlugin plugin, PropertyInfo pathInfoProp)
-    {
-        _plugin = plugin;
-        _pathInfoProp = pathInfoProp;
-    }
-
-    // Signature: System.Web.IHttpHandler Intercept(ServiceStack.Web.IHttpRequest)
-    // But since we can't reference ServiceStack.Web.IHttpRequest at compile time,
-    // we use 'object' for the parameter - this won't work with CreateDelegate.
-    // Instead we need the ACTUAL parameter type.
-    // The solution: this method is never called via CreateDelegate directly.
-    // We use a different approach below.
-    public System.Web.IHttpHandler Intercept(object httpRequest)
-    {
-        try
-        {
-            if (_pathInfoProp == null) return null;
-            string pathInfo = _pathInfoProp.GetValue(httpRequest) as string;
-            if (pathInfo == null || !pathInfo.StartsWith("/partyline")) return null;
-            return new PartylineHttpHandler(_plugin, pathInfo);
-        }
-        catch { return null; }
-    }
-}
-
-// Custom HTTP handler for /partyline/ requests
-// Must implement IServiceStackHandler for ServiceStack to execute it
-public class PartylineHttpHandler : System.Web.IHttpHandler
-{
-    private NewPlugin _plugin;
-    private string _path;
-
-    public PartylineHttpHandler(NewPlugin plugin, string path)
-    {
-        _plugin = plugin;
-        _path = path;
-    }
-
-    public bool IsReusable { get { return false; } }
-
-    public string RequestName { get { return "Partyline"; } }
-
-    public void ProcessRequest(System.Web.HttpContext context)
-    {
-        // Not used by ServiceStack's HttpListener host
-    }
-
-    // This is what ServiceStack actually calls
-    public void ProcessRequest(object httpReq, object httpRes, string operationName)
-    {
-        ProcessRequestInternal(httpRes);
-    }
-
-    public System.Threading.Tasks.Task ProcessRequestAsync(object httpReq, object httpRes, string operationName)
-    {
-        ProcessRequestInternal(httpRes);
-        return System.Threading.Tasks.Task.FromResult(0);
-    }
-
-    private void ProcessRequestInternal(object httpRes)
-    {
-        try
-        {
-            // httpRes implements IResponse which has OutputStream, ContentType, StatusCode, Close()
-            var resType = httpRes.GetType();
-            var contentTypeProp = resType.GetProperty("ContentType");
-            var outputStreamProp = resType.GetProperty("OutputStream");
-            var closeMethod = resType.GetMethod("Close", new Type[0]);
-
-            string subPath = _path.Replace("/partyline", "").TrimStart('/');
-            string body;
-            string contentType;
-
-            if (subPath == "" || subPath == "join" || subPath == "join/")
-            {
-                contentType = "text/html; charset=utf-8";
-                body = _plugin.GetCoHostPageHtml();
-            }
-            else if (subPath == "api/status")
-            {
-                contentType = "application/json";
-                body = "{\"connected\":" + _plugin.GetCoHostCount() + "}";
-            }
-            else
-            {
-                contentType = "text/plain";
-                body = "Not found";
-            }
-
-            if (contentTypeProp != null) contentTypeProp.SetValue(httpRes, contentType);
-
-            var stream = outputStreamProp.GetValue(httpRes) as Stream;
-            if (stream != null)
-            {
-                var bytes = Encoding.UTF8.GetBytes(body);
-                stream.Write(bytes, 0, bytes.Length);
-            }
-
-            if (closeMethod != null) closeMethod.Invoke(httpRes, null);
-        }
-        catch (Exception ex)
-        {
-            NewPlugin.LogStatic("Handler error: " + ex.Message);
-        }
     }
 }
 
