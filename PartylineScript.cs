@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq.Expressions;
 using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -145,32 +146,42 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             }
         }
 
-        Log("IHttpRequest type: " + (iHttpRequestType != null ? iHttpRequestType.FullName : "null"));
-        Log("IHttpHandler type: " + (iHttpHandlerType != null ? iHttpHandlerType.FullName : "null"));
+        // The list is List<Func<ServiceStack.Web.IHttpRequest, System.Web.IHttpHandler>>
+        // We need to add a Func that accepts IHttpRequest and returns IHttpHandler (or null).
+        // Since we can't reference ServiceStack.Web.IHttpRequest at compile time,
+        // we build the delegate using System.Linq.Expressions.
 
-        // Create our handler delegate: Func<IHttpRequest, IHttpHandler>
-        // Our method returns null for non-partyline paths (ServiceStack continues normal processing)
-        // For /partyline/ paths, we return a custom handler
-        var funcType = typeof(Func<,>).MakeGenericType(iHttpRequestType, iHttpHandlerType);
-        var wrapper = new RequestInterceptor(this, iHttpRequestType, iHttpHandlerType);
-        var method = typeof(RequestInterceptor).GetMethod("Intercept");
-        var del = Delegate.CreateDelegate(funcType, wrapper, method);
+        var pathInfoProp = iHttpRequestType.GetProperty("PathInfo");
+        Log("PathInfo property: " + (pathInfoProp != null ? "found" : "NOT FOUND"));
 
-        // Add to the list
-        var addMethod = handlersList.GetType().GetMethod("Insert");
-        if (addMethod != null)
-        {
-            // Insert at position 0 so we get first dibs
-            addMethod.Invoke(handlersList, new object[] { 0, del });
-            Log("SUCCESS: Registered handler at position 0 in RawHttpHandlers");
-        }
-        else
-        {
-            var addMethod2 = handlersList.GetType().GetMethod("Add");
-            addMethod2.Invoke(handlersList, new object[] { del });
-            Log("SUCCESS: Added handler to RawHttpHandlers");
-        }
+        // Build: (IHttpRequest req) => { var p = req.PathInfo; if p starts with /partyline return handler; else return null; }
+        var reqParam = System.Linq.Expressions.Expression.Parameter(iHttpRequestType, "req");
+        var pathExpr = System.Linq.Expressions.Expression.Property(reqParam, pathInfoProp);
 
+        var startsWithMethod = typeof(string).GetMethod("StartsWith", new Type[] { typeof(string) });
+        var checkExpr = System.Linq.Expressions.Expression.Call(pathExpr, startsWithMethod, System.Linq.Expressions.Expression.Constant("/partyline"));
+
+        // Build the handler construction: new PartylineHttpHandler(plugin, pathInfo)
+        var pluginConst = System.Linq.Expressions.Expression.Constant(this);
+        var handlerCtor = typeof(PartylineHttpHandler).GetConstructor(new Type[] { typeof(NewPlugin), typeof(string) });
+        var newHandlerExpr = System.Linq.Expressions.Expression.New(handlerCtor, pluginConst, pathExpr);
+
+        var nullExpr = System.Linq.Expressions.Expression.Constant(null, typeof(System.Web.IHttpHandler));
+        var condExpr = System.Linq.Expressions.Expression.Condition(checkExpr, 
+            System.Linq.Expressions.Expression.Convert(newHandlerExpr, typeof(System.Web.IHttpHandler)), 
+            nullExpr);
+
+        var funcTypeFromList = handlersList.GetType().GetGenericArguments()[0];
+        var lambda = System.Linq.Expressions.Expression.Lambda(funcTypeFromList, condExpr, reqParam);
+        var del = lambda.Compile();
+
+        Log("Compiled lambda delegate successfully");
+
+        // Insert at position 0
+        var listType = handlersList.GetType();
+        var insertMethod = listType.GetMethod("Insert");
+        insertMethod.Invoke(handlersList, new object[] { 0, del });
+        Log("SUCCESS: Inserted handler at position 0 in RawHttpHandlers");
         Log("Partyline is now available at https://localhost:25433/partyline/join");
     }
 
@@ -313,31 +324,27 @@ function pttOff(){sending=false;document.getElementById('ptt').className='btn pt
 public class RequestInterceptor
 {
     private NewPlugin _plugin;
-    private Type _requestType;
-    private Type _handlerType;
+    private PropertyInfo _pathInfoProp;
 
-    public RequestInterceptor(NewPlugin plugin, Type requestType, Type handlerType)
+    public RequestInterceptor(NewPlugin plugin, PropertyInfo pathInfoProp)
     {
         _plugin = plugin;
-        _requestType = requestType;
-        _handlerType = handlerType;
+        _pathInfoProp = pathInfoProp;
     }
 
-    // This method signature must match Func<IHttpRequest, IHttpHandler>
-    // Return null to let ServiceStack handle it normally
-    // Return a handler to intercept
-    public object Intercept(object httpRequest)
+    // Signature: System.Web.IHttpHandler Intercept(ServiceStack.Web.IHttpRequest)
+    // But since we can't reference ServiceStack.Web.IHttpRequest at compile time,
+    // we use 'object' for the parameter - this won't work with CreateDelegate.
+    // Instead we need the ACTUAL parameter type.
+    // The solution: this method is never called via CreateDelegate directly.
+    // We use a different approach below.
+    public System.Web.IHttpHandler Intercept(object httpRequest)
     {
         try
         {
-            // Get PathInfo from the request
-            var pathInfoProp = _requestType.GetProperty("PathInfo");
-            if (pathInfoProp == null) return null;
-
-            string pathInfo = pathInfoProp.GetValue(httpRequest) as string;
+            if (_pathInfoProp == null) return null;
+            string pathInfo = _pathInfoProp.GetValue(httpRequest) as string;
             if (pathInfo == null || !pathInfo.StartsWith("/partyline")) return null;
-
-            // This is our request! Return a custom handler
             return new PartylineHttpHandler(_plugin, pathInfo);
         }
         catch { return null; }
