@@ -258,7 +258,7 @@ namespace Partyline
     /// <summary>
     /// Represents a single co-host WebRTC session.
     /// </summary>
-    internal class CoHostSession
+    public class CoHostSession
     {
         public string Id { get; }
         public RTCPeerConnection PeerConnection { get; }
