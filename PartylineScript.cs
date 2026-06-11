@@ -493,6 +493,23 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
                     authResult = _authManager.Authenticate(username, password);
                 }
 
+                // Capture remote IP on successful login
+                if (authResult.Success)
+                {
+                    string remoteIp = GetRemoteIp(request);
+                    string cohostIdForIp = authResult.DisplayName;
+                    // Resolve cohostId from token session
+                    string tokenCohostId;
+                    if (_authManager.ValidateToken(authResult.Token, out tokenCohostId))
+                    {
+                        cohostIdForIp = tokenCohostId;
+                    }
+                    if (remoteIp != null && remoteIp.Length > 0)
+                    {
+                        _audioMixer.SetIp(cohostIdForIp, remoteIp);
+                    }
+                }
+
                 string jsonResponse;
                 if (authResult.Success)
                 {
@@ -647,6 +664,54 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             {
                 return reader.ReadToEnd();
             }
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private string GetRemoteIp(object request)
+    {
+        try
+        {
+            var reqType = request.GetType();
+
+            // Try RemoteIp property directly on the request object
+            PropertyInfo remoteIpProp = reqType.GetProperty("RemoteIp");
+            if (remoteIpProp != null)
+            {
+                string ip = remoteIpProp.GetValue(request) as string;
+                if (ip != null && ip.Length > 0) return ip;
+            }
+
+            // Try UserHostAddress property
+            PropertyInfo hostAddrProp = reqType.GetProperty("UserHostAddress");
+            if (hostAddrProp != null)
+            {
+                string ip = hostAddrProp.GetValue(request) as string;
+                if (ip != null && ip.Length > 0) return ip;
+            }
+
+            // Check interfaces for RemoteIp or UserHostAddress
+            Type[] interfaces = reqType.GetInterfaces();
+            for (int i = 0; i < interfaces.Length; i++)
+            {
+                PropertyInfo ifaceProp = interfaces[i].GetProperty("RemoteIp");
+                if (ifaceProp != null)
+                {
+                    string ip = ifaceProp.GetValue(request) as string;
+                    if (ip != null && ip.Length > 0) return ip;
+                }
+                ifaceProp = interfaces[i].GetProperty("UserHostAddress");
+                if (ifaceProp != null)
+                {
+                    string ip = ifaceProp.GetValue(request) as string;
+                    if (ip != null && ip.Length > 0) return ip;
+                }
+            }
+
+            return "";
         }
         catch
         {
@@ -1488,12 +1553,32 @@ public class AudioMixer
     private ConcurrentDictionary<string, CoHostState> _coHosts;
     private ConcurrentDictionary<string, float> _lastLatency;
     private ConcurrentDictionary<string, bool> _firstAudioLogged;
+    private ConcurrentDictionary<string, string> _cohostIps;
 
     public AudioMixer()
     {
         _coHosts = new ConcurrentDictionary<string, CoHostState>();
         _lastLatency = new ConcurrentDictionary<string, float>();
         _firstAudioLogged = new ConcurrentDictionary<string, bool>();
+        _cohostIps = new ConcurrentDictionary<string, string>();
+    }
+
+    public void SetIp(string cohostId, string ip)
+    {
+        if (cohostId == null) return;
+        if (ip == null) ip = "";
+        _cohostIps[cohostId] = ip;
+    }
+
+    public string GetIp(string cohostId)
+    {
+        if (cohostId == null) return "";
+        string ip;
+        if (_cohostIps.TryGetValue(cohostId, out ip))
+        {
+            return ip;
+        }
+        return "";
     }
 
     public void EnsureCoHost(string cohostId)
@@ -2337,11 +2422,11 @@ public class PartylineControlPanel : UserControl
         titlePanel.Controls.Add(titleLabel);
 
         Button configBtn = new Button();
-        configBtn.Text = "\u2699";
+        configBtn.Text = "\u2699 Configure";
         configBtn.FlatStyle = FlatStyle.Flat;
-        configBtn.Size = new System.Drawing.Size(24, 22);
+        configBtn.Size = new System.Drawing.Size(80, 22);
         configBtn.Dock = DockStyle.Right;
-        configBtn.Font = new System.Drawing.Font("Segoe UI", 10f);
+        configBtn.Font = new System.Drawing.Font("Segoe UI", 8f);
         configBtn.ForeColor = System.Drawing.Color.FromArgb(180, 180, 190);
         configBtn.BackColor = System.Drawing.Color.FromArgb(50, 50, 55);
         configBtn.FlatAppearance.BorderSize = 0;
@@ -2436,6 +2521,17 @@ public class PartylineControlPanel : UserControl
         latencyLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
         rowPanel.Controls.Add(latencyLabel);
         row.LatencyLabel = latencyLabel;
+
+        // IP label (very small gray text after latency)
+        Label ipLabel = new Label();
+        ipLabel.Text = "";
+        ipLabel.ForeColor = System.Drawing.Color.FromArgb(120, 120, 140);
+        ipLabel.Font = new System.Drawing.Font("Segoe UI", 6f);
+        ipLabel.Location = new System.Drawing.Point(150, 18);
+        ipLabel.Size = new System.Drawing.Size(80, 10);
+        ipLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+        rowPanel.Controls.Add(ipLabel);
+        row.IpLabel = ipLabel;
 
         // Mute button
         Button muteBtn = new Button();
@@ -2636,6 +2732,17 @@ public class PartylineControlPanel : UserControl
             {
                 row.LatencyLabel.Text = "";
             }
+
+            // Update IP display
+            string ip = _audioMixer.GetIp(row.CohostId);
+            if (ip != null && ip.Length > 0 && connected)
+            {
+                row.IpLabel.Text = ip;
+            }
+            else
+            {
+                row.IpLabel.Text = "";
+            }
         }
     }
 
@@ -2665,6 +2772,7 @@ internal class CoHostRow
     private Button _liveButton;
     private Label _connectedIndicator;
     private Label _latencyLabel;
+    private Label _ipLabel;
 
     public string CohostId
     {
@@ -2718,5 +2826,11 @@ internal class CoHostRow
     {
         get { return _latencyLabel; }
         set { _latencyLabel = value; }
+    }
+
+    public Label IpLabel
+    {
+        get { return _ipLabel; }
+        set { _ipLabel = value; }
     }
 }
