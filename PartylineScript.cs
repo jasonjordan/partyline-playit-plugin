@@ -59,16 +59,14 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             Log("Initialized AuthenticationManager and AudioMixer.");
 
             // Register audio stream into PlayIt Live's main mix
-            // (delayed until server is ready to avoid file locking conflicts)
-            //Log("Registering audio stream...");
-            //App.AudioPipeline.RegisterSpecialAudioStream("partyline", new PartylineStream(this));
-            //Log("Audio stream registered.");
+            Log("Registering audio stream...");
+            App.AudioPipeline.RegisterSpecialAudioStream("partyline", new PartylineStream(this));
+            Log("Audio stream registered.");
 
             // Register embedded UI control
-            // (disabled temporarily to isolate server startup issue)
-            //Log("Registering UI control...");
-            //App.RegisterUserControl(() => new PartylineStatusControl(this), UserControlLocation.BelowTrackList, 100);
-            //Log("UI control registered.");
+            Log("Registering UI control...");
+            App.RegisterUserControl(() => new PartylineControlPanel(_audioMixer, _authManager, accounts), UserControlLocation.AboveTrackGroupSelector, 100);
+            Log("UI control registered.");
 
             // Hook into PlayIt Live's ServiceStack HTTP server on port 25434
             // Wait for the server to start (user clicks "Start Server" manually)
@@ -646,7 +644,14 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     public override void Cleanup()
     {
         if (_cts != null) _cts.Cancel();
+
+        if (_authManager != null)
+        {
+            _authManager.InvalidateAllSessions();
+        }
+
         KickAll();
+        Log("Plugin cleanup completed.");
     }
 
     public override void Configure()
@@ -1815,66 +1820,329 @@ public class PartylineStreamContainer : IStreamContainer
     public void Cleanup() { }
 }
 
-public class PartylineStatusControl : UserControl
+public class PartylineControlPanel : UserControl
 {
-    private NewPlugin _plugin;
-    private Label _label;
-    private Button _mixerBtn;
-    private System.Windows.Forms.Timer _timer;
+    private AudioMixer _audioMixer;
+    private AuthenticationManager _authManager;
+    private List<CoHostAccount> _accounts;
+    private System.Windows.Forms.Timer _vuTimer;
+    private List<CoHostRow> _rows;
 
-    public PartylineStatusControl(NewPlugin plugin)
+    public PartylineControlPanel(AudioMixer audioMixer, AuthenticationManager authManager, List<CoHostAccount> accounts)
     {
-        _plugin = plugin;
-        Height = 32;
-        Dock = DockStyle.Fill;
+        _audioMixer = audioMixer;
+        _authManager = authManager;
+        _accounts = accounts != null ? accounts : new List<CoHostAccount>();
+        _rows = new List<CoHostRow>();
+
+        AutoSize = true;
+        Dock = DockStyle.Top;
         BackColor = System.Drawing.Color.FromArgb(30, 30, 50);
+        Padding = new Padding(4);
 
-        var layout = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
+        BuildRows();
 
-        _label = new Label
+        _vuTimer = new System.Windows.Forms.Timer();
+        _vuTimer.Interval = 100;
+        _vuTimer.Tick += OnVuTimerTick;
+        _vuTimer.Start();
+    }
+
+    private void BuildRows()
+    {
+        Controls.Clear();
+        _rows.Clear();
+
+        // Title label
+        Label titleLabel = new Label();
+        titleLabel.Text = "\U0001F3A4 Partyline Co-Hosts";
+        titleLabel.ForeColor = System.Drawing.Color.White;
+        titleLabel.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+        titleLabel.Height = 22;
+        titleLabel.Dock = DockStyle.Top;
+        titleLabel.Padding = new Padding(2, 4, 0, 0);
+        Controls.Add(titleLabel);
+
+        int yOffset = 24;
+        for (int i = 0; i < _accounts.Count; i++)
         {
-            Text = "🎙️ Partyline: 0 connected",
-            ForeColor = System.Drawing.Color.White,
-            Font = new System.Drawing.Font("Segoe UI", 9f),
-            AutoSize = true,
-            Margin = new Padding(4, 7, 10, 0)
-        };
+            CoHostAccount acct = _accounts[i];
+            CoHostRow row = CreateRow(acct, yOffset);
+            _rows.Add(row);
+            yOffset += 28;
+        }
 
-        _mixerBtn = new Button
+        Height = yOffset + 4;
+    }
+
+    private CoHostRow CreateRow(CoHostAccount account, int yOffset)
+    {
+        CoHostRow row = new CoHostRow();
+        row.CohostId = account.Username;
+
+        // Row panel
+        Panel rowPanel = new Panel();
+        rowPanel.Location = new System.Drawing.Point(4, yOffset);
+        rowPanel.Size = new System.Drawing.Size(Width - 8, 26);
+        rowPanel.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top;
+        rowPanel.BackColor = System.Drawing.Color.FromArgb(60, 60, 70);
+        row.RowPanel = rowPanel;
+
+        // Display name label
+        Label nameLabel = new Label();
+        nameLabel.Text = account.DisplayName != null ? account.DisplayName : account.Username;
+        nameLabel.ForeColor = System.Drawing.Color.White;
+        nameLabel.Font = new System.Drawing.Font("Segoe UI", 8f);
+        nameLabel.Location = new System.Drawing.Point(4, 5);
+        nameLabel.Size = new System.Drawing.Size(80, 18);
+        nameLabel.AutoEllipsis = true;
+        rowPanel.Controls.Add(nameLabel);
+
+        // VU meter container (outer panel)
+        Panel vuOuter = new Panel();
+        vuOuter.Location = new System.Drawing.Point(88, 6);
+        vuOuter.Size = new System.Drawing.Size(80, 14);
+        vuOuter.BackColor = System.Drawing.Color.FromArgb(40, 40, 50);
+        rowPanel.Controls.Add(vuOuter);
+
+        // VU meter fill (inner panel)
+        Panel vuFill = new Panel();
+        vuFill.Location = new System.Drawing.Point(0, 0);
+        vuFill.Size = new System.Drawing.Size(0, 14);
+        vuFill.BackColor = System.Drawing.Color.FromArgb(34, 197, 94);
+        vuOuter.Controls.Add(vuFill);
+        row.VuFill = vuFill;
+        row.VuOuter = vuOuter;
+
+        // Mute button
+        Button muteBtn = new Button();
+        muteBtn.Text = "\U0001F50A";
+        muteBtn.FlatStyle = FlatStyle.Flat;
+        muteBtn.Size = new System.Drawing.Size(30, 22);
+        muteBtn.Location = new System.Drawing.Point(174, 2);
+        muteBtn.Font = new System.Drawing.Font("Segoe UI", 8f);
+        muteBtn.ForeColor = System.Drawing.Color.White;
+        muteBtn.BackColor = System.Drawing.Color.FromArgb(70, 70, 85);
+        muteBtn.FlatAppearance.BorderSize = 0;
+        muteBtn.Cursor = Cursors.Hand;
+        muteBtn.Tag = account.Username;
+        muteBtn.Click += OnMuteClick;
+        rowPanel.Controls.Add(muteBtn);
+        row.MuteButton = muteBtn;
+
+        // Kick button
+        Button kickBtn = new Button();
+        kickBtn.Text = "\u2715";
+        kickBtn.FlatStyle = FlatStyle.Flat;
+        kickBtn.Size = new System.Drawing.Size(26, 22);
+        kickBtn.Location = new System.Drawing.Point(208, 2);
+        kickBtn.Font = new System.Drawing.Font("Segoe UI", 8f);
+        kickBtn.ForeColor = System.Drawing.Color.White;
+        kickBtn.BackColor = System.Drawing.Color.FromArgb(180, 60, 60);
+        kickBtn.FlatAppearance.BorderSize = 0;
+        kickBtn.Cursor = Cursors.Hand;
+        kickBtn.Tag = account.Username;
+        kickBtn.Click += OnKickClick;
+        rowPanel.Controls.Add(kickBtn);
+        row.KickButton = kickBtn;
+
+        // Live toggle button
+        Button liveBtn = new Button();
+        liveBtn.Text = "\u25CB OFF";
+        liveBtn.FlatStyle = FlatStyle.Flat;
+        liveBtn.Size = new System.Drawing.Size(60, 22);
+        liveBtn.Location = new System.Drawing.Point(238, 2);
+        liveBtn.Font = new System.Drawing.Font("Segoe UI", 7.5f, System.Drawing.FontStyle.Bold);
+        liveBtn.ForeColor = System.Drawing.Color.Gray;
+        liveBtn.BackColor = System.Drawing.Color.FromArgb(50, 50, 60);
+        liveBtn.FlatAppearance.BorderSize = 0;
+        liveBtn.Cursor = Cursors.Hand;
+        liveBtn.Tag = account.Username;
+        liveBtn.Click += OnLiveClick;
+        rowPanel.Controls.Add(liveBtn);
+        row.LiveButton = liveBtn;
+
+        Controls.Add(rowPanel);
+        return row;
+    }
+
+    private void OnLiveClick(object sender, EventArgs e)
+    {
+        Button btn = sender as Button;
+        if (btn == null) return;
+        string cohostId = btn.Tag as string;
+        if (cohostId == null) return;
+
+        bool currentLive = _audioMixer.GetLive(cohostId);
+        _audioMixer.SetLive(cohostId, !currentLive);
+
+        UpdateRowState(cohostId);
+    }
+
+    private void OnMuteClick(object sender, EventArgs e)
+    {
+        Button btn = sender as Button;
+        if (btn == null) return;
+        string cohostId = btn.Tag as string;
+        if (cohostId == null) return;
+
+        bool currentMuted = _audioMixer.GetMuted(cohostId);
+        _audioMixer.SetMuted(cohostId, !currentMuted);
+
+        UpdateRowState(cohostId);
+    }
+
+    private void OnKickClick(object sender, EventArgs e)
+    {
+        Button btn = sender as Button;
+        if (btn == null) return;
+        string cohostId = btn.Tag as string;
+        if (cohostId == null) return;
+
+        _authManager.InvalidateSession(cohostId);
+        _audioMixer.RemoveCoHost(cohostId);
+
+        UpdateRowState(cohostId);
+    }
+
+    private void UpdateRowState(string cohostId)
+    {
+        for (int i = 0; i < _rows.Count; i++)
         {
-            Text = "Copy Link",
-            FlatStyle = FlatStyle.Flat,
-            BackColor = System.Drawing.Color.FromArgb(59, 130, 246),
-            ForeColor = System.Drawing.Color.White,
-            Font = new System.Drawing.Font("Segoe UI", 8f),
-            Size = new System.Drawing.Size(80, 24),
-            Margin = new Padding(0, 3, 6, 0),
-            Cursor = Cursors.Hand
-        };
-        _mixerBtn.FlatAppearance.BorderSize = 0;
-        _mixerBtn.Click += (s, e) =>
+            CoHostRow row = _rows[i];
+            if (row.CohostId == cohostId)
+            {
+                bool isLive = _audioMixer.GetLive(cohostId);
+                bool isMuted = _audioMixer.GetMuted(cohostId);
+
+                // Update live button
+                if (isLive)
+                {
+                    row.LiveButton.Text = "\u25CF LIVE";
+                    row.LiveButton.ForeColor = System.Drawing.Color.FromArgb(34, 197, 94);
+                    row.LiveButton.BackColor = System.Drawing.Color.FromArgb(20, 60, 30);
+                }
+                else
+                {
+                    row.LiveButton.Text = "\u25CB OFF";
+                    row.LiveButton.ForeColor = System.Drawing.Color.Gray;
+                    row.LiveButton.BackColor = System.Drawing.Color.FromArgb(50, 50, 60);
+                }
+
+                // Update mute button
+                if (isMuted)
+                {
+                    row.MuteButton.Text = "\U0001F507";
+                    row.MuteButton.BackColor = System.Drawing.Color.FromArgb(180, 120, 30);
+                }
+                else
+                {
+                    row.MuteButton.Text = "\U0001F50A";
+                    row.MuteButton.BackColor = System.Drawing.Color.FromArgb(70, 70, 85);
+                }
+
+                // Update row background
+                if (isLive)
+                {
+                    row.RowPanel.BackColor = System.Drawing.Color.FromArgb(30, 70, 40);
+                }
+                else
+                {
+                    row.RowPanel.BackColor = System.Drawing.Color.FromArgb(60, 60, 70);
+                }
+
+                break;
+            }
+        }
+    }
+
+    private void OnVuTimerTick(object sender, EventArgs e)
+    {
+        for (int i = 0; i < _rows.Count; i++)
         {
-            Clipboard.SetText(_plugin.GetLink());
-            _mixerBtn.Text = "Copied!";
-            var t = new System.Windows.Forms.Timer();
-            t.Interval = 2000;
-            t.Tick += (s2, e2) => { _mixerBtn.Text = "Copy Link"; t.Stop(); t.Dispose(); };
-            t.Start();
-        };
+            CoHostRow row = _rows[i];
+            float level = _audioMixer.GetLevel(row.CohostId);
+            int fillWidth = (int)(level * row.VuOuter.Width);
+            if (fillWidth < 0) fillWidth = 0;
+            if (fillWidth > row.VuOuter.Width) fillWidth = row.VuOuter.Width;
+            row.VuFill.Width = fillWidth;
 
-        layout.Controls.Add(_label);
-        layout.Controls.Add(_mixerBtn);
-        Controls.Add(layout);
-
-        _timer = new System.Windows.Forms.Timer();
-        _timer.Interval = 1000;
-        _timer.Tick += (s, e) => { _label.Text = "🎙️ Partyline: " + _plugin.GetCoHostCount() + " connected"; };
-        _timer.Start();
+            // Color based on level
+            if (level > 0.8f)
+            {
+                row.VuFill.BackColor = System.Drawing.Color.FromArgb(239, 68, 68);
+            }
+            else if (level > 0.5f)
+            {
+                row.VuFill.BackColor = System.Drawing.Color.FromArgb(234, 179, 8);
+            }
+            else
+            {
+                row.VuFill.BackColor = System.Drawing.Color.FromArgb(34, 197, 94);
+            }
+        }
     }
 
     protected override void Dispose(bool disposing)
     {
-        if (_timer != null) { _timer.Stop(); _timer.Dispose(); }
+        if (_vuTimer != null)
+        {
+            _vuTimer.Stop();
+            _vuTimer.Dispose();
+        }
         base.Dispose(disposing);
+    }
+}
+
+internal class CoHostRow
+{
+    private string _cohostId;
+    private Panel _rowPanel;
+    private Panel _vuFill;
+    private Panel _vuOuter;
+    private Button _muteButton;
+    private Button _kickButton;
+    private Button _liveButton;
+
+    public string CohostId
+    {
+        get { return _cohostId; }
+        set { _cohostId = value; }
+    }
+
+    public Panel RowPanel
+    {
+        get { return _rowPanel; }
+        set { _rowPanel = value; }
+    }
+
+    public Panel VuFill
+    {
+        get { return _vuFill; }
+        set { _vuFill = value; }
+    }
+
+    public Panel VuOuter
+    {
+        get { return _vuOuter; }
+        set { _vuOuter = value; }
+    }
+
+    public Button MuteButton
+    {
+        get { return _muteButton; }
+        set { _muteButton = value; }
+    }
+
+    public Button KickButton
+    {
+        get { return _kickButton; }
+        set { _kickButton = value; }
+    }
+
+    public Button LiveButton
+    {
+        get { return _liveButton; }
+        set { _liveButton = value; }
     }
 }
