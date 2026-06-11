@@ -595,6 +595,20 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
                 return;
             }
 
+            // --- GET /partyline/listen ---
+            if (subPath == "listen")
+            {
+                string listenJson = "{\"available\":false,\"note\":\"Configure Listen URL in Partyline settings for return audio\"}";
+                contentTypeProp.SetValue(response, "application/json");
+                var listenStream = outputStreamProp.GetValue(response) as Stream;
+                if (listenStream != null)
+                {
+                    var bytes = Encoding.UTF8.GetBytes(listenJson);
+                    listenStream.Write(bytes, 0, bytes.Length);
+                }
+                return;
+            }
+
             // --- GET /partyline/status ---
             if (subPath == "status")
             {
@@ -944,7 +958,7 @@ h1{font-size:1.5rem;margin-bottom:1.5rem;text-align:center}
  onclick='toggleMic()'>
 MIC OFF</button>
 <div class='vu'><div id='vu' class='vu-fill'></div></div>
-<div class='info'>Click the button to toggle your microphone on or off.</div>
+<div class='info'>Click the button to toggle your microphone on or off.<br>You'll hear yourself in your headphones while mic is on (sidetone).</div>
 </div>
 
 <!-- Kicked State -->
@@ -1070,6 +1084,11 @@ function startAudio(){
   src=ctx.createMediaStreamSource(stream);
   proc=ctx.createScriptProcessor(BUF,1,1);
   src.connect(proc);proc.connect(ctx.destination);
+  // Sidetone: let co-host hear themselves at low volume
+  var sidetoneGain=ctx.createGain();
+  sidetoneGain.gain.value=0.3;
+  src.connect(sidetoneGain);
+  sidetoneGain.connect(ctx.destination);
   connected=true;
   document.getElementById('ptt').disabled=false;
   proc.onaudioprocess=function(e){
