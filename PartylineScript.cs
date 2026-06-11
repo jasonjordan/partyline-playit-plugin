@@ -18,6 +18,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     private static string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Partyline", "partyline.log");
     private SettingsManager _settingsManager = new SettingsManager();
     private string _stationName = "Partyline Co-Host";
+    private string _listenUrl = "";
 
     // Co-host sessions
     private ConcurrentDictionary<string, CoHostState> _cohosts = new ConcurrentDictionary<string, CoHostState>();
@@ -52,6 +53,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             // Load settings and initialize subsystems
             List<CoHostAccount> accounts = _settingsManager.Load();
             _stationName = _settingsManager.LoadStationName();
+            _listenUrl = _settingsManager.LoadListenUrl();
 
             _authManager = new AuthenticationManager();
             _authManager.SetAccounts(accounts);
@@ -937,6 +939,7 @@ h1{font-size:1.5rem;margin-bottom:1.5rem;text-align:center}
 <div id='connectedPanel' class='hidden'>
 <div id='welcomeMsg' class='welcome'></div>
 <div id='st' class='status s-on'><span class='dot'></span>Connected</div>
+<div id='listenContainer' class='hidden'><audio id='listenAudio' controls autoplay style='width:100%;margin-bottom:1rem;border-radius:8px'></audio></div>
 <button id='ptt' class='btn ptt ptt-off' disabled
  onclick='toggleMic()'>
 MIC OFF</button>
@@ -958,6 +961,7 @@ var statusInterval=null;
 var SR=44100,BUF=4096;
 var BASE=location.origin+'/partyline';
 var stationName='{{STATION_NAME_JS}}';
+var listenUrl='{{LISTEN_URL}}';
 
 (function(){
  var h=location.hash?location.hash.substring(1):'';
@@ -1027,6 +1031,12 @@ function showConnected(){
  document.getElementById('loginPanel').className='hidden';
  document.getElementById('connectedPanel').className='';
  document.getElementById('welcomeMsg').innerText='Welcome to '+stationName+', '+displayName+'!';
+ if(listenUrl&&listenUrl.length>0){
+  document.getElementById('listenContainer').className='';
+  var audio=document.getElementById('listenAudio');
+  audio.src=listenUrl;
+  audio.play().catch(function(){});
+ }
  startAudio();
  statusInterval=setInterval(pollStatus,3000);
 }
@@ -1099,6 +1109,7 @@ function toggleMic(){
 </html>";
         html = html.Replace("{{STATION_NAME}}", safeStationName);
         html = html.Replace("{{STATION_NAME_JS}}", EscapeJsonStringValue(safeStationName));
+        html = html.Replace("{{LISTEN_URL}}", EscapeJsonStringValue(_listenUrl ?? ""));
         return html;
     }
 
@@ -1820,6 +1831,30 @@ public class SettingsManager
         }
     }
 
+    public string LoadListenUrl()
+    {
+        try
+        {
+            if (!File.Exists(SettingsPath))
+            {
+                return "";
+            }
+
+            string json = File.ReadAllText(SettingsPath, Encoding.UTF8);
+            string url = ExtractJsonStringValue(json, "listenUrl");
+            if (string.IsNullOrEmpty(url))
+            {
+                return "";
+            }
+            return url;
+        }
+        catch (Exception ex)
+        {
+            NewPlugin.LogStatic("ERROR loading listen URL: " + ex.Message);
+            return "";
+        }
+    }
+
     private List<CoHostAccount> ParseAccountsJson(string json)
     {
         // Simple JSON parser for our known format:
@@ -1913,10 +1948,15 @@ public class SettingsManager
 
     public void Save(List<CoHostAccount> accounts)
     {
-        Save(accounts, null);
+        Save(accounts, null, null);
     }
 
     public void Save(List<CoHostAccount> accounts, string stationName)
+    {
+        Save(accounts, stationName, null);
+    }
+
+    public void Save(List<CoHostAccount> accounts, string stationName, string listenUrl)
     {
         try
         {
@@ -1932,10 +1972,18 @@ public class SettingsManager
                 stationName = LoadStationName();
             }
 
+            // If listenUrl not provided, preserve the existing one
+            if (listenUrl == null)
+            {
+                listenUrl = LoadListenUrl();
+            }
+
             var sb = new StringBuilder();
             sb.Append("{");
             sb.Append("\"stationName\":");
             sb.Append(EscapeJsonString(stationName));
+            sb.Append(",\"listenUrl\":");
+            sb.Append(EscapeJsonString(listenUrl));
             sb.Append(",\"accounts\":[");
 
             for (int i = 0; i < accounts.Count; i++)
@@ -2028,12 +2076,14 @@ public class PartylineConfigForm : Form
     private SettingsManager _settingsManager;
     private List<CoHostAccount> _accounts;
     private string _stationName;
+    private string _listenUrl;
     private DataGridView _grid;
     private Panel _editPanel;
     private TextBox _txtUsername;
     private TextBox _txtPassword;
     private TextBox _txtDisplayName;
     private TextBox _txtStationName;
+    private TextBox _txtListenUrl;
     private Button _btnSave;
     private Button _btnCancel;
     private Button _btnAdd;
@@ -2044,6 +2094,7 @@ public class PartylineConfigForm : Form
         _settingsManager = settingsManager;
         _accounts = _settingsManager.Load();
         _stationName = _settingsManager.LoadStationName();
+        _listenUrl = _settingsManager.LoadListenUrl();
         _editingIndex = -1;
         InitializeFormComponents();
         LoadGrid();
@@ -2053,7 +2104,7 @@ public class PartylineConfigForm : Form
     {
         Text = "Partyline Co-Host Configuration";
         Width = 550;
-        Height = 520;
+        Height = 560;
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
@@ -2073,16 +2124,38 @@ public class PartylineConfigForm : Form
         _txtStationName.Text = _stationName;
         Controls.Add(_txtStationName);
 
+        // Listen URL field
+        Label lblListenUrl = new Label();
+        lblListenUrl.Text = "Listen URL:";
+        lblListenUrl.Location = new System.Drawing.Point(12, 40);
+        lblListenUrl.AutoSize = true;
+        lblListenUrl.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+        Controls.Add(lblListenUrl);
+
+        _txtListenUrl = new TextBox();
+        _txtListenUrl.Location = new System.Drawing.Point(120, 38);
+        _txtListenUrl.Size = new System.Drawing.Size(300, 22);
+        _txtListenUrl.Text = _listenUrl;
+        Controls.Add(_txtListenUrl);
+
+        Label lblListenHint = new Label();
+        lblListenHint.Text = "(Icecast/Shoutcast stream URL for co-hosts to hear the mix)";
+        lblListenHint.Location = new System.Drawing.Point(120, 62);
+        lblListenHint.AutoSize = true;
+        lblListenHint.ForeColor = System.Drawing.SystemColors.GrayText;
+        lblListenHint.Font = new System.Drawing.Font("Segoe UI", 7.5f);
+        Controls.Add(lblListenHint);
+
         Label lblTitle = new Label();
         lblTitle.Text = "Co-Host Accounts:";
-        lblTitle.Location = new System.Drawing.Point(12, 44);
+        lblTitle.Location = new System.Drawing.Point(12, 82);
         lblTitle.AutoSize = true;
         lblTitle.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
         Controls.Add(lblTitle);
 
         // DataGridView for account list
         _grid = new DataGridView();
-        _grid.Location = new System.Drawing.Point(12, 68);
+        _grid.Location = new System.Drawing.Point(12, 104);
         _grid.Size = new System.Drawing.Size(510, 200);
         _grid.AllowUserToAddRows = false;
         _grid.AllowUserToDeleteRows = false;
@@ -2134,14 +2207,14 @@ public class PartylineConfigForm : Form
         // Add button
         _btnAdd = new Button();
         _btnAdd.Text = "+ Add Co-Host";
-        _btnAdd.Location = new System.Drawing.Point(12, 276);
+        _btnAdd.Location = new System.Drawing.Point(12, 312);
         _btnAdd.Size = new System.Drawing.Size(120, 28);
         _btnAdd.Click += OnAddClick;
         Controls.Add(_btnAdd);
 
         // Edit panel
         _editPanel = new Panel();
-        _editPanel.Location = new System.Drawing.Point(12, 312);
+        _editPanel.Location = new System.Drawing.Point(12, 348);
         _editPanel.Size = new System.Drawing.Size(510, 150);
         _editPanel.Visible = false;
 
@@ -2228,7 +2301,9 @@ public class PartylineConfigForm : Form
         {
             _stationName = stationName;
         }
-        _settingsManager.Save(_accounts, _stationName);
+        string listenUrl = _txtListenUrl.Text.Trim();
+        _listenUrl = listenUrl;
+        _settingsManager.Save(_accounts, _stationName, _listenUrl);
         DialogResult = DialogResult.OK;
         Close();
     }
@@ -2374,6 +2449,7 @@ public class PartylineControlPanel : UserControl
     private List<CoHostRow> _rows;
     private ToolTip _toolTip;
     private SettingsManager _settingsManager;
+    private int _pulseCounter;
 
     public PartylineControlPanel(AudioMixer audioMixer, AuthenticationManager authManager, List<CoHostAccount> accounts, SettingsManager settingsManager)
     {
@@ -2473,13 +2549,15 @@ public class PartylineControlPanel : UserControl
         rowPanel.BackColor = System.Drawing.Color.FromArgb(60, 60, 70);
         row.RowPanel = rowPanel;
 
-        // Connected indicator (dot)
+        // Connected indicator (pill)
         Label connIndicator = new Label();
-        connIndicator.Text = "\u25CB";
+        connIndicator.Text = "Offline";
         connIndicator.ForeColor = System.Drawing.Color.Gray;
-        connIndicator.Font = new System.Drawing.Font("Segoe UI", 7f);
-        connIndicator.Location = new System.Drawing.Point(2, 6);
-        connIndicator.Size = new System.Drawing.Size(12, 14);
+        connIndicator.BackColor = System.Drawing.Color.FromArgb(80, 80, 90);
+        connIndicator.Font = new System.Drawing.Font("Segoe UI", 7f, System.Drawing.FontStyle.Bold);
+        connIndicator.Location = new System.Drawing.Point(2, 5);
+        connIndicator.Size = new System.Drawing.Size(60, 16);
+        connIndicator.TextAlign = System.Drawing.ContentAlignment.MiddleCenter;
         rowPanel.Controls.Add(connIndicator);
         row.ConnectedIndicator = connIndicator;
 
@@ -2488,7 +2566,7 @@ public class PartylineControlPanel : UserControl
         nameLabel.Text = account.DisplayName != null ? account.DisplayName : account.Username;
         nameLabel.ForeColor = System.Drawing.Color.White;
         nameLabel.Font = new System.Drawing.Font("Segoe UI", 9.5f, System.Drawing.FontStyle.Bold);
-        nameLabel.Location = new System.Drawing.Point(14, 4);
+        nameLabel.Location = new System.Drawing.Point(66, 4);
         nameLabel.Size = new System.Drawing.Size(80, 20);
         nameLabel.AutoEllipsis = true;
         rowPanel.Controls.Add(nameLabel);
@@ -2496,7 +2574,7 @@ public class PartylineControlPanel : UserControl
 
         // VU meter container (outer panel)
         Panel vuOuter = new Panel();
-        vuOuter.Location = new System.Drawing.Point(88, 6);
+        vuOuter.Location = new System.Drawing.Point(148, 6);
         vuOuter.Size = new System.Drawing.Size(60, 14);
         vuOuter.BackColor = System.Drawing.Color.FromArgb(40, 40, 50);
         rowPanel.Controls.Add(vuOuter);
@@ -2516,7 +2594,7 @@ public class PartylineControlPanel : UserControl
         latencyLabel.Text = "";
         latencyLabel.ForeColor = System.Drawing.Color.FromArgb(200, 200, 220);
         latencyLabel.Font = new System.Drawing.Font("Segoe UI", 7.5f);
-        latencyLabel.Location = new System.Drawing.Point(152, 5);
+        latencyLabel.Location = new System.Drawing.Point(212, 5);
         latencyLabel.Size = new System.Drawing.Size(40, 14);
         latencyLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
         rowPanel.Controls.Add(latencyLabel);
@@ -2527,7 +2605,7 @@ public class PartylineControlPanel : UserControl
         ipLabel.Text = "";
         ipLabel.ForeColor = System.Drawing.Color.FromArgb(180, 180, 200);
         ipLabel.Font = new System.Drawing.Font("Segoe UI", 7f);
-        ipLabel.Location = new System.Drawing.Point(152, 16);
+        ipLabel.Location = new System.Drawing.Point(212, 16);
         ipLabel.Size = new System.Drawing.Size(100, 12);
         ipLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
         rowPanel.Controls.Add(ipLabel);
@@ -2538,7 +2616,7 @@ public class PartylineControlPanel : UserControl
         muteBtn.Text = "Mute";
         muteBtn.FlatStyle = FlatStyle.Flat;
         muteBtn.Size = new System.Drawing.Size(44, 22);
-        muteBtn.Location = new System.Drawing.Point(256, 2);
+        muteBtn.Location = new System.Drawing.Point(312, 2);
         muteBtn.Font = new System.Drawing.Font("Segoe UI", 8f);
         muteBtn.ForeColor = System.Drawing.Color.White;
         muteBtn.BackColor = System.Drawing.Color.FromArgb(70, 70, 85);
@@ -2555,7 +2633,7 @@ public class PartylineControlPanel : UserControl
         kickBtn.Text = "Kick";
         kickBtn.FlatStyle = FlatStyle.Flat;
         kickBtn.Size = new System.Drawing.Size(40, 22);
-        kickBtn.Location = new System.Drawing.Point(304, 2);
+        kickBtn.Location = new System.Drawing.Point(360, 2);
         kickBtn.Font = new System.Drawing.Font("Segoe UI", 8f);
         kickBtn.ForeColor = System.Drawing.Color.White;
         kickBtn.BackColor = System.Drawing.Color.FromArgb(180, 60, 60);
@@ -2572,7 +2650,7 @@ public class PartylineControlPanel : UserControl
         liveBtn.Text = "Go Live";
         liveBtn.FlatStyle = FlatStyle.Flat;
         liveBtn.Size = new System.Drawing.Size(60, 22);
-        liveBtn.Location = new System.Drawing.Point(348, 2);
+        liveBtn.Location = new System.Drawing.Point(404, 2);
         liveBtn.Font = new System.Drawing.Font("Segoe UI", 7.5f, System.Drawing.FontStyle.Bold);
         liveBtn.ForeColor = System.Drawing.Color.Gray;
         liveBtn.BackColor = System.Drawing.Color.FromArgb(50, 50, 60);
@@ -2686,6 +2764,7 @@ public class PartylineControlPanel : UserControl
 
     private void OnVuTimerTick(object sender, EventArgs e)
     {
+        _pulseCounter++;
         for (int i = 0; i < _rows.Count; i++)
         {
             CoHostRow row = _rows[i];
@@ -2709,17 +2788,28 @@ public class PartylineControlPanel : UserControl
                 row.VuFill.BackColor = System.Drawing.Color.FromArgb(34, 197, 94);
             }
 
-            // Update connected indicator (based on active session, not audio)
+            // Update connected indicator pill (based on active session, not audio)
             bool connected = _authManager.HasActiveSession(row.CohostId);
             if (connected)
             {
-                row.ConnectedIndicator.Text = "\u25CF";
-                row.ConnectedIndicator.ForeColor = System.Drawing.Color.FromArgb(34, 197, 94);
+                row.ConnectedIndicator.Text = "Connected";
+                row.ConnectedIndicator.ForeColor = System.Drawing.Color.White;
+                // Throb between bright green and dimmer green every 500ms (10 ticks at 50ms)
+                bool bright = ((_pulseCounter / 10) % 2) == 0;
+                if (bright)
+                {
+                    row.ConnectedIndicator.BackColor = System.Drawing.Color.FromArgb(34, 197, 94);
+                }
+                else
+                {
+                    row.ConnectedIndicator.BackColor = System.Drawing.Color.FromArgb(24, 157, 74);
+                }
             }
             else
             {
-                row.ConnectedIndicator.Text = "\u25CB";
+                row.ConnectedIndicator.Text = "Offline";
                 row.ConnectedIndicator.ForeColor = System.Drawing.Color.Gray;
+                row.ConnectedIndicator.BackColor = System.Drawing.Color.FromArgb(80, 80, 90);
             }
 
             // Update latency display
