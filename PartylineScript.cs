@@ -27,6 +27,18 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     private AuthenticationManager _authManager;
     private AudioMixer _audioMixer;
 
+    // Return audio (BASS mixer capture)
+    private int _mixerHandle;
+    private byte[] _returnBuffer = new byte[44100 * 2 * 2]; // 2 seconds of 16-bit mono at 44.1kHz
+    private int _returnWritePos;
+    private int _returnReadPos;
+    private readonly object _returnLock = new object();
+    private Thread _captureThread;
+    private volatile bool _captureRunning;
+
+    [DllImport("bass", CallingConvention = CallingConvention.StdCall)]
+    private static extern int BASS_ChannelGetData(int handle, [Out] byte[] buffer, int length);
+
     private static void Log(string message)
     {
         try
@@ -68,6 +80,37 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             Log("Registering special audio stream 'partyline'...");
             App.AudioPipeline.RegisterSpecialAudioStream("partyline", new PartylineStream(this));
             Log("Special audio stream registered. PlayIt Live will call CreateStream/GetStreamFunc internally.");
+
+            // Capture mixer handle for return audio
+            try
+            {
+                var mainMix = App.AudioPipeline.GetMainMix();
+                if (mainMix != null)
+                {
+                    _mixerHandle = mainMix.GetMixerChannelHandle();
+                    Log("Mixer channel handle: " + _mixerHandle);
+
+                    if (_mixerHandle > 0)
+                    {
+                        _captureRunning = true;
+                        _captureThread = new Thread(CaptureLoop) { IsBackground = true, Name = "PartylineCapture" };
+                        _captureThread.Start();
+                        Log("Return audio capture thread started.");
+                    }
+                    else
+                    {
+                        Log("WARNING: Mixer handle is 0 or invalid, return audio disabled.");
+                    }
+                }
+                else
+                {
+                    Log("WARNING: GetMainMix() returned null, return audio disabled.");
+                }
+            }
+            catch (Exception mixEx)
+            {
+                Log("WARNING: Could not get mixer handle for return audio: " + mixEx.Message);
+            }
 
             // Register embedded UI control
             Log("Registering UI control...");
@@ -598,13 +641,30 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             // --- GET /partyline/listen ---
             if (subPath == "listen")
             {
-                string listenJson = "{\"available\":false,\"note\":\"Configure Listen URL in Partyline settings for return audio\"}";
-                contentTypeProp.SetValue(response, "application/json");
-                var listenStream = outputStreamProp.GetValue(response) as Stream;
-                if (listenStream != null)
+                // Authenticate the request
+                string listenToken = GetRequestHeader(request, "X-Session-Token");
+                string listenCohostId;
+                if (listenToken == null || !_authManager.ValidateToken(listenToken, out listenCohostId))
                 {
-                    var bytes = Encoding.UTF8.GetBytes(listenJson);
-                    listenStream.Write(bytes, 0, bytes.Length);
+                    contentTypeProp.SetValue(response, "text/plain");
+                    var statusCodeProp2 = resType.GetProperty("StatusCode");
+                    if (statusCodeProp2 != null) statusCodeProp2.SetValue(response, 401);
+                    var s401 = outputStreamProp.GetValue(response) as Stream;
+                    if (s401 != null)
+                    {
+                        var bytes401 = Encoding.UTF8.GetBytes("Unauthorized");
+                        s401.Write(bytes401, 0, bytes401.Length);
+                    }
+                    return;
+                }
+
+                // Serve raw PCM data from the return audio buffer (16-bit mono 44.1kHz)
+                byte[] pcmData = ReadReturnAudio(8192);
+                contentTypeProp.SetValue(response, "application/octet-stream");
+                var listenStream = outputStreamProp.GetValue(response) as Stream;
+                if (listenStream != null && pcmData.Length > 0)
+                {
+                    listenStream.Write(pcmData, 0, pcmData.Length);
                 }
                 return;
             }
@@ -876,6 +936,68 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     public int GetCoHostCount() { return _cohosts.Count; }
     public string GetLink() { return "https://" + Dns.GetHostName() + ":" + _activePort + "/partyline/join"; }
 
+    private void CaptureLoop()
+    {
+        byte[] chunk = new byte[8192]; // ~93ms at 44.1kHz mono 16-bit
+        Log("CaptureLoop started, handle=" + _mixerHandle);
+
+        while (_captureRunning)
+        {
+            try
+            {
+                int bytesRead = BASS_ChannelGetData(_mixerHandle, chunk, chunk.Length);
+                if (bytesRead > 0)
+                {
+                    lock (_returnLock)
+                    {
+                        for (int i = 0; i < bytesRead; i++)
+                        {
+                            _returnBuffer[_returnWritePos] = chunk[i];
+                            _returnWritePos = (_returnWritePos + 1) % _returnBuffer.Length;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("CaptureLoop error: " + ex.Message);
+            }
+
+            Thread.Sleep(50);
+        }
+
+        Log("CaptureLoop exited.");
+    }
+
+    internal byte[] ReadReturnAudio(int maxBytes)
+    {
+        lock (_returnLock)
+        {
+            int available;
+            if (_returnWritePos >= _returnReadPos)
+            {
+                available = _returnWritePos - _returnReadPos;
+            }
+            else
+            {
+                available = _returnBuffer.Length - _returnReadPos + _returnWritePos;
+            }
+
+            if (available <= 0) return new byte[0];
+
+            int toRead = Math.Min(available, maxBytes);
+            byte[] result = new byte[toRead];
+
+            for (int i = 0; i < toRead; i++)
+            {
+                result[i] = _returnBuffer[_returnReadPos];
+                _returnReadPos = (_returnReadPos + 1) % _returnBuffer.Length;
+            }
+
+            return result;
+        }
+    }
+
     public void MuteAll() { foreach (var c in _cohosts.Values) c.IsMuted = true; }
     public void UnmuteAll() { foreach (var c in _cohosts.Values) c.IsMuted = false; }
     public void KickAll() { _cohosts.Clear(); }
@@ -885,6 +1007,12 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     public override void Cleanup()
     {
         if (_cts != null) _cts.Cancel();
+
+        _captureRunning = false;
+        if (_captureThread != null)
+        {
+            try { _captureThread.Join(2000); } catch { }
+        }
 
         if (_authManager != null)
         {
@@ -953,7 +1081,6 @@ h1{font-size:1.5rem;margin-bottom:1.5rem;text-align:center}
 <div id='connectedPanel' class='hidden'>
 <div id='welcomeMsg' class='welcome'></div>
 <div id='st' class='status s-on'><span class='dot'></span>Connected</div>
-<div id='listenContainer' class='hidden'><audio id='listenAudio' controls autoplay style='width:100%;margin-bottom:1rem;border-radius:8px'></audio></div>
 <button id='ptt' class='btn ptt ptt-off' disabled
  onclick='toggleMic()'>
 MIC OFF</button>
@@ -975,7 +1102,10 @@ var statusInterval=null;
 var SR=44100,BUF=4096;
 var BASE=location.origin+'/partyline';
 var stationName='{{STATION_NAME_JS}}';
-var listenUrl='{{LISTEN_URL}}';
+
+// Return audio playback state
+var listenCtx=null,listenInterval=null;
+var listenQueue=[],listenPlaying=false,listenNextTime=0;
 
 (function(){
  var h=location.hash?location.hash.substring(1):'';
@@ -1045,14 +1175,40 @@ function showConnected(){
  document.getElementById('loginPanel').className='hidden';
  document.getElementById('connectedPanel').className='';
  document.getElementById('welcomeMsg').innerText='Welcome to '+stationName+', '+displayName+'!';
- if(listenUrl&&listenUrl.length>0){
-  document.getElementById('listenContainer').className='';
-  var audio=document.getElementById('listenAudio');
-  audio.src=listenUrl;
-  audio.play().catch(function(){});
- }
  startAudio();
+ startListenStream();
  statusInterval=setInterval(pollStatus,3000);
+}
+
+function startListenStream(){
+ listenCtx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
+ listenNextTime=listenCtx.currentTime+0.3;
+ listenInterval=setInterval(pollListen,100);
+}
+
+function pollListen(){
+ if(!sessionToken||!listenCtx)return;
+ var xhr=new XMLHttpRequest();
+ xhr.open('GET',BASE+'/listen',true);
+ xhr.responseType='arraybuffer';
+ xhr.setRequestHeader('X-Session-Token',sessionToken);
+ xhr.onload=function(){
+  if(xhr.status===200&&xhr.response&&xhr.response.byteLength>0){
+   var raw=new Int16Array(xhr.response);
+   var floats=new Float32Array(raw.length);
+   for(var i=0;i<raw.length;i++)floats[i]=raw[i]/32768.0;
+   var buf=listenCtx.createBuffer(1,floats.length,SR);
+   buf.getChannelData(0).set(floats);
+   var src2=listenCtx.createBufferSource();
+   src2.buffer=buf;
+   src2.connect(listenCtx.destination);
+   var now=listenCtx.currentTime;
+   if(listenNextTime<now)listenNextTime=now+0.05;
+   src2.start(listenNextTime);
+   listenNextTime+=buf.duration;
+  }
+ };
+ xhr.send();
 }
 
 function pollStatus(){
@@ -1073,7 +1229,9 @@ function showKicked(){
  connected=false;
  sending=false;
  if(statusInterval){clearInterval(statusInterval);statusInterval=null;}
+ if(listenInterval){clearInterval(listenInterval);listenInterval=null;}
  if(ctx){try{ctx.close();}catch(e){}}
+ if(listenCtx){try{listenCtx.close();}catch(e){}}
  document.getElementById('connectedPanel').className='hidden';
  document.getElementById('kickedPanel').className='';
 }
@@ -1128,7 +1286,6 @@ function toggleMic(){
 </html>";
         html = html.Replace("{{STATION_NAME}}", safeStationName);
         html = html.Replace("{{STATION_NAME_JS}}", EscapeJsonStringValue(safeStationName));
-        html = html.Replace("{{LISTEN_URL}}", EscapeJsonStringValue(_listenUrl ?? ""));
         return html;
     }
 
@@ -1817,7 +1974,36 @@ public class SettingsManager
             }
 
             string json = File.ReadAllText(SettingsPath, Encoding.UTF8);
-            return ParseAccountsJson(json);
+            List<CoHostAccount> accounts = ParseAccountsJson(json);
+
+            // Generate hash for any accounts that are missing one (legacy accounts)
+            bool needsResave = false;
+            for (int i = 0; i < accounts.Count; i++)
+            {
+                if (string.IsNullOrEmpty(accounts[i].Hash))
+                {
+                    accounts[i].Hash = Guid.NewGuid().ToString("N").Substring(0, 12);
+                    needsResave = true;
+                    NewPlugin.LogStatic("Generated hash for account: " + accounts[i].Username);
+                }
+            }
+
+            if (needsResave)
+            {
+                try
+                {
+                    string stationName = ExtractJsonStringValue(json, "stationName");
+                    string listenUrl = ExtractJsonStringValue(json, "listenUrl");
+                    Save(accounts, stationName, listenUrl);
+                    NewPlugin.LogStatic("Re-saved settings with generated hashes");
+                }
+                catch (Exception saveEx)
+                {
+                    NewPlugin.LogStatic("WARNING: Could not re-save settings with generated hashes: " + saveEx.Message);
+                }
+            }
+
+            return accounts;
         }
         catch (Exception ex)
         {
@@ -2608,27 +2794,16 @@ public class PartylineControlPanel : UserControl
         row.VuFill = vuFill;
         row.VuOuter = vuOuter;
 
-        // Latency label
+        // Combined latency + IP label (single line: "45ms | 192.168.1.5")
         Label latencyLabel = new Label();
         latencyLabel.Text = "";
-        latencyLabel.ForeColor = System.Drawing.Color.FromArgb(200, 200, 220);
-        latencyLabel.Font = new System.Drawing.Font("Segoe UI", 7.5f);
+        latencyLabel.ForeColor = System.Drawing.Color.White;
+        latencyLabel.Font = new System.Drawing.Font("Segoe UI", 8f);
         latencyLabel.Location = new System.Drawing.Point(212, 5);
-        latencyLabel.Size = new System.Drawing.Size(40, 14);
+        latencyLabel.Size = new System.Drawing.Size(130, 16);
         latencyLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
         rowPanel.Controls.Add(latencyLabel);
         row.LatencyLabel = latencyLabel;
-
-        // IP label
-        Label ipLabel = new Label();
-        ipLabel.Text = "";
-        ipLabel.ForeColor = System.Drawing.Color.FromArgb(180, 180, 200);
-        ipLabel.Font = new System.Drawing.Font("Segoe UI", 7f);
-        ipLabel.Location = new System.Drawing.Point(212, 16);
-        ipLabel.Size = new System.Drawing.Size(100, 12);
-        ipLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
-        rowPanel.Controls.Add(ipLabel);
-        row.IpLabel = ipLabel;
 
         // Mute button
         Button muteBtn = new Button();
@@ -2831,26 +3006,32 @@ public class PartylineControlPanel : UserControl
                 row.ConnectedIndicator.BackColor = System.Drawing.Color.FromArgb(80, 80, 90);
             }
 
-            // Update latency display
-            float latency = _audioMixer.GetLatency(row.CohostId);
-            if (latency > 0 && connected)
+            // Update combined latency + IP display
+            if (connected)
             {
-                row.LatencyLabel.Text = ((int)latency).ToString() + "ms";
+                float latency = _audioMixer.GetLatency(row.CohostId);
+                string ip = _audioMixer.GetIp(row.CohostId);
+                string combined = "";
+                if (latency > 0)
+                {
+                    combined = ((int)latency).ToString() + "ms";
+                }
+                if (ip != null && ip.Length > 0)
+                {
+                    if (combined.Length > 0)
+                    {
+                        combined += " | " + ip;
+                    }
+                    else
+                    {
+                        combined = ip;
+                    }
+                }
+                row.LatencyLabel.Text = combined;
             }
             else
             {
                 row.LatencyLabel.Text = "";
-            }
-
-            // Update IP display
-            string ip = _audioMixer.GetIp(row.CohostId);
-            if (ip != null && ip.Length > 0 && connected)
-            {
-                row.IpLabel.Text = ip;
-            }
-            else
-            {
-                row.IpLabel.Text = "";
             }
         }
     }
@@ -2881,7 +3062,6 @@ internal class CoHostRow
     private Button _liveButton;
     private Label _connectedIndicator;
     private Label _latencyLabel;
-    private Label _ipLabel;
 
     public string CohostId
     {
@@ -2935,11 +3115,5 @@ internal class CoHostRow
     {
         get { return _latencyLabel; }
         set { _latencyLabel = value; }
-    }
-
-    public Label IpLabel
-    {
-        get { return _ipLabel; }
-        set { _ipLabel = value; }
     }
 }
