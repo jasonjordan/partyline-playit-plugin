@@ -21,10 +21,9 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     // Co-host sessions
     private ConcurrentDictionary<string, CoHostState> _cohosts = new ConcurrentDictionary<string, CoHostState>();
 
-    // Audio ring buffer for mixed co-host audio (44100Hz mono 16-bit)
-    private short[] _ringBuffer = new short[44100 * 2];
-    private int _writePos = 0;
-    private readonly object _audioLock = new object();
+    // Authentication and audio subsystems (initialized in Run)
+    private AuthenticationManager _authManager;
+    private AudioMixer _audioMixer;
 
     private static void Log(string message)
     {
@@ -48,6 +47,16 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         {
             _cts = new CancellationTokenSource();
             Log("Plugin starting...");
+
+            // Load settings and initialize subsystems
+            List<CoHostAccount> accounts = _settingsManager.Load();
+
+            _authManager = new AuthenticationManager();
+            _authManager.SetAccounts(accounts);
+
+            _audioMixer = new AudioMixer();
+
+            Log("Initialized AuthenticationManager and AudioMixer.");
 
             // Register audio stream into PlayIt Live's main mix
             // (delayed until server is ready to avoid file locking conflicts)
@@ -350,9 +359,60 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             var contentTypeProp = resType.GetProperty("ContentType");
             var outputStreamProp = resType.GetProperty("OutputStream");
 
-            // Check if this is an audio POST
+            // --- POST /partyline/login ---
+            if (subPath == "login")
+            {
+                string reqBody = ReadRequestBody(request);
+                string username = ExtractJsonStringValueFromBody(reqBody, "username");
+                string password = ExtractJsonStringValueFromBody(reqBody, "password");
+
+                AuthResult authResult = _authManager.Authenticate(username, password);
+
+                string jsonResponse;
+                if (authResult.Success)
+                {
+                    jsonResponse = "{\"success\":true,\"token\":\"" + EscapeJsonStringValue(authResult.Token) + "\",\"displayName\":\"" + EscapeJsonStringValue(authResult.DisplayName) + "\"}";
+                }
+                else
+                {
+                    jsonResponse = "{\"success\":false,\"error\":\"" + EscapeJsonStringValue(authResult.Error) + "\"}";
+                }
+
+                contentTypeProp.SetValue(response, "application/json");
+                var stream = outputStreamProp.GetValue(response) as Stream;
+                if (stream != null)
+                {
+                    var bytes = Encoding.UTF8.GetBytes(jsonResponse);
+                    stream.Write(bytes, 0, bytes.Length);
+                }
+                return;
+            }
+
+            // --- POST /partyline/audio ---
             if (subPath == "audio")
             {
+                // Extract X-Session-Token header via reflection
+                string token = GetRequestHeader(request, "X-Session-Token");
+
+                string cohostId;
+                if (token == null || !_authManager.ValidateToken(token, out cohostId))
+                {
+                    // Return 401 Unauthorized
+                    contentTypeProp.SetValue(response, "text/plain");
+                    var statusCodeProp = resType.GetProperty("StatusCode");
+                    if (statusCodeProp != null)
+                    {
+                        statusCodeProp.SetValue(response, 401);
+                    }
+                    var stream = outputStreamProp.GetValue(response) as Stream;
+                    if (stream != null)
+                    {
+                        var bytes = Encoding.UTF8.GetBytes("Unauthorized");
+                        stream.Write(bytes, 0, bytes.Length);
+                    }
+                    return;
+                }
+
                 // Read the request body (PCM audio data)
                 var reqType = request.GetType();
                 var inputStreamProp = reqType.GetProperty("InputStream");
@@ -367,22 +427,45 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
                             var data = ms.ToArray();
                             if (data.Length > 0)
                             {
-                                WritePcmSamples(data, data.Length);
+                                _audioMixer.IngestAudio(cohostId, data, data.Length);
                             }
                         }
                     }
                 }
 
                 contentTypeProp.SetValue(response, "text/plain");
+                var outStream = outputStreamProp.GetValue(response) as Stream;
+                if (outStream != null)
+                {
+                    var bytes = Encoding.UTF8.GetBytes("OK");
+                    outStream.Write(bytes, 0, bytes.Length);
+                }
+                return;
+            }
+
+            // --- GET /partyline/status ---
+            if (subPath == "status")
+            {
+                string token = GetRequestHeader(request, "X-Session-Token");
+                string cohostId;
+                bool kicked = true;
+                if (token != null && _authManager.ValidateToken(token, out cohostId))
+                {
+                    kicked = false;
+                }
+
+                string jsonResponse = "{\"kicked\":" + (kicked ? "true" : "false") + "}";
+                contentTypeProp.SetValue(response, "application/json");
                 var stream = outputStreamProp.GetValue(response) as Stream;
                 if (stream != null)
                 {
-                    var bytes = Encoding.UTF8.GetBytes("OK");
+                    var bytes = Encoding.UTF8.GetBytes(jsonResponse);
                     stream.Write(bytes, 0, bytes.Length);
                 }
                 return;
             }
 
+            // --- GET /partyline/join ---
             string body;
             string contentType;
 
@@ -403,11 +486,11 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             }
 
             contentTypeProp.SetValue(response, contentType);
-            var outStream = outputStreamProp.GetValue(response) as Stream;
-            if (outStream != null)
+            var finalStream = outputStreamProp.GetValue(response) as Stream;
+            if (finalStream != null)
             {
                 var bytes = Encoding.UTF8.GetBytes(body);
-                outStream.Write(bytes, 0, bytes.Length);
+                finalStream.Write(bytes, 0, bytes.Length);
             }
         }
         catch (Exception ex)
@@ -416,40 +499,136 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         }
     }
 
-    // Called by PlayIt Live's audio pipeline when it needs samples
-    internal int FillAudioBuffer(int length, IntPtr buffer)
+    private string ReadRequestBody(object request)
     {
-        int sampleCount = length / 2;
-        var output = new short[sampleCount];
-
-        lock (_audioLock)
+        try
         {
-            int readPos = (_writePos - sampleCount + _ringBuffer.Length) % _ringBuffer.Length;
-            for (int i = 0; i < sampleCount; i++)
+            var reqType = request.GetType();
+            var inputStreamProp = reqType.GetProperty("InputStream");
+            if (inputStreamProp == null) return "";
+
+            var inputStream = inputStreamProp.GetValue(request) as Stream;
+            if (inputStream == null) return "";
+
+            using (var reader = new StreamReader(inputStream, Encoding.UTF8))
             {
-                output[i] = _ringBuffer[readPos];
-                _ringBuffer[readPos] = 0;
-                readPos = (readPos + 1) % _ringBuffer.Length;
+                return reader.ReadToEnd();
             }
         }
-
-        Marshal.Copy(output, 0, buffer, sampleCount);
-        return length;
+        catch
+        {
+            return "";
+        }
     }
 
-    internal void WritePcmSamples(byte[] data, int count)
+    private string GetRequestHeader(object request, string headerName)
     {
-        int sampleCount = count / 2;
-        lock (_audioLock)
+        try
         {
-            for (int i = 0; i < sampleCount; i++)
+            var reqType = request.GetType();
+            var headersProp = reqType.GetProperty("Headers");
+            if (headersProp == null) return null;
+
+            var headers = headersProp.GetValue(request);
+            if (headers == null) return null;
+
+            // Try to call .Get(headerName) via reflection
+            var getMethod = headers.GetType().GetMethod("Get", new Type[] { typeof(string) });
+            if (getMethod != null)
             {
-                short sample = BitConverter.ToInt16(data, i * 2);
-                int mixed = _ringBuffer[_writePos] + sample;
-                _ringBuffer[_writePos] = (short)Math.Max(-32768, Math.Min(32767, mixed));
-                _writePos = (_writePos + 1) % _ringBuffer.Length;
+                return getMethod.Invoke(headers, new object[] { headerName }) as string;
+            }
+
+            // Fallback: try indexer
+            var indexer = headers.GetType().GetProperty("Item", new Type[] { typeof(string) });
+            if (indexer != null)
+            {
+                return indexer.GetValue(headers, new object[] { headerName }) as string;
+            }
+
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private string ExtractJsonStringValueFromBody(string json, string key)
+    {
+        if (json == null) return null;
+        string searchKey = "\"" + key + "\"";
+        int keyIdx = json.IndexOf(searchKey);
+        if (keyIdx < 0) return null;
+
+        int colonIdx = json.IndexOf(':', keyIdx + searchKey.Length);
+        if (colonIdx < 0) return null;
+
+        int valueStart = json.IndexOf('"', colonIdx + 1);
+        if (valueStart < 0) return null;
+
+        int valueEnd = valueStart + 1;
+        while (valueEnd < json.Length)
+        {
+            if (json[valueEnd] == '"' && json[valueEnd - 1] != '\\')
+                break;
+            valueEnd++;
+        }
+
+        if (valueEnd >= json.Length) return null;
+        return json.Substring(valueStart + 1, valueEnd - valueStart - 1)
+            .Replace("\\\"", "\"")
+            .Replace("\\\\", "\\")
+            .Replace("\\n", "\n")
+            .Replace("\\r", "\r")
+            .Replace("\\t", "\t");
+    }
+
+    private string EscapeJsonStringValue(string value)
+    {
+        if (value == null) return "";
+        var sb = new StringBuilder();
+        foreach (char c in value)
+        {
+            switch (c)
+            {
+                case '"':
+                    sb.Append("\\\"");
+                    break;
+                case '\\':
+                    sb.Append("\\\\");
+                    break;
+                case '\n':
+                    sb.Append("\\n");
+                    break;
+                case '\r':
+                    sb.Append("\\r");
+                    break;
+                case '\t':
+                    sb.Append("\\t");
+                    break;
+                default:
+                    sb.Append(c);
+                    break;
             }
         }
+        return sb.ToString();
+    }
+
+    // Called by PlayIt Live's audio pipeline when it needs samples
+    // Now delegates to AudioMixer
+    internal int FillAudioBuffer(int length, IntPtr buffer)
+    {
+        if (_audioMixer != null)
+        {
+            return _audioMixer.FillOutputBuffer(length, buffer);
+        }
+
+        // Fallback: output silence if mixer not initialized
+        int sampleCount = length / 2;
+        var silence = new short[sampleCount];
+        Marshal.Copy(silence, 0, buffer, sampleCount);
+        return length;
     }
 
     public int GetCoHostCount() { return _cohosts.Count; }
@@ -489,8 +668,10 @@ h1{font-size:1.5rem;margin-bottom:1.5rem;text-align:center}
 .s-off{background:rgba(239,68,68,.2);border:1px solid #ef4444}
 .s-on{background:rgba(34,197,94,.2);border:1px solid #22c55e}
 .s-wait{background:rgba(234,179,8,.2);border:1px solid #eab308}
+.s-kick{background:rgba(239,68,68,.3);border:1px solid #ef4444}
 .btn{width:100%;padding:1rem;font-size:1.1rem;border:none;border-radius:8px;cursor:pointer;font-weight:bold;margin-bottom:1rem}
 .btn-blue{background:#3b82f6;color:#fff}
+.btn-blue:disabled{opacity:.5;cursor:not-allowed}
 .ptt{padding:2rem;font-size:1.5rem;border-radius:12px;user-select:none;transition:all .1s}
 .ptt-off{background:#64748b;color:#fff}
 .ptt-on{background:#ef4444;color:#fff;transform:scale(.98)}
@@ -498,13 +679,30 @@ h1{font-size:1.5rem;margin-bottom:1.5rem;text-align:center}
 .vu{height:8px;background:rgba(255,255,255,.1);border-radius:4px;overflow:hidden;margin-top:1rem}
 .vu-fill{height:100%;background:#22c55e;width:0%;transition:width .05s}
 .info{margin-top:1rem;font-size:.8rem;color:#94a3b8;text-align:center}
+.input{width:100%;padding:.75rem;font-size:1rem;border:1px solid #334155;border-radius:8px;margin-bottom:.75rem;background:#0f172a;color:#fff}
+.input:focus{outline:none;border-color:#3b82f6}
+.error{color:#ef4444;font-size:.9rem;text-align:center;margin-bottom:1rem;min-height:1.2em}
+.welcome{font-size:1.1rem;text-align:center;margin-bottom:1rem;color:#22c55e}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:6px}
+.hidden{display:none}
 </style>
 </head>
 <body>
 <div class='c'>
 <h1>🎙️ Partyline Co-Host</h1>
-<div id='st' class='status s-off'>Disconnected</div>
-<button id='conn' class='btn btn-blue' onclick='connect()'>Connect</button>
+
+<!-- Login State -->
+<div id='loginPanel'>
+<input id='username' class='input' type='text' placeholder='Username' autocomplete='username'>
+<input id='password' class='input' type='password' placeholder='Password' autocomplete='current-password'>
+<div id='errorMsg' class='error'></div>
+<button id='connectBtn' class='btn btn-blue' onclick='doLogin()'>Connect</button>
+</div>
+
+<!-- Connected State -->
+<div id='connectedPanel' class='hidden'>
+<div id='welcomeMsg' class='welcome'></div>
+<div id='st' class='status s-on'><span class='dot'></span>Connected</div>
 <button id='ptt' class='btn ptt ptt-off' disabled
  onmousedown='pttOn()' onmouseup='pttOff()' onmouseleave='pttOff()'
  ontouchstart='pttOn();event.preventDefault()' ontouchend='pttOff();event.preventDefault()'>
@@ -512,35 +710,109 @@ PUSH TO TALK</button>
 <div class='vu'><div id='vu' class='vu-fill'></div></div>
 <div class='info'>Hold the button to talk. Release to mute.</div>
 </div>
+
+<!-- Kicked State -->
+<div id='kickedPanel' class='hidden'>
+<div class='status s-kick'>Disconnected by host</div>
+<div class='info'>Your session has been ended by the DJ.</div>
+</div>
+
+</div>
 <script>
-let ctx,src,proc,sending=false,connected=false;
-const SR=44100,BUF=4096;
-const BASE=location.origin+'/partyline';
-async function connect(){
- document.getElementById('st').className='status s-wait';
- document.getElementById('st').innerText='Connecting...';
- document.getElementById('conn').disabled=true;
- try{
-  const stream=await navigator.mediaDevices.getUserMedia({audio:{sampleRate:SR,channelCount:1,echoCancellation:true}});
+var ctx,src,proc,sending=false,connected=false;
+var sessionToken=null,displayName='';
+var statusInterval=null;
+var SR=44100,BUF=4096;
+var BASE=location.origin+'/partyline';
+
+function doLogin(){
+ var u=document.getElementById('username').value.trim();
+ var p=document.getElementById('password').value;
+ document.getElementById('errorMsg').innerText='';
+ if(!u||!p){document.getElementById('errorMsg').innerText='Please enter username and password.';return;}
+ document.getElementById('connectBtn').disabled=true;
+ var xhr=new XMLHttpRequest();
+ xhr.open('POST',BASE+'/login',true);
+ xhr.setRequestHeader('Content-Type','application/json');
+ xhr.onload=function(){
+  document.getElementById('connectBtn').disabled=false;
+  try{
+   var r=JSON.parse(xhr.responseText);
+   if(r.success){
+    sessionToken=r.token;
+    displayName=r.displayName||u;
+    showConnected();
+   }else{
+    document.getElementById('errorMsg').innerText=r.error||'Login failed';
+   }
+  }catch(e){document.getElementById('errorMsg').innerText='Connection error';}
+ };
+ xhr.onerror=function(){
+  document.getElementById('connectBtn').disabled=false;
+  document.getElementById('errorMsg').innerText='Connection error';
+ };
+ xhr.send(JSON.stringify({username:u,password:p}));
+}
+
+function showConnected(){
+ document.getElementById('loginPanel').className='hidden';
+ document.getElementById('connectedPanel').className='';
+ document.getElementById('welcomeMsg').innerText='Welcome, '+displayName;
+ startAudio();
+ statusInterval=setInterval(pollStatus,3000);
+}
+
+function pollStatus(){
+ if(!sessionToken)return;
+ var xhr=new XMLHttpRequest();
+ xhr.open('GET',BASE+'/status',true);
+ xhr.setRequestHeader('X-Session-Token',sessionToken);
+ xhr.onload=function(){
+  try{
+   var r=JSON.parse(xhr.responseText);
+   if(r.kicked){showKicked();}
+  }catch(e){}
+ };
+ xhr.send();
+}
+
+function showKicked(){
+ connected=false;
+ sending=false;
+ if(statusInterval){clearInterval(statusInterval);statusInterval=null;}
+ if(ctx){try{ctx.close();}catch(e){}}
+ document.getElementById('connectedPanel').className='hidden';
+ document.getElementById('kickedPanel').className='';
+}
+
+function startAudio(){
+ navigator.mediaDevices.getUserMedia({audio:{sampleRate:SR,channelCount:1,echoCancellation:true}}).then(function(stream){
   ctx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
   src=ctx.createMediaStreamSource(stream);
   proc=ctx.createScriptProcessor(BUF,1,1);
   src.connect(proc);proc.connect(ctx.destination);
   connected=true;
-  document.getElementById('st').className='status s-on';
-  document.getElementById('st').innerText='Connected ✓';
   document.getElementById('ptt').disabled=false;
-  proc.onaudioprocess=(e)=>{
+  proc.onaudioprocess=function(e){
    if(!sending||!connected)return;
-   const d=e.inputBuffer.getChannelData(0);const p=new Int16Array(d.length);
-   for(let i=0;i<d.length;i++)p[i]=Math.max(-32768,Math.min(32767,Math.round(d[i]*32767)));
-   fetch(BASE+'/audio',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:p.buffer}).catch(()=>{});
-   let m=0;for(let i=0;i<d.length;i++){let v=Math.abs(d[i]);if(v>m)m=v;}
+   var d=e.inputBuffer.getChannelData(0);
+   var p=new Int16Array(d.length);
+   for(var i=0;i<d.length;i++)p[i]=Math.max(-32768,Math.min(32767,Math.round(d[i]*32767)));
+   var xhr=new XMLHttpRequest();
+   xhr.open('POST',BASE+'/audio',true);
+   xhr.setRequestHeader('Content-Type','application/octet-stream');
+   xhr.setRequestHeader('X-Session-Token',sessionToken);
+   xhr.send(p.buffer);
+   var m=0;for(var i=0;i<d.length;i++){var v=Math.abs(d[i]);if(v>m)m=v;}
    document.getElementById('vu').style.width=(m*100)+'%';
   };
- }catch(err){document.getElementById('st').className='status s-off';document.getElementById('st').innerText='Error: '+err.message;document.getElementById('conn').disabled=false;}
+ }).catch(function(err){
+  document.getElementById('st').className='status s-off';
+  document.getElementById('st').innerText='Mic error: '+err.message;
+ });
 }
-function pttOn(){sending=true;document.getElementById('ptt').className='btn ptt ptt-on';document.getElementById('ptt').innerText='🎙️ LIVE';}
+
+function pttOn(){if(!connected)return;sending=true;document.getElementById('ptt').className='btn ptt ptt-on';document.getElementById('ptt').innerText='🎙️ LIVE';}
 function pttOff(){sending=false;document.getElementById('ptt').className='btn ptt ptt-off';document.getElementById('ptt').innerText='PUSH TO TALK';document.getElementById('vu').style.width='0%';}
 </script>
 </body>
@@ -894,6 +1166,155 @@ public class CoHostAudioBuffer
             _readPos = 0;
             _availableSamples = 0;
             _peakLevel = 0f;
+        }
+    }
+}
+
+public class AudioMixer
+{
+    private ConcurrentDictionary<string, CoHostState> _coHosts;
+
+    public AudioMixer()
+    {
+        _coHosts = new ConcurrentDictionary<string, CoHostState>();
+    }
+
+    public void EnsureCoHost(string cohostId)
+    {
+        if (cohostId == null) return;
+        if (!_coHosts.ContainsKey(cohostId))
+        {
+            CoHostState state = new CoHostState();
+            state.IsLive = false;
+            state.IsMuted = false;
+            state.IsConnected = true;
+            state.Buffer = new CoHostAudioBuffer();
+            _coHosts.TryAdd(cohostId, state);
+        }
+    }
+
+    public void IngestAudio(string cohostId, byte[] pcmData, int length)
+    {
+        if (cohostId == null || pcmData == null || length <= 0) return;
+        EnsureCoHost(cohostId);
+
+        CoHostState state;
+        if (_coHosts.TryGetValue(cohostId, out state))
+        {
+            state.Buffer.Write(pcmData, length);
+        }
+    }
+
+    public int FillOutputBuffer(int length, IntPtr buffer)
+    {
+        int sampleCount = length / 2;
+        short[] output = new short[sampleCount];
+
+        // Collect all live + unmuted co-host keys
+        List<CoHostState> activeStates = new List<CoHostState>();
+        foreach (var kvp in _coHosts)
+        {
+            CoHostState s = kvp.Value;
+            if (s.IsLive && !s.IsMuted)
+            {
+                activeStates.Add(s);
+            }
+        }
+
+        if (activeStates.Count == 0)
+        {
+            // Output silence
+            Marshal.Copy(output, 0, buffer, sampleCount);
+            return length;
+        }
+
+        // Read from each active co-host and sum with clamping
+        short[][] buffers = new short[activeStates.Count][];
+        for (int i = 0; i < activeStates.Count; i++)
+        {
+            buffers[i] = new short[sampleCount];
+            activeStates[i].Buffer.Read(buffers[i], sampleCount);
+        }
+
+        for (int s = 0; s < sampleCount; s++)
+        {
+            int sum = 0;
+            for (int i = 0; i < buffers.Length; i++)
+            {
+                sum += buffers[i][s];
+            }
+            // Clamp to 16-bit signed range
+            if (sum > 32767) sum = 32767;
+            if (sum < -32768) sum = -32768;
+            output[s] = (short)sum;
+        }
+
+        Marshal.Copy(output, 0, buffer, sampleCount);
+        return length;
+    }
+
+    public void SetLive(string cohostId, bool live)
+    {
+        if (cohostId == null) return;
+        EnsureCoHost(cohostId);
+        CoHostState state;
+        if (_coHosts.TryGetValue(cohostId, out state))
+        {
+            state.IsLive = live;
+        }
+    }
+
+    public void SetMuted(string cohostId, bool muted)
+    {
+        if (cohostId == null) return;
+        EnsureCoHost(cohostId);
+        CoHostState state;
+        if (_coHosts.TryGetValue(cohostId, out state))
+        {
+            state.IsMuted = muted;
+        }
+    }
+
+    public bool GetLive(string cohostId)
+    {
+        if (cohostId == null) return false;
+        CoHostState state;
+        if (_coHosts.TryGetValue(cohostId, out state))
+        {
+            return state.IsLive;
+        }
+        return false;
+    }
+
+    public bool GetMuted(string cohostId)
+    {
+        if (cohostId == null) return false;
+        CoHostState state;
+        if (_coHosts.TryGetValue(cohostId, out state))
+        {
+            return state.IsMuted;
+        }
+        return false;
+    }
+
+    public float GetLevel(string cohostId)
+    {
+        if (cohostId == null) return 0f;
+        CoHostState state;
+        if (_coHosts.TryGetValue(cohostId, out state))
+        {
+            return state.Buffer.GetPeakLevel();
+        }
+        return 0f;
+    }
+
+    public void RemoveCoHost(string cohostId)
+    {
+        if (cohostId == null) return;
+        CoHostState removed;
+        if (_coHosts.TryRemove(cohostId, out removed))
+        {
+            removed.Buffer.Clear();
         }
     }
 }
