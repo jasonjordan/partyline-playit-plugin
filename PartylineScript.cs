@@ -923,7 +923,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
                 if (mainMix == null) continue;
 
                 int handle = mainMix.GetMixerChannelHandle();
-                if (handle > 0)
+                if (handle != 0)
                 {
                     _mixerHandle = handle;
                     Log("Mixer channel handle acquired: " + _mixerHandle);
@@ -2832,56 +2832,62 @@ public class PartylineControlPanel : UserControl
         rowPanel.Controls.Add(latencyLabel);
         row.LatencyLabel = latencyLabel;
 
-        // Mute button
+        // Mute button (anchored to right)
         Button muteBtn = new Button();
         muteBtn.Text = "Mute";
         muteBtn.FlatStyle = FlatStyle.Flat;
         muteBtn.Size = new System.Drawing.Size(50, 22);
-        muteBtn.Location = new System.Drawing.Point(312, 2);
         muteBtn.Font = new System.Drawing.Font("Segoe UI", 7.5f);
         muteBtn.ForeColor = System.Drawing.Color.White;
         muteBtn.BackColor = System.Drawing.Color.FromArgb(70, 70, 85);
         muteBtn.FlatAppearance.BorderSize = 0;
         muteBtn.Cursor = Cursors.Hand;
         muteBtn.Tag = account.Username;
+        muteBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         muteBtn.Click += OnMuteClick;
         rowPanel.Controls.Add(muteBtn);
         row.MuteButton = muteBtn;
         _toolTip.SetToolTip(muteBtn, "Mute/unmute co-host audio");
 
-        // Kick button
+        // Kick button (anchored to right)
         Button kickBtn = new Button();
         kickBtn.Text = "Kick";
         kickBtn.FlatStyle = FlatStyle.Flat;
         kickBtn.Size = new System.Drawing.Size(40, 22);
-        kickBtn.Location = new System.Drawing.Point(366, 2);
-        kickBtn.Font = new System.Drawing.Font("Segoe UI", 8f);
+        kickBtn.Font = new System.Drawing.Font("Segoe UI", 7.5f);
         kickBtn.ForeColor = System.Drawing.Color.White;
         kickBtn.BackColor = System.Drawing.Color.FromArgb(180, 60, 60);
         kickBtn.FlatAppearance.BorderSize = 0;
         kickBtn.Cursor = Cursors.Hand;
         kickBtn.Tag = account.Username;
+        kickBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         kickBtn.Click += OnKickClick;
         rowPanel.Controls.Add(kickBtn);
         row.KickButton = kickBtn;
         _toolTip.SetToolTip(kickBtn, "Disconnect co-host");
 
-        // Live toggle button
+        // Live toggle button (anchored to right)
         Button liveBtn = new Button();
         liveBtn.Text = "Go Live";
         liveBtn.FlatStyle = FlatStyle.Flat;
         liveBtn.Size = new System.Drawing.Size(60, 22);
-        liveBtn.Location = new System.Drawing.Point(404, 2);
         liveBtn.Font = new System.Drawing.Font("Segoe UI", 7.5f, System.Drawing.FontStyle.Bold);
         liveBtn.ForeColor = System.Drawing.Color.Gray;
         liveBtn.BackColor = System.Drawing.Color.FromArgb(50, 50, 60);
         liveBtn.FlatAppearance.BorderSize = 0;
         liveBtn.Cursor = Cursors.Hand;
         liveBtn.Tag = account.Username;
+        liveBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         liveBtn.Click += OnLiveClick;
         rowPanel.Controls.Add(liveBtn);
         row.LiveButton = liveBtn;
         _toolTip.SetToolTip(liveBtn, "Toggle co-host audio on/off air");
+
+        // Position buttons from right edge
+        int rightEdge = rowPanel.Width;
+        liveBtn.Location = new System.Drawing.Point(rightEdge - 64, 2);
+        kickBtn.Location = new System.Drawing.Point(rightEdge - 108, 2);
+        muteBtn.Location = new System.Drawing.Point(rightEdge - 162, 2);
 
         Controls.Add(rowPanel);
         return row;
