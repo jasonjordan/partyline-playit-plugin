@@ -17,6 +17,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     private int _activePort = 25434;
     private static string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Partyline", "partyline.log");
     private SettingsManager _settingsManager = new SettingsManager();
+    private string _stationName = "Partyline Co-Host";
 
     // Co-host sessions
     private ConcurrentDictionary<string, CoHostState> _cohosts = new ConcurrentDictionary<string, CoHostState>();
@@ -50,6 +51,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
             // Load settings and initialize subsystems
             List<CoHostAccount> accounts = _settingsManager.Load();
+            _stationName = _settingsManager.LoadStationName();
 
             _authManager = new AuthenticationManager();
             _authManager.SetAccounts(accounts);
@@ -705,11 +707,12 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
     private string GetCoHostPage()
     {
-        return @"<!DOCTYPE html>
+        string safeStationName = EscapeHtmlContent(_stationName ?? "Partyline Co-Host");
+        string html = @"<!DOCTYPE html>
 <html>
 <head>
 <meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Partyline Co-Host</title>
+<title>{{STATION_NAME}}</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center}
@@ -740,7 +743,7 @@ h1{font-size:1.5rem;margin-bottom:1.5rem;text-align:center}
 </head>
 <body>
 <div class='c'>
-<h1>🎙️ Partyline Co-Host</h1>
+<h1>🎙️ {{STATION_NAME}}</h1>
 
 <!-- Login State -->
 <div id='loginPanel'>
@@ -755,11 +758,10 @@ h1{font-size:1.5rem;margin-bottom:1.5rem;text-align:center}
 <div id='welcomeMsg' class='welcome'></div>
 <div id='st' class='status s-on'><span class='dot'></span>Connected</div>
 <button id='ptt' class='btn ptt ptt-off' disabled
- onmousedown='pttOn()' onmouseup='pttOff()' onmouseleave='pttOff()'
- ontouchstart='pttOn();event.preventDefault()' ontouchend='pttOff();event.preventDefault()'>
-PUSH TO TALK</button>
+ onclick='toggleMic()'>
+MIC OFF</button>
 <div class='vu'><div id='vu' class='vu-fill'></div></div>
-<div class='info'>Hold the button to talk. Release to mute.</div>
+<div class='info'>Click the button to toggle your microphone on or off.</div>
 </div>
 
 <!-- Kicked State -->
@@ -775,6 +777,7 @@ var sessionToken=null,displayName='';
 var statusInterval=null;
 var SR=44100,BUF=4096;
 var BASE=location.origin+'/partyline';
+var stationName='{{STATION_NAME_JS}}';
 
 function doLogin(){
  var u=document.getElementById('username').value.trim();
@@ -808,7 +811,7 @@ function doLogin(){
 function showConnected(){
  document.getElementById('loginPanel').className='hidden';
  document.getElementById('connectedPanel').className='';
- document.getElementById('welcomeMsg').innerText='Welcome, '+displayName;
+ document.getElementById('welcomeMsg').innerText='Welcome to '+stationName+', '+displayName+'!';
  startAudio();
  statusInterval=setInterval(pollStatus,3000);
 }
@@ -864,11 +867,30 @@ function startAudio(){
  });
 }
 
-function pttOn(){if(!connected)return;sending=true;document.getElementById('ptt').className='btn ptt ptt-on';document.getElementById('ptt').innerText='🎙️ LIVE';}
-function pttOff(){sending=false;document.getElementById('ptt').className='btn ptt ptt-off';document.getElementById('ptt').innerText='PUSH TO TALK';document.getElementById('vu').style.width='0%';}
+function toggleMic(){
+ if(!connected)return;
+ sending=!sending;
+ if(sending){
+  document.getElementById('ptt').className='btn ptt ptt-on';
+  document.getElementById('ptt').innerText='MIC ON';
+ }else{
+  document.getElementById('ptt').className='btn ptt ptt-off';
+  document.getElementById('ptt').innerText='MIC OFF';
+  document.getElementById('vu').style.width='0%';
+ }
+}
 </script>
 </body>
 </html>";
+        html = html.Replace("{{STATION_NAME}}", safeStationName);
+        html = html.Replace("{{STATION_NAME_JS}}", EscapeJsonStringValue(safeStationName));
+        return html;
+    }
+
+    private string EscapeHtmlContent(string value)
+    {
+        if (value == null) return "";
+        return value.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;").Replace("'", "&#39;");
     }
 }
 
@@ -1460,6 +1482,30 @@ public class SettingsManager
         }
     }
 
+    public string LoadStationName()
+    {
+        try
+        {
+            if (!File.Exists(SettingsPath))
+            {
+                return "Partyline Co-Host";
+            }
+
+            string json = File.ReadAllText(SettingsPath, Encoding.UTF8);
+            string name = ExtractJsonStringValue(json, "stationName");
+            if (string.IsNullOrEmpty(name))
+            {
+                return "Partyline Co-Host";
+            }
+            return name;
+        }
+        catch (Exception ex)
+        {
+            NewPlugin.LogStatic("ERROR loading station name: " + ex.Message);
+            return "Partyline Co-Host";
+        }
+    }
+
     private List<CoHostAccount> ParseAccountsJson(string json)
     {
         // Simple JSON parser for our known format:
@@ -1552,6 +1598,11 @@ public class SettingsManager
 
     public void Save(List<CoHostAccount> accounts)
     {
+        Save(accounts, null);
+    }
+
+    public void Save(List<CoHostAccount> accounts, string stationName)
+    {
         try
         {
             string dir = Path.GetDirectoryName(SettingsPath);
@@ -1560,9 +1611,17 @@ public class SettingsManager
                 Directory.CreateDirectory(dir);
             }
 
+            // If stationName not provided, preserve the existing one
+            if (stationName == null)
+            {
+                stationName = LoadStationName();
+            }
+
             var sb = new StringBuilder();
             sb.Append("{");
-            sb.Append("\"accounts\":[");
+            sb.Append("\"stationName\":");
+            sb.Append(EscapeJsonString(stationName));
+            sb.Append(",\"accounts\":[");
 
             for (int i = 0; i < accounts.Count; i++)
             {
@@ -1651,11 +1710,13 @@ public class PartylineConfigForm : Form
 {
     private SettingsManager _settingsManager;
     private List<CoHostAccount> _accounts;
+    private string _stationName;
     private DataGridView _grid;
     private Panel _editPanel;
     private TextBox _txtUsername;
     private TextBox _txtPassword;
     private TextBox _txtDisplayName;
+    private TextBox _txtStationName;
     private Button _btnSave;
     private Button _btnCancel;
     private Button _btnAdd;
@@ -1665,6 +1726,7 @@ public class PartylineConfigForm : Form
     {
         _settingsManager = settingsManager;
         _accounts = _settingsManager.Load();
+        _stationName = _settingsManager.LoadStationName();
         _editingIndex = -1;
         InitializeFormComponents();
         LoadGrid();
@@ -1674,22 +1736,37 @@ public class PartylineConfigForm : Form
     {
         Text = "Partyline Co-Host Configuration";
         Width = 550;
-        Height = 480;
+        Height = 520;
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
 
+        // Station Name field at top
+        Label lblStation = new Label();
+        lblStation.Text = "Station Name:";
+        lblStation.Location = new System.Drawing.Point(12, 12);
+        lblStation.AutoSize = true;
+        lblStation.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+        Controls.Add(lblStation);
+
+        _txtStationName = new TextBox();
+        _txtStationName.Location = new System.Drawing.Point(120, 10);
+        _txtStationName.Size = new System.Drawing.Size(300, 22);
+        _txtStationName.Text = _stationName;
+        _txtStationName.Leave += OnStationNameChanged;
+        Controls.Add(_txtStationName);
+
         Label lblTitle = new Label();
         lblTitle.Text = "Co-Host Accounts:";
-        lblTitle.Location = new System.Drawing.Point(12, 12);
+        lblTitle.Location = new System.Drawing.Point(12, 44);
         lblTitle.AutoSize = true;
         lblTitle.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
         Controls.Add(lblTitle);
 
         // DataGridView for account list
         _grid = new DataGridView();
-        _grid.Location = new System.Drawing.Point(12, 36);
+        _grid.Location = new System.Drawing.Point(12, 68);
         _grid.Size = new System.Drawing.Size(510, 200);
         _grid.AllowUserToAddRows = false;
         _grid.AllowUserToDeleteRows = false;
@@ -1735,14 +1812,14 @@ public class PartylineConfigForm : Form
         // Add button
         _btnAdd = new Button();
         _btnAdd.Text = "+ Add Co-Host";
-        _btnAdd.Location = new System.Drawing.Point(12, 244);
+        _btnAdd.Location = new System.Drawing.Point(12, 276);
         _btnAdd.Size = new System.Drawing.Size(120, 28);
         _btnAdd.Click += OnAddClick;
         Controls.Add(_btnAdd);
 
         // Edit panel
         _editPanel = new Panel();
-        _editPanel.Location = new System.Drawing.Point(12, 280);
+        _editPanel.Location = new System.Drawing.Point(12, 312);
         _editPanel.Size = new System.Drawing.Size(510, 150);
         _editPanel.Visible = false;
 
@@ -1825,9 +1902,19 @@ public class PartylineConfigForm : Form
         else if (_grid.Columns[e.ColumnIndex].Name == "Delete")
         {
             _accounts.RemoveAt(e.RowIndex);
-            _settingsManager.Save(_accounts);
+            _settingsManager.Save(_accounts, _txtStationName.Text.Trim());
             LoadGrid();
             HideEditPanel();
+        }
+    }
+
+    private void OnStationNameChanged(object sender, EventArgs e)
+    {
+        string newName = _txtStationName.Text.Trim();
+        if (!string.IsNullOrEmpty(newName) && newName != _stationName)
+        {
+            _stationName = newName;
+            _settingsManager.Save(_accounts, _stationName);
         }
     }
 
@@ -1889,7 +1976,7 @@ public class PartylineConfigForm : Form
             existing.DisplayName = string.IsNullOrEmpty(displayName) ? username : displayName;
         }
 
-        _settingsManager.Save(_accounts);
+        _settingsManager.Save(_accounts, _txtStationName.Text.Trim());
         LoadGrid();
         HideEditPanel();
     }
