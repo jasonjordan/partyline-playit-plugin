@@ -76,6 +76,9 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             hookThread.Start();
 
             Log("Plugin started successfully.");
+
+            // Keep plugin running - this blocks until plugin is stopped
+            App.WaitForPluginStop();
         }
         catch (Exception ex)
         {
