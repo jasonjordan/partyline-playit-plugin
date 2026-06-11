@@ -100,7 +100,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
             // Register embedded UI control
             Log("Registering UI control...");
-            App.RegisterUserControl(() => new PartylineControlPanel(_audioMixer, _authManager, accounts), UserControlLocation.AboveTrackGroupSelector, 100);
+            App.RegisterUserControl(() => new PartylineControlPanel(_audioMixer, _authManager, accounts, _settingsManager), UserControlLocation.AboveTrackGroupSelector, 100);
             Log("UI control registered.");
 
             // Hook into PlayIt Live's ServiceStack HTTP server on port 25434
@@ -1934,10 +1934,12 @@ public class PartylineControlPanel : UserControl
     private System.Windows.Forms.Timer _vuTimer;
     private List<CoHostRow> _rows;
     private ToolTip _toolTip;
+    private SettingsManager _settingsManager;
 
-    public PartylineControlPanel(AudioMixer audioMixer, AuthenticationManager authManager, List<CoHostAccount> accounts)
+    public PartylineControlPanel(AudioMixer audioMixer, AuthenticationManager authManager, List<CoHostAccount> accounts, SettingsManager settingsManager)
     {
         _audioMixer = audioMixer;
+        _settingsManager = settingsManager;
         _authManager = authManager;
         _accounts = accounts != null ? accounts : new List<CoHostAccount>();
         _rows = new List<CoHostRow>();
@@ -1979,6 +1981,20 @@ public class PartylineControlPanel : UserControl
         titleLabel.Dock = DockStyle.Fill;
         titleLabel.Padding = new Padding(2, 4, 0, 0);
         titlePanel.Controls.Add(titleLabel);
+
+        Button configBtn = new Button();
+        configBtn.Text = "\u2699";
+        configBtn.FlatStyle = FlatStyle.Flat;
+        configBtn.Size = new System.Drawing.Size(24, 22);
+        configBtn.Dock = DockStyle.Right;
+        configBtn.Font = new System.Drawing.Font("Segoe UI", 10f);
+        configBtn.ForeColor = System.Drawing.Color.FromArgb(180, 180, 190);
+        configBtn.BackColor = System.Drawing.Color.FromArgb(50, 50, 55);
+        configBtn.FlatAppearance.BorderSize = 0;
+        configBtn.Cursor = Cursors.Hand;
+        configBtn.Click += OnConfigureClick;
+        titlePanel.Controls.Add(configBtn);
+        _toolTip.SetToolTip(configBtn, "Configure co-host accounts");
 
         Controls.Add(titlePanel);
 
@@ -2159,6 +2175,12 @@ public class PartylineControlPanel : UserControl
         _audioMixer.RemoveCoHost(cohostId);
 
         UpdateRowState(cohostId);
+    }
+
+    private void OnConfigureClick(object sender, EventArgs e)
+    {
+        var form = new PartylineConfigForm(_settingsManager);
+        form.ShowDialog();
     }
 
     private void UpdateRowState(string cohostId)
