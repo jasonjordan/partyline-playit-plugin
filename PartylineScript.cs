@@ -29,15 +29,36 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
     // Return audio (BASS mixer capture)
     private int _mixerHandle;
-    private byte[] _returnBuffer = new byte[44100 * 2 * 2]; // 2 seconds of 16-bit mono at 44.1kHz
+    private int _mixerChannels = 2; // default stereo, updated from BASS_ChannelGetInfo
+    private int _mixerFreq = 44100; // default 44.1kHz, updated from BASS_ChannelGetInfo
+    private byte[] _returnBuffer = new byte[44100 * 2 * 4]; // 4 seconds of 16-bit mono at 44.1kHz
     private int _returnWritePos;
     private int _returnReadPos;
     private readonly object _returnLock = new object();
     private Thread _captureThread;
     private volatile bool _captureRunning;
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BASS_CHANNELINFO
+    {
+        public int freq;
+        public int chans;
+        public int flags;
+        public int ctype;
+        public int origres;
+        public int plugin;
+        public int sample;
+        public IntPtr filename;
+    }
+
+    [DllImport("bass", CallingConvention = CallingConvention.StdCall)]
+    private static extern bool BASS_ChannelGetInfo(int handle, ref BASS_CHANNELINFO info);
+
     [DllImport("bass", CallingConvention = CallingConvention.StdCall)]
     private static extern int BASS_ChannelGetData(int handle, [Out] byte[] buffer, int length);
+
+    [DllImport("bass", CallingConvention = CallingConvention.StdCall)]
+    private static extern int BASS_ChannelGetData(int handle, [Out] float[] buffer, int length);
 
     private static void Log(string message)
     {
@@ -927,6 +948,20 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
                 {
                     _mixerHandle = handle;
                     Log("Mixer channel handle acquired: " + _mixerHandle);
+
+                    // Query mixer format for proper audio conversion
+                    BASS_CHANNELINFO info = new BASS_CHANNELINFO();
+                    if (BASS_ChannelGetInfo(_mixerHandle, ref info))
+                    {
+                        _mixerFreq = info.freq > 0 ? info.freq : 44100;
+                        _mixerChannels = info.chans > 0 ? info.chans : 2;
+                        Log("Mixer format: freq=" + info.freq + " chans=" + info.chans + " flags=" + info.flags);
+                    }
+                    else
+                    {
+                        Log("BASS_ChannelGetInfo failed, assuming stereo 44.1kHz float");
+                    }
+
                     _captureRunning = true;
                     _captureThread = new Thread(CaptureLoop) { IsBackground = true, Name = "PartylineCapture" };
                     _captureThread.Start();
@@ -944,21 +979,43 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
     private void CaptureLoop()
     {
-        byte[] chunk = new byte[8192]; // ~93ms at 44.1kHz mono 16-bit
-        Log("CaptureLoop started, handle=" + _mixerHandle);
+        float[] floatChunk = new float[4096]; // 4096 float samples
+        Log("CaptureLoop started, handle=" + _mixerHandle + " channels=" + _mixerChannels + " freq=" + _mixerFreq);
 
         while (_captureRunning)
         {
             try
             {
-                int bytesRead = BASS_ChannelGetData(_mixerHandle, chunk, chunk.Length);
+                // Request 4096 float samples * 4 bytes each = 16384 bytes
+                int bytesRead = BASS_ChannelGetData(_mixerHandle, floatChunk, 4096 * 4);
                 if (bytesRead > 0)
                 {
+                    int floatSamples = bytesRead / 4;
+                    int channels = _mixerChannels;
+                    int monoSamples = floatSamples / channels;
+                    byte[] pcm16 = new byte[monoSamples * 2];
+
+                    for (int i = 0; i < monoSamples; i++)
+                    {
+                        float sum = 0;
+                        for (int ch = 0; ch < channels; ch++)
+                        {
+                            sum += floatChunk[i * channels + ch];
+                        }
+                        float mono = sum / channels;
+                        // Clamp to [-1, 1] and convert to 16-bit signed
+                        if (mono > 1f) mono = 1f;
+                        if (mono < -1f) mono = -1f;
+                        short s16 = (short)(mono * 32767f);
+                        pcm16[i * 2] = (byte)(s16 & 0xFF);
+                        pcm16[i * 2 + 1] = (byte)((s16 >> 8) & 0xFF);
+                    }
+
                     lock (_returnLock)
                     {
-                        for (int i = 0; i < bytesRead; i++)
+                        for (int i = 0; i < pcm16.Length; i++)
                         {
-                            _returnBuffer[_returnWritePos] = chunk[i];
+                            _returnBuffer[_returnWritePos] = pcm16[i];
                             _returnWritePos = (_returnWritePos + 1) % _returnBuffer.Length;
                         }
                     }
@@ -1188,8 +1245,8 @@ function showConnected(){
 
 function startListenStream(){
  listenCtx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
- listenNextTime=listenCtx.currentTime+0.3;
- listenInterval=setInterval(pollListen,100);
+ listenNextTime=listenCtx.currentTime+0.5;
+ listenInterval=setInterval(pollListen,150);
 }
 
 function pollListen(){
