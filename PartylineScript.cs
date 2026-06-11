@@ -63,6 +63,41 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             App.AudioPipeline.RegisterSpecialAudioStream("partyline", new PartylineStream(this));
             Log("Audio stream registered.");
 
+            // Connect the partyline audio source to the main mix output
+            try
+            {
+                Log("Connecting partyline source to main mix...");
+                var source = App.AudioPipeline.CreateSource("partyline");
+                Log("Created audio source: " + (source != null ? "OK" : "NULL"));
+
+                if (source != null)
+                {
+                    var mainMix = App.AudioPipeline.GetMainMix();
+                    Log("Got main mix: " + (mainMix != null ? "OK" : "NULL"));
+
+                    if (mainMix != null)
+                    {
+                        App.AudioPipeline.Connect(source, mainMix);
+                        Log("Connected source to main mix.");
+
+                        source.Start();
+                        Log("Audio source started.");
+                    }
+                    else
+                    {
+                        Log("WARNING: MainMix is null, audio will not be routed.");
+                    }
+                }
+                else
+                {
+                    Log("WARNING: Could not create audio source, audio will not be routed.");
+                }
+            }
+            catch (Exception audioEx)
+            {
+                Log("ERROR connecting audio pipeline: " + audioEx.ToString());
+            }
+
             // Register embedded UI control
             Log("Registering UI control...");
             App.RegisterUserControl(() => new PartylineControlPanel(_audioMixer, _authManager, accounts), UserControlLocation.AboveTrackGroupSelector, 100);
@@ -948,6 +983,20 @@ public class AuthenticationManager
     public void InvalidateAllSessions()
     {
         _sessions.Clear();
+    }
+
+    public bool HasActiveSession(string cohostId)
+    {
+        if (cohostId == null) return false;
+        foreach (var kvp in _sessions)
+        {
+            if (kvp.Value.CohostId != null &&
+                kvp.Value.CohostId.Equals(cohostId, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     public void SetAccounts(List<CoHostAccount> accounts)
@@ -1921,12 +1970,12 @@ public class PartylineControlPanel : UserControl
         Panel titlePanel = new Panel();
         titlePanel.Dock = DockStyle.Top;
         titlePanel.Height = 24;
-        titlePanel.BackColor = System.Drawing.Color.FromArgb(20, 20, 40);
+        titlePanel.BackColor = System.Drawing.Color.FromArgb(50, 50, 55);
 
         Label titleLabel = new Label();
-        titleLabel.Text = "\U0001F3A4 Partyline Co-Hosts";
+        titleLabel.Text = "Partyline";
         titleLabel.ForeColor = System.Drawing.Color.White;
-        titleLabel.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+        titleLabel.Font = new System.Drawing.Font("Segoe UI", 11f, System.Drawing.FontStyle.Bold);
         titleLabel.Dock = DockStyle.Fill;
         titleLabel.Padding = new Padding(2, 4, 0, 0);
         titlePanel.Controls.Add(titleLabel);
@@ -2054,7 +2103,7 @@ public class PartylineControlPanel : UserControl
 
         // Live toggle button
         Button liveBtn = new Button();
-        liveBtn.Text = "\u25CB OFF";
+        liveBtn.Text = "Go Live";
         liveBtn.FlatStyle = FlatStyle.Flat;
         liveBtn.Size = new System.Drawing.Size(60, 22);
         liveBtn.Location = new System.Drawing.Point(250, 2);
@@ -2131,7 +2180,7 @@ public class PartylineControlPanel : UserControl
                 }
                 else
                 {
-                    row.LiveButton.Text = "\u25CB OFF";
+                    row.LiveButton.Text = "Go Live";
                     row.LiveButton.ForeColor = System.Drawing.Color.Gray;
                     row.LiveButton.BackColor = System.Drawing.Color.FromArgb(50, 50, 60);
                 }
@@ -2188,8 +2237,8 @@ public class PartylineControlPanel : UserControl
                 row.VuFill.BackColor = System.Drawing.Color.FromArgb(34, 197, 94);
             }
 
-            // Update connected indicator
-            bool connected = _audioMixer.IsConnected(row.CohostId);
+            // Update connected indicator (based on active session, not audio)
+            bool connected = _authManager.HasActiveSession(row.CohostId);
             if (connected)
             {
                 row.ConnectedIndicator.Text = "\u25CF";
