@@ -14,7 +14,7 @@ using PlayIt.PluginEngine;
 public class NewPlugin : Plugin<IPlayItLiveApp>
 {
     private CancellationTokenSource _cts;
-    private int _activePort = 25434;
+    private int _activePort;
     private static string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Partyline", "partyline.log");
     private SettingsManager _settingsManager = new SettingsManager();
     private string _stationName = "Partyline Co-Host";
@@ -163,7 +163,117 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
                 return;
             }
 
-            Log("Found instance: " + instance.GetType().FullName + ". Hooking now.");
+            Log("Found instance: " + instance.GetType().FullName + ". Detecting port...");
+
+            // Detect port from HttpListener prefixes via reflection
+            int detectedPort = 25434; // fallback
+            try
+            {
+                // Walk the type hierarchy looking for a Listener property or field
+                object listener = null;
+                Type searchType = instance.GetType();
+                while (searchType != null && listener == null)
+                {
+                    PropertyInfo listenerProp = searchType.GetProperty("Listener", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (listenerProp != null)
+                    {
+                        listener = listenerProp.GetValue(instance);
+                    }
+                    else
+                    {
+                        FieldInfo listenerField = searchType.GetField("Listener", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                        if (listenerField != null)
+                        {
+                            listener = listenerField.GetValue(instance);
+                        }
+                    }
+                    searchType = searchType.BaseType;
+                }
+
+                if (listener == null)
+                {
+                    // Try common alternative names
+                    searchType = instance.GetType();
+                    while (searchType != null && listener == null)
+                    {
+                        foreach (var prop in searchType.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                        {
+                            if (prop.PropertyType == typeof(HttpListener) || prop.PropertyType.Name == "HttpListener")
+                            {
+                                listener = prop.GetValue(instance);
+                                if (listener != null) break;
+                            }
+                        }
+                        if (listener == null)
+                        {
+                            foreach (var field in searchType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                            {
+                                if (field.FieldType == typeof(HttpListener) || field.FieldType.Name == "HttpListener")
+                                {
+                                    listener = field.GetValue(instance);
+                                    if (listener != null) break;
+                                }
+                            }
+                        }
+                        searchType = searchType.BaseType;
+                    }
+                }
+
+                if (listener != null)
+                {
+                    Log("Found listener object: " + listener.GetType().FullName);
+
+                    // Get Prefixes from the HttpListener
+                    PropertyInfo prefixesProp = listener.GetType().GetProperty("Prefixes", BindingFlags.Public | BindingFlags.Instance);
+                    if (prefixesProp != null)
+                    {
+                        var prefixes = prefixesProp.GetValue(listener);
+                        if (prefixes != null)
+                        {
+                            // Enumerate prefixes to find port - pattern: https://+:25434/
+                            var enumerator = prefixes.GetType().GetMethod("GetEnumerator");
+                            if (enumerator != null)
+                            {
+                                var iter = enumerator.Invoke(prefixes, null) as System.Collections.IEnumerator;
+                                if (iter != null && iter.MoveNext())
+                                {
+                                    string prefix = iter.Current as string;
+                                    if (prefix != null)
+                                    {
+                                        Log("Found prefix: " + prefix);
+                                        // Parse port from URL like https://+:25434/ or http://localhost:12345/
+                                        int colonIdx = prefix.LastIndexOf(':');
+                                        if (colonIdx > 0)
+                                        {
+                                            int slashIdx = prefix.IndexOf('/', colonIdx);
+                                            if (slashIdx < 0) slashIdx = prefix.Length;
+                                            string portStr = prefix.Substring(colonIdx + 1, slashIdx - colonIdx - 1);
+                                            int parsedPort;
+                                            if (int.TryParse(portStr, out parsedPort) && parsedPort > 0 && parsedPort <= 65535)
+                                            {
+                                                detectedPort = parsedPort;
+                                                Log("Detected port from prefix: " + detectedPort);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    Log("Could not find Listener on instance, using fallback port 25434");
+                }
+            }
+            catch (Exception portEx)
+            {
+                Log("Port detection error (using fallback 25434): " + portEx.Message);
+            }
+
+            _activePort = detectedPort;
+            Log("Active port set to: " + _activePort);
+
             HookIntoServiceStack();
         }
         catch (Exception ex)
@@ -174,7 +284,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
     private void HookIntoServiceStack()
     {
-        Log("Hooking into ServiceStack on port 25434...");
+        Log("Hooking into ServiceStack on port " + _activePort + "...");
 
         // Find ServiceStackHost.Instance
         Type hostType = null;
@@ -678,7 +788,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     }
 
     public int GetCoHostCount() { return _cohosts.Count; }
-    public string GetLink() { return "https://" + Dns.GetHostName() + ":25434/partyline/join"; }
+    public string GetLink() { return "https://" + Dns.GetHostName() + ":" + _activePort + "/partyline/join"; }
 
     public void MuteAll() { foreach (var c in _cohosts.Values) c.IsMuted = true; }
     public void UnmuteAll() { foreach (var c in _cohosts.Values) c.IsMuted = false; }
@@ -1754,7 +1864,6 @@ public class PartylineConfigForm : Form
         _txtStationName.Location = new System.Drawing.Point(120, 10);
         _txtStationName.Size = new System.Drawing.Size(300, 22);
         _txtStationName.Text = _stationName;
-        _txtStationName.Leave += OnStationNameChanged;
         Controls.Add(_txtStationName);
 
         Label lblTitle = new Label();
@@ -1879,6 +1988,42 @@ public class PartylineConfigForm : Form
         _editPanel.Controls.Add(_btnCancel);
 
         Controls.Add(_editPanel);
+
+        // Save & Close button at bottom-right
+        Button btnSaveClose = new Button();
+        btnSaveClose.Text = "Save && Close";
+        btnSaveClose.Location = new System.Drawing.Point(Width - 220, Height - 60);
+        btnSaveClose.Size = new System.Drawing.Size(100, 30);
+        btnSaveClose.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+        btnSaveClose.Click += OnSaveCloseClick;
+        Controls.Add(btnSaveClose);
+
+        // Close button (no save)
+        Button btnClose = new Button();
+        btnClose.Text = "Close";
+        btnClose.Location = new System.Drawing.Point(Width - 110, Height - 60);
+        btnClose.Size = new System.Drawing.Size(80, 30);
+        btnClose.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+        btnClose.Click += OnCloseClick;
+        Controls.Add(btnClose);
+    }
+
+    private void OnSaveCloseClick(object sender, EventArgs e)
+    {
+        string stationName = _txtStationName.Text.Trim();
+        if (!string.IsNullOrEmpty(stationName))
+        {
+            _stationName = stationName;
+        }
+        _settingsManager.Save(_accounts, _stationName);
+        DialogResult = DialogResult.OK;
+        Close();
+    }
+
+    private void OnCloseClick(object sender, EventArgs e)
+    {
+        DialogResult = DialogResult.Cancel;
+        Close();
     }
 
     private void LoadGrid()
@@ -1902,19 +2047,8 @@ public class PartylineConfigForm : Form
         else if (_grid.Columns[e.ColumnIndex].Name == "Delete")
         {
             _accounts.RemoveAt(e.RowIndex);
-            _settingsManager.Save(_accounts, _txtStationName.Text.Trim());
             LoadGrid();
             HideEditPanel();
-        }
-    }
-
-    private void OnStationNameChanged(object sender, EventArgs e)
-    {
-        string newName = _txtStationName.Text.Trim();
-        if (!string.IsNullOrEmpty(newName) && newName != _stationName)
-        {
-            _stationName = newName;
-            _settingsManager.Save(_accounts, _stationName);
         }
     }
 
@@ -1976,7 +2110,6 @@ public class PartylineConfigForm : Form
             existing.DisplayName = string.IsNullOrEmpty(displayName) ? username : displayName;
         }
 
-        _settingsManager.Save(_accounts, _txtStationName.Text.Trim());
         LoadGrid();
         HideEditPanel();
     }
@@ -2135,9 +2268,9 @@ public class PartylineControlPanel : UserControl
         Label nameLabel = new Label();
         nameLabel.Text = account.DisplayName != null ? account.DisplayName : account.Username;
         nameLabel.ForeColor = System.Drawing.Color.White;
-        nameLabel.Font = new System.Drawing.Font("Segoe UI", 8f);
-        nameLabel.Location = new System.Drawing.Point(14, 5);
-        nameLabel.Size = new System.Drawing.Size(70, 18);
+        nameLabel.Font = new System.Drawing.Font("Segoe UI", 9.5f, System.Drawing.FontStyle.Bold);
+        nameLabel.Location = new System.Drawing.Point(14, 4);
+        nameLabel.Size = new System.Drawing.Size(80, 20);
         nameLabel.AutoEllipsis = true;
         rowPanel.Controls.Add(nameLabel);
         _toolTip.SetToolTip(nameLabel, "Co-host display name");
