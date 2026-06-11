@@ -61,44 +61,11 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             Log("Initialized AuthenticationManager and AudioMixer.");
 
             // Register audio stream into PlayIt Live's main mix
-            Log("Registering audio stream...");
+            // NOTE: RegisterSpecialAudioStream handles source creation and routing internally.
+            // Do NOT call CreateSource/Connect/Start — those are for file-based sources only.
+            Log("Registering special audio stream 'partyline'...");
             App.AudioPipeline.RegisterSpecialAudioStream("partyline", new PartylineStream(this));
-            Log("Audio stream registered.");
-
-            // Connect the partyline audio source to the main mix output
-            try
-            {
-                Log("Connecting partyline source to main mix...");
-                var source = App.AudioPipeline.CreateSource("partyline");
-                Log("Created audio source: " + (source != null ? "OK" : "NULL"));
-
-                if (source != null)
-                {
-                    var mainMix = App.AudioPipeline.GetMainMix();
-                    Log("Got main mix: " + (mainMix != null ? "OK" : "NULL"));
-
-                    if (mainMix != null)
-                    {
-                        App.AudioPipeline.Connect(source, mainMix);
-                        Log("Connected source to main mix.");
-
-                        source.Start();
-                        Log("Audio source started.");
-                    }
-                    else
-                    {
-                        Log("WARNING: MainMix is null, audio will not be routed.");
-                    }
-                }
-                else
-                {
-                    Log("WARNING: Could not create audio source, audio will not be routed.");
-                }
-            }
-            catch (Exception audioEx)
-            {
-                Log("ERROR connecting audio pipeline: " + audioEx.ToString());
-            }
+            Log("Special audio stream registered. PlayIt Live will call CreateStream/GetStreamFunc internally.");
 
             // Register embedded UI control
             Log("Registering UI control...");
@@ -511,10 +478,20 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             if (subPath == "login")
             {
                 string reqBody = ReadRequestBody(request);
+                string hash = ExtractJsonStringValueFromBody(reqBody, "hash");
                 string username = ExtractJsonStringValueFromBody(reqBody, "username");
                 string password = ExtractJsonStringValueFromBody(reqBody, "password");
 
-                AuthResult authResult = _authManager.Authenticate(username, password);
+                AuthResult authResult;
+                if (hash != null && hash.Length > 0)
+                {
+                    // Hash-based login (auto-login via URL hash)
+                    authResult = _authManager.AuthenticateByHash(hash);
+                }
+                else
+                {
+                    authResult = _authManager.Authenticate(username, password);
+                }
 
                 string jsonResponse;
                 if (authResult.Success)
@@ -773,17 +750,45 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
     // Called by PlayIt Live's audio pipeline when it needs samples
     // Now delegates to AudioMixer
+    private bool _fillBufferFirstCallLogged = false;
+    private bool _fillBufferNonSilenceLogged = false;
+
     internal int FillAudioBuffer(int length, IntPtr buffer)
     {
+        if (!_fillBufferFirstCallLogged)
+        {
+            _fillBufferFirstCallLogged = true;
+            Log("FillAudioBuffer called for the first time");
+        }
+
         if (_audioMixer != null)
         {
-            return _audioMixer.FillOutputBuffer(length, buffer);
+            int result = _audioMixer.FillOutputBuffer(length, buffer);
+
+            if (!_fillBufferNonSilenceLogged && result > 0)
+            {
+                // Check if any non-zero samples in the buffer
+                int sampleCount = length / 2;
+                short[] check = new short[sampleCount];
+                Marshal.Copy(buffer, check, 0, sampleCount);
+                for (int i = 0; i < sampleCount; i++)
+                {
+                    if (check[i] != 0)
+                    {
+                        _fillBufferNonSilenceLogged = true;
+                        Log("FillAudioBuffer producing non-silence audio");
+                        break;
+                    }
+                }
+            }
+
+            return result;
         }
 
         // Fallback: output silence if mixer not initialized
-        int sampleCount = length / 2;
-        var silence = new short[sampleCount];
-        Marshal.Copy(silence, 0, buffer, sampleCount);
+        int fallbackSampleCount = length / 2;
+        var silence = new short[fallbackSampleCount];
+        Marshal.Copy(silence, 0, buffer, fallbackSampleCount);
         return length;
     }
 
@@ -888,6 +893,41 @@ var statusInterval=null;
 var SR=44100,BUF=4096;
 var BASE=location.origin+'/partyline';
 var stationName='{{STATION_NAME_JS}}';
+
+(function(){
+ var h=location.hash?location.hash.substring(1):'';
+ if(h&&h.length>0){
+  document.addEventListener('DOMContentLoaded',function(){doHashLogin(h);});
+ }
+})();
+
+function doHashLogin(hash){
+ document.getElementById('loginPanel').className='hidden';
+ var xhr=new XMLHttpRequest();
+ xhr.open('POST',BASE+'/login',true);
+ xhr.setRequestHeader('Content-Type','application/json');
+ xhr.onload=function(){
+  try{
+   var r=JSON.parse(xhr.responseText);
+   if(r.success){
+    sessionToken=r.token;
+    displayName=r.displayName||'Co-Host';
+    showConnected();
+   }else{
+    document.getElementById('loginPanel').className='';
+    document.getElementById('errorMsg').innerText=r.error||'Auto-login failed';
+   }
+  }catch(e){
+   document.getElementById('loginPanel').className='';
+   document.getElementById('errorMsg').innerText='Connection error';
+  }
+ };
+ xhr.onerror=function(){
+  document.getElementById('loginPanel').className='';
+  document.getElementById('errorMsg').innerText='Connection error';
+ };
+ xhr.send(JSON.stringify({hash:hash}));
+}
 
 function doLogin(){
  var u=document.getElementById('username').value.trim();
@@ -1054,6 +1094,9 @@ public class AuthenticationManager
             return failResult;
         }
 
+        // Single session per user: invalidate any existing session before issuing a new one
+        InvalidateSession(matchedAccount.Username);
+
         string token = Guid.NewGuid().ToString("N");
         ActiveSession session = new ActiveSession();
         session.Token = token;
@@ -1068,6 +1111,64 @@ public class AuthenticationManager
         successResult.Token = token;
         successResult.DisplayName = matchedAccount.DisplayName;
         return successResult;
+    }
+
+    public AuthResult AuthenticateByHash(string hash)
+    {
+        if (hash == null)
+        {
+            AuthResult failResult = new AuthResult();
+            failResult.Success = false;
+            failResult.Error = "Invalid credentials";
+            return failResult;
+        }
+
+        CoHostAccount matchedAccount = FindByHash(hash);
+
+        if (matchedAccount == null)
+        {
+            AuthResult failResult = new AuthResult();
+            failResult.Success = false;
+            failResult.Error = "Invalid credentials";
+            return failResult;
+        }
+
+        // Single session per user: invalidate any existing session before issuing a new one
+        InvalidateSession(matchedAccount.Username);
+
+        string token = Guid.NewGuid().ToString("N");
+        ActiveSession session = new ActiveSession();
+        session.Token = token;
+        session.CohostId = matchedAccount.Username;
+        session.DisplayName = matchedAccount.DisplayName;
+        session.CreatedAt = DateTime.UtcNow;
+
+        _sessions[token] = session;
+
+        AuthResult successResult = new AuthResult();
+        successResult.Success = true;
+        successResult.Token = token;
+        successResult.DisplayName = matchedAccount.DisplayName;
+        return successResult;
+    }
+
+    public CoHostAccount FindByHash(string hash)
+    {
+        if (hash == null) return null;
+
+        lock (_accountsLock)
+        {
+            for (int i = 0; i < _accounts.Count; i++)
+            {
+                CoHostAccount acct = _accounts[i];
+                if (acct.Hash != null && acct.Hash.Equals(hash, StringComparison.Ordinal))
+                {
+                    return acct;
+                }
+            }
+        }
+
+        return null;
     }
 
     public bool ValidateToken(string token, out string cohostId)
@@ -1152,6 +1253,7 @@ public class CoHostAccount
     private string _username;
     private string _password;
     private string _displayName;
+    private string _hash;
 
     public string Username
     {
@@ -1169,6 +1271,12 @@ public class CoHostAccount
     {
         get { return _displayName; }
         set { _displayName = value; }
+    }
+
+    public string Hash
+    {
+        get { return _hash; }
+        set { _hash = value; }
     }
 }
 
@@ -1379,11 +1487,13 @@ public class AudioMixer
 {
     private ConcurrentDictionary<string, CoHostState> _coHosts;
     private ConcurrentDictionary<string, float> _lastLatency;
+    private ConcurrentDictionary<string, bool> _firstAudioLogged;
 
     public AudioMixer()
     {
         _coHosts = new ConcurrentDictionary<string, CoHostState>();
         _lastLatency = new ConcurrentDictionary<string, float>();
+        _firstAudioLogged = new ConcurrentDictionary<string, bool>();
     }
 
     public void EnsureCoHost(string cohostId)
@@ -1409,6 +1519,15 @@ public class AudioMixer
     public void IngestAudio(string cohostId, byte[] pcmData, int length, long clientTimestampMs)
     {
         if (cohostId == null || pcmData == null || length <= 0) return;
+
+        // Log first time audio arrives from this co-host
+        bool alreadyLogged;
+        if (!_firstAudioLogged.TryGetValue(cohostId, out alreadyLogged) || !alreadyLogged)
+        {
+            _firstAudioLogged[cohostId] = true;
+            NewPlugin.LogStatic("Audio received from co-host: " + cohostId + ", " + length + " bytes");
+        }
+
         EnsureCoHost(cohostId);
 
         CoHostState state;
@@ -1672,6 +1791,7 @@ public class SettingsManager
         account.Username = ExtractJsonStringValue(objJson, "username");
         account.Password = ExtractJsonStringValue(objJson, "password");
         account.DisplayName = ExtractJsonStringValue(objJson, "displayName");
+        account.Hash = ExtractJsonStringValue(objJson, "hash");
         return account;
     }
 
@@ -1747,6 +1867,8 @@ public class SettingsManager
                 sb.Append(EscapeJsonString(accounts[i].Password));
                 sb.Append(",\"displayName\":");
                 sb.Append(EscapeJsonString(accounts[i].DisplayName));
+                sb.Append(",\"hash\":");
+                sb.Append(EscapeJsonString(accounts[i].Hash));
                 sb.Append("}");
             }
 
@@ -1890,21 +2012,27 @@ public class PartylineConfigForm : Form
         DataGridViewTextBoxColumn colUsername = new DataGridViewTextBoxColumn();
         colUsername.Name = "Username";
         colUsername.HeaderText = "Username";
-        colUsername.FillWeight = 35;
+        colUsername.FillWeight = 25;
         _grid.Columns.Add(colUsername);
 
         DataGridViewTextBoxColumn colDisplay = new DataGridViewTextBoxColumn();
         colDisplay.Name = "DisplayName";
         colDisplay.HeaderText = "Display Name";
-        colDisplay.FillWeight = 35;
+        colDisplay.FillWeight = 20;
         _grid.Columns.Add(colDisplay);
+
+        DataGridViewTextBoxColumn colJoinUrl = new DataGridViewTextBoxColumn();
+        colJoinUrl.Name = "JoinUrl";
+        colJoinUrl.HeaderText = "Join URL";
+        colJoinUrl.FillWeight = 30;
+        _grid.Columns.Add(colJoinUrl);
 
         DataGridViewButtonColumn colEdit = new DataGridViewButtonColumn();
         colEdit.Name = "Edit";
         colEdit.HeaderText = "";
         colEdit.Text = "Edit";
         colEdit.UseColumnTextForButtonValue = true;
-        colEdit.FillWeight = 15;
+        colEdit.FillWeight = 12;
         _grid.Columns.Add(colEdit);
 
         DataGridViewButtonColumn colDelete = new DataGridViewButtonColumn();
@@ -1912,7 +2040,7 @@ public class PartylineConfigForm : Form
         colDelete.HeaderText = "";
         colDelete.Text = "Delete";
         colDelete.UseColumnTextForButtonValue = true;
-        colDelete.FillWeight = 15;
+        colDelete.FillWeight = 13;
         _grid.Columns.Add(colDelete);
 
         _grid.CellContentClick += OnGridCellContentClick;
@@ -2032,7 +2160,12 @@ public class PartylineConfigForm : Form
         for (int i = 0; i < _accounts.Count; i++)
         {
             CoHostAccount acct = _accounts[i];
-            _grid.Rows.Add(acct.Username, acct.DisplayName);
+            string joinUrl = "";
+            if (!string.IsNullOrEmpty(acct.Hash))
+            {
+                joinUrl = "/partyline/join#" + acct.Hash;
+            }
+            _grid.Rows.Add(acct.Username, acct.DisplayName, joinUrl);
         }
     }
 
@@ -2094,11 +2227,12 @@ public class PartylineConfigForm : Form
 
         if (_editingIndex < 0)
         {
-            // Adding new account
+            // Adding new account — generate a unique hash for auto-login URL
             CoHostAccount newAcct = new CoHostAccount();
             newAcct.Username = username;
             newAcct.Password = password;
             newAcct.DisplayName = string.IsNullOrEmpty(displayName) ? username : displayName;
+            newAcct.Hash = Guid.NewGuid().ToString("N").Substring(0, 12);
             _accounts.Add(newAcct);
         }
         else
