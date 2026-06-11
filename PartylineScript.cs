@@ -414,6 +414,14 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
                     return;
                 }
 
+                // Extract X-Audio-Timestamp header for latency calculation
+                string timestampHeader = GetRequestHeader(request, "X-Audio-Timestamp");
+                long clientTimestampMs = -1;
+                if (timestampHeader != null)
+                {
+                    long.TryParse(timestampHeader, out clientTimestampMs);
+                }
+
                 // Read the request body (PCM audio data)
                 var reqType = request.GetType();
                 var inputStreamProp = reqType.GetProperty("InputStream");
@@ -428,7 +436,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
                             var data = ms.ToArray();
                             if (data.Length > 0)
                             {
-                                _audioMixer.IngestAudio(cohostId, data, data.Length);
+                                _audioMixer.IngestAudio(cohostId, data, data.Length, clientTimestampMs);
                             }
                         }
                     }
@@ -810,6 +818,7 @@ function startAudio(){
    xhr.open('POST',BASE+'/audio',true);
    xhr.setRequestHeader('Content-Type','application/octet-stream');
    xhr.setRequestHeader('X-Session-Token',sessionToken);
+   xhr.setRequestHeader('X-Audio-Timestamp',Date.now().toString());
    xhr.send(p.buffer);
    var m=0;for(var i=0;i<d.length;i++){var v=Math.abs(d[i]);if(v>m)m=v;}
    document.getElementById('vu').style.width=(m*100)+'%';
@@ -1052,6 +1061,7 @@ public class CoHostState
     private bool _isMuted;
     private bool _isConnected;
     private CoHostAudioBuffer _buffer;
+    private DateTime _lastAudioReceived;
 
     public bool IsLive
     {
@@ -1075,6 +1085,12 @@ public class CoHostState
     {
         get { return _buffer; }
         set { _buffer = value; }
+    }
+
+    public DateTime LastAudioReceived
+    {
+        get { return _lastAudioReceived; }
+        set { _lastAudioReceived = value; }
     }
 }
 
@@ -1160,7 +1176,7 @@ public class CoHostAudioBuffer
         lock (_lock)
         {
             float level = _peakLevel;
-            _peakLevel = _peakLevel * 0.95f;
+            _peakLevel = _peakLevel * 0.85f;
             return level;
         }
     }
@@ -1181,10 +1197,12 @@ public class CoHostAudioBuffer
 public class AudioMixer
 {
     private ConcurrentDictionary<string, CoHostState> _coHosts;
+    private ConcurrentDictionary<string, float> _lastLatency;
 
     public AudioMixer()
     {
         _coHosts = new ConcurrentDictionary<string, CoHostState>();
+        _lastLatency = new ConcurrentDictionary<string, float>();
     }
 
     public void EnsureCoHost(string cohostId)
@@ -1197,11 +1215,17 @@ public class AudioMixer
             state.IsMuted = false;
             state.IsConnected = true;
             state.Buffer = new CoHostAudioBuffer();
+            state.LastAudioReceived = DateTime.UtcNow;
             _coHosts.TryAdd(cohostId, state);
         }
     }
 
     public void IngestAudio(string cohostId, byte[] pcmData, int length)
+    {
+        IngestAudio(cohostId, pcmData, length, -1);
+    }
+
+    public void IngestAudio(string cohostId, byte[] pcmData, int length, long clientTimestampMs)
     {
         if (cohostId == null || pcmData == null || length <= 0) return;
         EnsureCoHost(cohostId);
@@ -1210,7 +1234,40 @@ public class AudioMixer
         if (_coHosts.TryGetValue(cohostId, out state))
         {
             state.Buffer.Write(pcmData, length);
+            state.LastAudioReceived = DateTime.UtcNow;
         }
+
+        // Calculate latency if timestamp provided
+        if (clientTimestampMs > 0)
+        {
+            long nowMs = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+            float latency = (float)(nowMs - clientTimestampMs);
+            if (latency < 0) latency = 0;
+            _lastLatency[cohostId] = latency;
+        }
+    }
+
+    public bool IsConnected(string cohostId)
+    {
+        if (cohostId == null) return false;
+        CoHostState state;
+        if (_coHosts.TryGetValue(cohostId, out state))
+        {
+            TimeSpan elapsed = DateTime.UtcNow - state.LastAudioReceived;
+            return elapsed.TotalSeconds <= 5;
+        }
+        return false;
+    }
+
+    public float GetLatency(string cohostId)
+    {
+        if (cohostId == null) return 0f;
+        float latency;
+        if (_lastLatency.TryGetValue(cohostId, out latency))
+        {
+            return latency;
+        }
+        return 0f;
     }
 
     public int FillOutputBuffer(int length, IntPtr buffer)
@@ -1827,6 +1884,7 @@ public class PartylineControlPanel : UserControl
     private List<CoHostAccount> _accounts;
     private System.Windows.Forms.Timer _vuTimer;
     private List<CoHostRow> _rows;
+    private ToolTip _toolTip;
 
     public PartylineControlPanel(AudioMixer audioMixer, AuthenticationManager authManager, List<CoHostAccount> accounts)
     {
@@ -1834,6 +1892,12 @@ public class PartylineControlPanel : UserControl
         _authManager = authManager;
         _accounts = accounts != null ? accounts : new List<CoHostAccount>();
         _rows = new List<CoHostRow>();
+
+        _toolTip = new ToolTip();
+        _toolTip.AutoPopDelay = 5000;
+        _toolTip.InitialDelay = 400;
+        _toolTip.ReshowDelay = 200;
+        _toolTip.ShowAlways = true;
 
         AutoSize = true;
         Dock = DockStyle.Top;
@@ -1843,7 +1907,7 @@ public class PartylineControlPanel : UserControl
         BuildRows();
 
         _vuTimer = new System.Windows.Forms.Timer();
-        _vuTimer.Interval = 100;
+        _vuTimer.Interval = 50;
         _vuTimer.Tick += OnVuTimerTick;
         _vuTimer.Start();
     }
@@ -1853,17 +1917,34 @@ public class PartylineControlPanel : UserControl
         Controls.Clear();
         _rows.Clear();
 
-        // Title label
+        // Title panel with darker background (section header style)
+        Panel titlePanel = new Panel();
+        titlePanel.Dock = DockStyle.Top;
+        titlePanel.Height = 24;
+        titlePanel.BackColor = System.Drawing.Color.FromArgb(20, 20, 40);
+
         Label titleLabel = new Label();
         titleLabel.Text = "\U0001F3A4 Partyline Co-Hosts";
         titleLabel.ForeColor = System.Drawing.Color.White;
         titleLabel.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
-        titleLabel.Height = 22;
-        titleLabel.Dock = DockStyle.Top;
+        titleLabel.Dock = DockStyle.Fill;
         titleLabel.Padding = new Padding(2, 4, 0, 0);
-        Controls.Add(titleLabel);
+        titlePanel.Controls.Add(titleLabel);
 
-        int yOffset = 24;
+        Controls.Add(titlePanel);
+
+        // 1px bottom border separator
+        Panel separator = new Panel();
+        separator.Dock = DockStyle.Top;
+        separator.Height = 1;
+        separator.BackColor = System.Drawing.Color.FromArgb(80, 80, 100);
+        Controls.Add(separator);
+
+        // Since Dock=Top adds in reverse visual order, we set BringToFront
+        separator.BringToFront();
+        titlePanel.BringToFront();
+
+        int yOffset = 28;
         for (int i = 0; i < _accounts.Count; i++)
         {
             CoHostAccount acct = _accounts[i];
@@ -1888,22 +1969,34 @@ public class PartylineControlPanel : UserControl
         rowPanel.BackColor = System.Drawing.Color.FromArgb(60, 60, 70);
         row.RowPanel = rowPanel;
 
+        // Connected indicator (dot)
+        Label connIndicator = new Label();
+        connIndicator.Text = "\u25CB";
+        connIndicator.ForeColor = System.Drawing.Color.Gray;
+        connIndicator.Font = new System.Drawing.Font("Segoe UI", 7f);
+        connIndicator.Location = new System.Drawing.Point(2, 6);
+        connIndicator.Size = new System.Drawing.Size(12, 14);
+        rowPanel.Controls.Add(connIndicator);
+        row.ConnectedIndicator = connIndicator;
+
         // Display name label
         Label nameLabel = new Label();
         nameLabel.Text = account.DisplayName != null ? account.DisplayName : account.Username;
         nameLabel.ForeColor = System.Drawing.Color.White;
         nameLabel.Font = new System.Drawing.Font("Segoe UI", 8f);
-        nameLabel.Location = new System.Drawing.Point(4, 5);
-        nameLabel.Size = new System.Drawing.Size(80, 18);
+        nameLabel.Location = new System.Drawing.Point(14, 5);
+        nameLabel.Size = new System.Drawing.Size(70, 18);
         nameLabel.AutoEllipsis = true;
         rowPanel.Controls.Add(nameLabel);
+        _toolTip.SetToolTip(nameLabel, "Co-host display name");
 
         // VU meter container (outer panel)
         Panel vuOuter = new Panel();
         vuOuter.Location = new System.Drawing.Point(88, 6);
-        vuOuter.Size = new System.Drawing.Size(80, 14);
+        vuOuter.Size = new System.Drawing.Size(60, 14);
         vuOuter.BackColor = System.Drawing.Color.FromArgb(40, 40, 50);
         rowPanel.Controls.Add(vuOuter);
+        _toolTip.SetToolTip(vuOuter, "Audio level from co-host");
 
         // VU meter fill (inner panel)
         Panel vuFill = new Panel();
@@ -1914,12 +2007,23 @@ public class PartylineControlPanel : UserControl
         row.VuFill = vuFill;
         row.VuOuter = vuOuter;
 
+        // Latency label (small gray text next to VU meter)
+        Label latencyLabel = new Label();
+        latencyLabel.Text = "";
+        latencyLabel.ForeColor = System.Drawing.Color.FromArgb(148, 163, 184);
+        latencyLabel.Font = new System.Drawing.Font("Segoe UI", 6.5f);
+        latencyLabel.Location = new System.Drawing.Point(150, 7);
+        latencyLabel.Size = new System.Drawing.Size(34, 12);
+        latencyLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+        rowPanel.Controls.Add(latencyLabel);
+        row.LatencyLabel = latencyLabel;
+
         // Mute button
         Button muteBtn = new Button();
         muteBtn.Text = "\U0001F50A";
         muteBtn.FlatStyle = FlatStyle.Flat;
         muteBtn.Size = new System.Drawing.Size(30, 22);
-        muteBtn.Location = new System.Drawing.Point(174, 2);
+        muteBtn.Location = new System.Drawing.Point(186, 2);
         muteBtn.Font = new System.Drawing.Font("Segoe UI", 8f);
         muteBtn.ForeColor = System.Drawing.Color.White;
         muteBtn.BackColor = System.Drawing.Color.FromArgb(70, 70, 85);
@@ -1929,13 +2033,14 @@ public class PartylineControlPanel : UserControl
         muteBtn.Click += OnMuteClick;
         rowPanel.Controls.Add(muteBtn);
         row.MuteButton = muteBtn;
+        _toolTip.SetToolTip(muteBtn, "Mute/unmute co-host audio");
 
         // Kick button
         Button kickBtn = new Button();
         kickBtn.Text = "\u2715";
         kickBtn.FlatStyle = FlatStyle.Flat;
         kickBtn.Size = new System.Drawing.Size(26, 22);
-        kickBtn.Location = new System.Drawing.Point(208, 2);
+        kickBtn.Location = new System.Drawing.Point(220, 2);
         kickBtn.Font = new System.Drawing.Font("Segoe UI", 8f);
         kickBtn.ForeColor = System.Drawing.Color.White;
         kickBtn.BackColor = System.Drawing.Color.FromArgb(180, 60, 60);
@@ -1945,13 +2050,14 @@ public class PartylineControlPanel : UserControl
         kickBtn.Click += OnKickClick;
         rowPanel.Controls.Add(kickBtn);
         row.KickButton = kickBtn;
+        _toolTip.SetToolTip(kickBtn, "Disconnect co-host");
 
         // Live toggle button
         Button liveBtn = new Button();
         liveBtn.Text = "\u25CB OFF";
         liveBtn.FlatStyle = FlatStyle.Flat;
         liveBtn.Size = new System.Drawing.Size(60, 22);
-        liveBtn.Location = new System.Drawing.Point(238, 2);
+        liveBtn.Location = new System.Drawing.Point(250, 2);
         liveBtn.Font = new System.Drawing.Font("Segoe UI", 7.5f, System.Drawing.FontStyle.Bold);
         liveBtn.ForeColor = System.Drawing.Color.Gray;
         liveBtn.BackColor = System.Drawing.Color.FromArgb(50, 50, 60);
@@ -1961,6 +2067,7 @@ public class PartylineControlPanel : UserControl
         liveBtn.Click += OnLiveClick;
         rowPanel.Controls.Add(liveBtn);
         row.LiveButton = liveBtn;
+        _toolTip.SetToolTip(liveBtn, "Toggle co-host audio on/off air");
 
         Controls.Add(rowPanel);
         return row;
@@ -2080,6 +2187,30 @@ public class PartylineControlPanel : UserControl
             {
                 row.VuFill.BackColor = System.Drawing.Color.FromArgb(34, 197, 94);
             }
+
+            // Update connected indicator
+            bool connected = _audioMixer.IsConnected(row.CohostId);
+            if (connected)
+            {
+                row.ConnectedIndicator.Text = "\u25CF";
+                row.ConnectedIndicator.ForeColor = System.Drawing.Color.FromArgb(34, 197, 94);
+            }
+            else
+            {
+                row.ConnectedIndicator.Text = "\u25CB";
+                row.ConnectedIndicator.ForeColor = System.Drawing.Color.Gray;
+            }
+
+            // Update latency display
+            float latency = _audioMixer.GetLatency(row.CohostId);
+            if (latency > 0 && connected)
+            {
+                row.LatencyLabel.Text = ((int)latency).ToString() + "ms";
+            }
+            else
+            {
+                row.LatencyLabel.Text = "";
+            }
         }
     }
 
@@ -2089,6 +2220,10 @@ public class PartylineControlPanel : UserControl
         {
             _vuTimer.Stop();
             _vuTimer.Dispose();
+        }
+        if (_toolTip != null)
+        {
+            _toolTip.Dispose();
         }
         base.Dispose(disposing);
     }
@@ -2103,6 +2238,8 @@ internal class CoHostRow
     private Button _muteButton;
     private Button _kickButton;
     private Button _liveButton;
+    private Label _connectedIndicator;
+    private Label _latencyLabel;
 
     public string CohostId
     {
@@ -2144,5 +2281,17 @@ internal class CoHostRow
     {
         get { return _liveButton; }
         set { _liveButton = value; }
+    }
+
+    public Label ConnectedIndicator
+    {
+        get { return _connectedIndicator; }
+        set { _connectedIndicator = value; }
+    }
+
+    public Label LatencyLabel
+    {
+        get { return _latencyLabel; }
+        set { _latencyLabel = value; }
     }
 }
