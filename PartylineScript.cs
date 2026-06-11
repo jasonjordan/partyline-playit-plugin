@@ -81,36 +81,9 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
             App.AudioPipeline.RegisterSpecialAudioStream("partyline", new PartylineStream(this));
             Log("Special audio stream registered. PlayIt Live will call CreateStream/GetStreamFunc internally.");
 
-            // Capture mixer handle for return audio
-            try
-            {
-                var mainMix = App.AudioPipeline.GetMainMix();
-                if (mainMix != null)
-                {
-                    _mixerHandle = mainMix.GetMixerChannelHandle();
-                    Log("Mixer channel handle: " + _mixerHandle);
-
-                    if (_mixerHandle > 0)
-                    {
-                        _captureRunning = true;
-                        _captureThread = new Thread(CaptureLoop) { IsBackground = true, Name = "PartylineCapture" };
-                        _captureThread.Start();
-                        Log("Return audio capture thread started.");
-                    }
-                    else
-                    {
-                        Log("WARNING: Mixer handle is 0 or invalid, return audio disabled.");
-                    }
-                }
-                else
-                {
-                    Log("WARNING: GetMainMix() returned null, return audio disabled.");
-                }
-            }
-            catch (Exception mixEx)
-            {
-                Log("WARNING: Could not get mixer handle for return audio: " + mixEx.Message);
-            }
+            // Capture mixer handle for return audio (delayed — mixer may not be ready at startup)
+            var captureStartThread = new Thread(() => StartCaptureWhenReady()) { IsBackground = true, Name = "PartylineCaptureInit" };
+            captureStartThread.Start();
 
             // Register embedded UI control
             Log("Registering UI control...");
@@ -935,6 +908,39 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
     public int GetCoHostCount() { return _cohosts.Count; }
     public string GetLink() { return "https://" + Dns.GetHostName() + ":" + _activePort + "/partyline/join"; }
+
+    private void StartCaptureWhenReady()
+    {
+        Log("Waiting for mixer to become available...");
+        for (int attempt = 0; attempt < 120; attempt++) // Try for up to 2 minutes
+        {
+            if (_cts.IsCancellationRequested) return;
+            Thread.Sleep(2000);
+
+            try
+            {
+                var mainMix = App.AudioPipeline.GetMainMix();
+                if (mainMix == null) continue;
+
+                int handle = mainMix.GetMixerChannelHandle();
+                if (handle > 0)
+                {
+                    _mixerHandle = handle;
+                    Log("Mixer channel handle acquired: " + _mixerHandle);
+                    _captureRunning = true;
+                    _captureThread = new Thread(CaptureLoop) { IsBackground = true, Name = "PartylineCapture" };
+                    _captureThread.Start();
+                    Log("Return audio capture thread started.");
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                if (attempt == 0) Log("Mixer not ready yet: " + ex.Message);
+            }
+        }
+        Log("WARNING: Mixer handle never became valid, return audio disabled.");
+    }
 
     private void CaptureLoop()
     {
