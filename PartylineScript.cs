@@ -2387,8 +2387,16 @@ public class PartylineConfigForm : Form
         DataGridViewTextBoxColumn colJoinUrl = new DataGridViewTextBoxColumn();
         colJoinUrl.Name = "JoinUrl";
         colJoinUrl.HeaderText = "Join URL";
-        colJoinUrl.FillWeight = 30;
+        colJoinUrl.FillWeight = 26;
         _grid.Columns.Add(colJoinUrl);
+
+        DataGridViewButtonColumn colCopy = new DataGridViewButtonColumn();
+        colCopy.Name = "Copy";
+        colCopy.HeaderText = "";
+        colCopy.Text = "Copy";
+        colCopy.UseColumnTextForButtonValue = true;
+        colCopy.FillWeight = 9;
+        _grid.Columns.Add(colCopy);
 
         DataGridViewButtonColumn colEdit = new DataGridViewButtonColumn();
         colEdit.Name = "Edit";
@@ -2541,6 +2549,19 @@ public class PartylineConfigForm : Form
         if (_grid.Columns[e.ColumnIndex].Name == "Edit")
         {
             BeginEdit(e.RowIndex);
+        }
+        else if (_grid.Columns[e.ColumnIndex].Name == "Copy")
+        {
+            if (e.RowIndex >= 0 && e.RowIndex < _accounts.Count)
+            {
+                CoHostAccount acct = _accounts[e.RowIndex];
+                if (!string.IsNullOrEmpty(acct.Hash))
+                {
+                    string fullUrl = "/partyline/join#" + acct.Hash;
+                    Clipboard.SetText(fullUrl);
+                    MessageBox.Show("Join URL copied to clipboard.", "Partyline", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
         }
         else if (_grid.Columns[e.ColumnIndex].Name == "Delete")
         {
@@ -2809,9 +2830,9 @@ public class PartylineControlPanel : UserControl
         Button muteBtn = new Button();
         muteBtn.Text = "Mute";
         muteBtn.FlatStyle = FlatStyle.Flat;
-        muteBtn.Size = new System.Drawing.Size(44, 22);
+        muteBtn.Size = new System.Drawing.Size(50, 22);
         muteBtn.Location = new System.Drawing.Point(312, 2);
-        muteBtn.Font = new System.Drawing.Font("Segoe UI", 8f);
+        muteBtn.Font = new System.Drawing.Font("Segoe UI", 7.5f);
         muteBtn.ForeColor = System.Drawing.Color.White;
         muteBtn.BackColor = System.Drawing.Color.FromArgb(70, 70, 85);
         muteBtn.FlatAppearance.BorderSize = 0;
@@ -2827,7 +2848,7 @@ public class PartylineControlPanel : UserControl
         kickBtn.Text = "Kick";
         kickBtn.FlatStyle = FlatStyle.Flat;
         kickBtn.Size = new System.Drawing.Size(40, 22);
-        kickBtn.Location = new System.Drawing.Point(360, 2);
+        kickBtn.Location = new System.Drawing.Point(366, 2);
         kickBtn.Font = new System.Drawing.Font("Segoe UI", 8f);
         kickBtn.ForeColor = System.Drawing.Color.White;
         kickBtn.BackColor = System.Drawing.Color.FromArgb(180, 60, 60);
