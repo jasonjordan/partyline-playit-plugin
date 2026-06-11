@@ -2416,7 +2416,7 @@ public class PartylineControlPanel : UserControl
         Label titleLabel = new Label();
         titleLabel.Text = "Partyline";
         titleLabel.ForeColor = System.Drawing.Color.White;
-        titleLabel.Font = new System.Drawing.Font("Segoe UI", 11f, System.Drawing.FontStyle.Bold);
+        titleLabel.Font = new System.Drawing.Font("Segoe UI", 11f, System.Drawing.FontStyle.Regular);
         titleLabel.Dock = DockStyle.Fill;
         titleLabel.Padding = new Padding(2, 4, 0, 0);
         titlePanel.Controls.Add(titleLabel);
@@ -2424,7 +2424,7 @@ public class PartylineControlPanel : UserControl
         Button configBtn = new Button();
         configBtn.Text = "\u2699 Configure";
         configBtn.FlatStyle = FlatStyle.Flat;
-        configBtn.Size = new System.Drawing.Size(80, 22);
+        configBtn.Size = new System.Drawing.Size(90, 22);
         configBtn.Dock = DockStyle.Right;
         configBtn.Font = new System.Drawing.Font("Segoe UI", 8f);
         configBtn.ForeColor = System.Drawing.Color.FromArgb(180, 180, 190);
@@ -2511,34 +2511,34 @@ public class PartylineControlPanel : UserControl
         row.VuFill = vuFill;
         row.VuOuter = vuOuter;
 
-        // Latency label (small gray text next to VU meter)
+        // Latency label
         Label latencyLabel = new Label();
         latencyLabel.Text = "";
-        latencyLabel.ForeColor = System.Drawing.Color.FromArgb(148, 163, 184);
-        latencyLabel.Font = new System.Drawing.Font("Segoe UI", 6.5f);
-        latencyLabel.Location = new System.Drawing.Point(150, 7);
-        latencyLabel.Size = new System.Drawing.Size(34, 12);
+        latencyLabel.ForeColor = System.Drawing.Color.FromArgb(200, 200, 220);
+        latencyLabel.Font = new System.Drawing.Font("Segoe UI", 7.5f);
+        latencyLabel.Location = new System.Drawing.Point(152, 5);
+        latencyLabel.Size = new System.Drawing.Size(40, 14);
         latencyLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
         rowPanel.Controls.Add(latencyLabel);
         row.LatencyLabel = latencyLabel;
 
-        // IP label (very small gray text after latency)
+        // IP label
         Label ipLabel = new Label();
         ipLabel.Text = "";
-        ipLabel.ForeColor = System.Drawing.Color.FromArgb(120, 120, 140);
-        ipLabel.Font = new System.Drawing.Font("Segoe UI", 6f);
-        ipLabel.Location = new System.Drawing.Point(150, 18);
-        ipLabel.Size = new System.Drawing.Size(80, 10);
+        ipLabel.ForeColor = System.Drawing.Color.FromArgb(180, 180, 200);
+        ipLabel.Font = new System.Drawing.Font("Segoe UI", 7f);
+        ipLabel.Location = new System.Drawing.Point(152, 16);
+        ipLabel.Size = new System.Drawing.Size(100, 12);
         ipLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
         rowPanel.Controls.Add(ipLabel);
         row.IpLabel = ipLabel;
 
         // Mute button
         Button muteBtn = new Button();
-        muteBtn.Text = "\U0001F50A";
+        muteBtn.Text = "Mute";
         muteBtn.FlatStyle = FlatStyle.Flat;
-        muteBtn.Size = new System.Drawing.Size(30, 22);
-        muteBtn.Location = new System.Drawing.Point(186, 2);
+        muteBtn.Size = new System.Drawing.Size(44, 22);
+        muteBtn.Location = new System.Drawing.Point(256, 2);
         muteBtn.Font = new System.Drawing.Font("Segoe UI", 8f);
         muteBtn.ForeColor = System.Drawing.Color.White;
         muteBtn.BackColor = System.Drawing.Color.FromArgb(70, 70, 85);
@@ -2552,10 +2552,10 @@ public class PartylineControlPanel : UserControl
 
         // Kick button
         Button kickBtn = new Button();
-        kickBtn.Text = "\u2715";
+        kickBtn.Text = "Kick";
         kickBtn.FlatStyle = FlatStyle.Flat;
-        kickBtn.Size = new System.Drawing.Size(26, 22);
-        kickBtn.Location = new System.Drawing.Point(220, 2);
+        kickBtn.Size = new System.Drawing.Size(40, 22);
+        kickBtn.Location = new System.Drawing.Point(304, 2);
         kickBtn.Font = new System.Drawing.Font("Segoe UI", 8f);
         kickBtn.ForeColor = System.Drawing.Color.White;
         kickBtn.BackColor = System.Drawing.Color.FromArgb(180, 60, 60);
@@ -2572,7 +2572,7 @@ public class PartylineControlPanel : UserControl
         liveBtn.Text = "Go Live";
         liveBtn.FlatStyle = FlatStyle.Flat;
         liveBtn.Size = new System.Drawing.Size(60, 22);
-        liveBtn.Location = new System.Drawing.Point(250, 2);
+        liveBtn.Location = new System.Drawing.Point(348, 2);
         liveBtn.Font = new System.Drawing.Font("Segoe UI", 7.5f, System.Drawing.FontStyle.Bold);
         liveBtn.ForeColor = System.Drawing.Color.Gray;
         liveBtn.BackColor = System.Drawing.Color.FromArgb(50, 50, 60);
@@ -2660,12 +2660,12 @@ public class PartylineControlPanel : UserControl
                 // Update mute button
                 if (isMuted)
                 {
-                    row.MuteButton.Text = "\U0001F507";
+                    row.MuteButton.Text = "Unmute";
                     row.MuteButton.BackColor = System.Drawing.Color.FromArgb(180, 120, 30);
                 }
                 else
                 {
-                    row.MuteButton.Text = "\U0001F50A";
+                    row.MuteButton.Text = "Mute";
                     row.MuteButton.BackColor = System.Drawing.Color.FromArgb(70, 70, 85);
                 }
 
