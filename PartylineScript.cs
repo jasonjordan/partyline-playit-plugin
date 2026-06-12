@@ -3040,6 +3040,8 @@ public class WebRtcMeshClient
     private HttpClient _streamClient;     // long-lived SSE read (infinite timeout)
 
     private Thread _reconnectThread;
+    private Thread _heartbeatThread;
+    private volatile bool _heartbeatRunning;
     private volatile bool _running;
     private volatile bool _connected;
     private volatile bool _micOn;
@@ -3146,7 +3148,15 @@ public class WebRtcMeshClient
                 Join();
                 _connected = true;
                 _reconnectDelay = 1000; // reset on a successful (re)subscribe
-                OpenSignalStream();     // blocks until the SSE stream drops
+                StartHeartbeat();       // keep our roster presence fresh (< TTL)
+                try
+                {
+                    OpenSignalStream(); // blocks until the SSE stream drops
+                }
+                finally
+                {
+                    StopHeartbeat();
+                }
             }
             catch (OperationCanceledException)
             {
@@ -3314,6 +3324,42 @@ public class WebRtcMeshClient
 
     // --- Join / roster -------------------------------------------------------
 
+    /// <summary>
+    /// Periodically re-posts `join` to refresh this peer's roster presence so it
+    /// stays within the server's presence TTL (otherwise late-joining peers won't
+    /// see us and never send an offer). Runs while the SSE stream is open.
+    /// </summary>
+    private void StartHeartbeat()
+    {
+        StopHeartbeat();
+        _heartbeatRunning = true;
+        _heartbeatThread = new Thread(() =>
+        {
+            while (_heartbeatRunning && _running && !_cts.IsCancellationRequested)
+            {
+                try { Thread.Sleep(5000); }
+                catch (ThreadInterruptedException) { break; }
+                if (!_heartbeatRunning || _cts.IsCancellationRequested) break;
+                try { Join(); }
+                catch (Exception ex) { Log("Heartbeat join error: " + ex.Message); }
+            }
+        });
+        _heartbeatThread.IsBackground = true;
+        _heartbeatThread.Name = "WebRtcMeshHeartbeat";
+        _heartbeatThread.Start();
+    }
+
+    private void StopHeartbeat()
+    {
+        _heartbeatRunning = false;
+        Thread t = _heartbeatThread;
+        _heartbeatThread = null;
+        if (t != null && t.IsAlive)
+        {
+            try { t.Join(1000); } catch { }
+        }
+    }
+
     private void Join()
     {
         string resp = PostSignal("join", null, "\"role\":\"" + EscapeJson(_role) + "\"");
@@ -3327,8 +3373,11 @@ public class WebRtcMeshClient
         {
             string pid = ExtractJsonValue(peerObjs[i], "peerId");
             if (pid == null || pid == _peerId) continue;
+            // Offer only to peers we have not seen before, so the periodic join
+            // heartbeat refreshes presence without re-offering to connected peers.
+            bool isNew = !_knownPeers.ContainsKey(pid);
             _knownPeers[pid] = 1;
-            if (IsInitiator(pid)) InitiateOffer(pid);
+            if (isNew && IsInitiator(pid)) InitiateOffer(pid);
         }
     }
 
