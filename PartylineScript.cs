@@ -758,14 +758,14 @@ public class NewPlugin
         {
             try
             {
-                // Always drain a frame so the ring buffer does not accumulate latency
-                // while the mic is OFF / no peer is wired.
+                // Always drain a frame so the ring buffer does not accumulate latency.
                 bool haveFrame = TryReadMainMixFrame(frame);
 
-                // Only transmit when the mic toggle is ON (replaces PTT gating) and a
-                // peer is wired. Snapshot the field so a concurrent swap is safe.
+                // Co-hosts always hear the program: the captured main mix is sent to
+                // every connected peer unconditionally (no mic-toggle gating). Snapshot
+                // the field so a concurrent peer swap is safe.
                 IWebRtcPeer peer = _webRtcPeer;
-                if (haveFrame && _micOn && peer != null)
+                if (haveFrame && peer != null)
                 {
                     peer.PushOutboundAudio(frame, frameSamples, 48000, 1);
                     if (!firstPushLogged)
