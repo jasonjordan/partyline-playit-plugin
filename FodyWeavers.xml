@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Costura embeds all copy-local managed dependencies into PartylinePlugin.dll.
+  - The PlayItLive reference is <Private>false</Private>, so it is host-provided
+    and NOT embedded (correct).
+  - Newtonsoft.Json is also bundled with PlayIt Live; embedding our pinned copy
+    is harmless because Costura resolves the embedded one for this assembly.
+-->
+<Weavers xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="FodyWeavers.xsd">
+  <Costura />
+</Weavers>

@@ -8,9 +8,86 @@
     <LangVersion>9.0</LangVersion>
   </PropertyGroup>
 
+  <!--
+    MR-WebRTC primary adapter (task 5.2). Off by default so the project still
+    restores and the IDE/language server still reports clean diagnostics on
+    machines that cannot pull the native Microsoft.MixedReality.WebRTC package
+    (e.g. non-Windows dev boxes). Enable on a Windows build with:
+        dotnet build -p:PartylineMrWebRtc=true
+    which defines PARTYLINE_MRWEBRTC and pulls in the pinned NuGet package.
+    The native mrwebrtc.dll must be vendored per architecture (win-x86/win-x64)
+    matching the PlayIt Live host process bitness, alongside bass.dll.
+  -->
+  <PropertyGroup>
+    <PartylineMrWebRtc Condition="'$(PartylineMrWebRtc)' == ''">false</PartylineMrWebRtc>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(PartylineMrWebRtc)' == 'true'">
+    <DefineConstants>$(DefineConstants);PARTYLINE_MRWEBRTC</DefineConstants>
+  </PropertyGroup>
+
+  <!-- The Tests/ folder is a separate net8.0 xUnit+FsCheck project (mirrors plugin
+       logic for off-Windows verification). Exclude it from this net48 plugin build
+       so its sources are not globbed into the plugin assembly. -->
+  <ItemGroup>
+    <Compile Remove="Tests/**/*.cs" />
+    <None Remove="Tests/**/*" />
+  </ItemGroup>
+
+  <!--
+    Single plugin entry point: NewPlugin in PartylineScript.cs (WebRTC/Opus
+    co-host mesh with Cloudflare signaling-only transport).
+
+    The files below are the SUPERSEDED older plugin (PartylinePlugin: an
+    HttpListener + CoHostManager WebRTC attempt) and its UI/helpers. They define
+    a second Plugin<IPlayItLiveApp> entry class and are NOT referenced by
+    NewPlugin/PartylineScript.cs, so they are excluded from the DLL build to
+    leave exactly one entry point. The source files are kept on disk for
+    reference — this only removes them from compilation.
+  -->
+  <ItemGroup>
+    <Compile Remove="PartylinePlugin.cs" />
+    <Compile Remove="CoHostManager.cs" />
+    <Compile Remove="CoHostPage.cs" />
+    <Compile Remove="PartylineMixerForm.cs" />
+    <Compile Remove="PartylineStatusStrip.cs" />
+  </ItemGroup>
+
+  <!--
+    Single-file packaging: Costura.Fody embeds all copy-local managed dependency
+    DLLs (SIPSorcery, Concentus, Newtonsoft.Json, and their managed closure:
+    BouncyCastle, DnsClient, Microsoft.Extensions.Logging.Abstractions, etc.)
+    as resources INSIDE PartylinePlugin.dll and loads them at runtime via an
+    AssemblyResolve handler. Result: you copy ONLY PartylinePlugin.dll into the
+    PlayIt Live Plugins folder — no loose dependency DLLs.
+
+    NOTE: this only works for managed assemblies. If you enable the MR-WebRTC
+    primary adapter (-p:PartylineMrWebRtc=true), its native mrwebrtc.dll is NOT
+    managed and CANNOT be embedded — it must still be shipped as a loose native
+    file next to the plugin. The default SIPSorcery+Concentus build is fully
+    managed and rolls up into the single DLL.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Fody" Version="6.8.2" PrivateAssets="all" />
+    <PackageReference Include="Costura.Fody" Version="5.7.0" PrivateAssets="all" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="SIPSorcery" Version="6.2.4" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <!--
+      Concentus: pure-managed C# Opus codec used by the SIPSorcery + Concentus
+      fallback IWebRtcPeer adapter (task 5.3). Pinned to 1.1.7, the last release
+      with the classic synchronous OpusEncoder/OpusDecoder API (no Span<T>), which
+      compiles cleanly on net48. Pure managed, so it restores on any OS and never
+      introduces a native DLL/bitness dependency (unlike MR-WebRTC's mrwebrtc.dll).
+    -->
+    <PackageReference Include="Concentus" Version="1.1.7" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(PartylineMrWebRtc)' == 'true'">
+    <!-- Pinned: last published MR-WebRTC release (project archived since 2022). -->
+    <PackageReference Include="Microsoft.MixedReality.WebRTC" Version="2.0.2" />
   </ItemGroup>
 
   <ItemGroup>

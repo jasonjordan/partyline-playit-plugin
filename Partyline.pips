@@ -1,0 +1,241 @@
+using System;
+using System.IO;
+using System.Reflection;
+using PlayIt.PluginEngine;
+
+// Partyline .pips bootstrapper
+// ----------------------------
+// PlayIt Live only loads `.pips` script plugins, not arbitrary DLLs. This thin
+// script is the real plugin PlayIt Live sees; it reflectively loads the compiled
+// PartylinePlugin.dll (a single Costura-merged assembly placed in the Plugins
+// folder) and forwards the Run/Cleanup/Configure lifecycle to its `NewPlugin`
+// host type. The host's NewPlugin.Run takes the IPlayItLiveApp by injection
+// (it is NOT a Plugin<> subclass), so App is boxed and passed straight through.
+public class NewPlugin : Plugin<IPlayItLiveApp>
+{
+    private const string DllName = "PartylinePlugin.dll";
+    private const string HostTypeName = "NewPlugin";
+
+    private object _host;
+    private Type _hostType;
+
+    private static string LoaderLogPath
+    {
+        get
+        {
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "Partyline", "loader.log");
+        }
+    }
+
+    private static void Log(string message)
+    {
+        try
+        {
+            var path = LoaderLogPath;
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            File.AppendAllText(path,
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + message + Environment.NewLine);
+        }
+        catch
+        {
+            // Logging must never throw inside the host lifecycle.
+        }
+    }
+
+    // Matches Run by name + single parameter rather than exact parameter type.
+    // This is resilient to assembly-identity mismatches between the .pips script's
+    // IPlayItLiveApp and the DLL's IPlayItLiveApp (both bind to PlayItLive.exe
+    // in-process, but reflection's exact-type GetMethod can still miss). The App
+    // instance is assignable to whatever the host's single parameter expects.
+    private static System.Reflection.MethodInfo ResolveRunMethod(Type hostType)
+    {
+        // Prefer an exact IPlayItLiveApp match when available.
+        var exact = hostType.GetMethod("Run", new[] { typeof(IPlayItLiveApp) });
+        if (exact != null) return exact;
+
+        foreach (var m in hostType.GetMethods(BindingFlags.Public | BindingFlags.Instance))
+        {
+            if (m.Name == "Run" && m.GetParameters().Length == 1)
+            {
+                return m;
+            }
+        }
+        return null;
+    }
+
+    private static string DescribeMethod(System.Reflection.MethodInfo m)
+    {
+        var ps = m.GetParameters();
+        var sb = new System.Text.StringBuilder();
+        sb.Append(m.Name).Append('(');
+        for (int i = 0; i < ps.Length; i++)
+        {
+            if (i > 0) sb.Append(", ");
+            sb.Append(ps[i].ParameterType.FullName);
+        }
+        sb.Append(')');
+        return sb.ToString();
+    }
+
+    private static string DescribeMethods(Type hostType, string name)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var m in hostType.GetMethods(BindingFlags.Public | BindingFlags.Instance))
+        {
+            if (m.Name == name)
+            {
+                if (sb.Length > 0) sb.Append("; ");
+                sb.Append(DescribeMethod(m));
+            }
+        }
+        return sb.Length > 0 ? sb.ToString() : "(none)";
+    }
+
+    private string ResolveDllPath()
+    {
+        // PartylinePlugin.dll ships next to the .pips in PlayIt Live's Plugins
+        // folder. Probe the Plugins subfolder of the app base first, then the
+        // app base itself as a fallback.
+        var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+        var candidates = new[]
+        {
+            Path.Combine(baseDir, "Plugins", DllName),
+            Path.Combine(baseDir, DllName)
+        };
+
+        foreach (var candidate in candidates)
+        {
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        // Default to the Plugins location for the error message.
+        return candidates[0];
+    }
+
+    public override void Run()
+    {
+        try
+        {
+            var dllPath = ResolveDllPath();
+            Log("Loading host assembly from: " + dllPath);
+
+            if (!File.Exists(dllPath))
+            {
+                Log("ERROR: " + DllName + " not found. Place it in the Plugins folder.");
+                return;
+            }
+
+            var asm = Assembly.LoadFrom(dllPath);
+            _hostType = asm.GetType(HostTypeName);
+            if (_hostType == null)
+            {
+                Log("ERROR: type '" + HostTypeName + "' not found in " + DllName + ".");
+                return;
+            }
+
+            Log("Loaded assembly: " + asm.FullName);
+            Log("Assembly location: " + asm.Location);
+
+            _host = Activator.CreateInstance(_hostType);
+            Log("Host instance created. Invoking Run(App)...");
+
+            var runMethod = ResolveRunMethod(_hostType);
+            if (runMethod == null)
+            {
+                Log("ERROR: no single-parameter Run(app) method found on host type. " +
+                    "The deployed PartylinePlugin.dll is likely stale (rebuild it). " +
+                    "Methods present: " + DescribeMethods(_hostType, "Run"));
+                return;
+            }
+
+            Log("Resolved Run method: " + DescribeMethod(runMethod));
+
+            // Host Run blocks on WaitForPluginStop until the plugin is stopped,
+            // mirroring the original Plugin<>.Run behavior.
+            runMethod.Invoke(_host, new object[] { App });
+            Log("Host Run returned.");
+        }
+        catch (TargetInvocationException tie)
+        {
+            Log("ERROR in host Run: " + (tie.InnerException ?? tie));
+        }
+        catch (Exception ex)
+        {
+            Log("ERROR loading/running host: " + ex);
+        }
+    }
+
+    public override void Cleanup()
+    {
+        try
+        {
+            if (_host != null && _hostType != null)
+            {
+                var cleanup = _hostType.GetMethod("Cleanup", Type.EmptyTypes);
+                if (cleanup != null)
+                {
+                    cleanup.Invoke(_host, null);
+                }
+            }
+        }
+        catch (TargetInvocationException tie)
+        {
+            Log("ERROR in host Cleanup: " + (tie.InnerException ?? tie));
+        }
+        catch (Exception ex)
+        {
+            Log("ERROR invoking host Cleanup: " + ex);
+        }
+    }
+
+    public override void Configure()
+    {
+        try
+        {
+            // Configure may be called before Run, so ensure the host type is loaded.
+            if (_hostType == null)
+            {
+                var dllPath = ResolveDllPath();
+                if (File.Exists(dllPath))
+                {
+                    var asm = Assembly.LoadFrom(dllPath);
+                    _hostType = asm.GetType(HostTypeName);
+                }
+            }
+
+            if (_hostType == null)
+            {
+                Log("ERROR: cannot Configure, host type unavailable.");
+                return;
+            }
+
+            if (_host == null)
+            {
+                _host = Activator.CreateInstance(_hostType);
+            }
+
+            var configure = _hostType.GetMethod("Configure", Type.EmptyTypes);
+            if (configure != null)
+            {
+                configure.Invoke(_host, null);
+            }
+            else
+            {
+                Log("ERROR: Configure() not found on host type.");
+            }
+        }
+        catch (TargetInvocationException tie)
+        {
+            Log("ERROR in host Configure: " + (tie.InnerException ?? tie));
+        }
+        catch (Exception ex)
+        {
+            Log("ERROR invoking host Configure: " + ex);
+        }
+    }
+}

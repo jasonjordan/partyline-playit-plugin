@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Host-independent test project for the PlayIt Live plugin (webrtc-opus-audio spec,
+    tasks 5.8 / 5.9 / 5.10).
+
+    WHY A SEPARATE PROJECT: PartylinePlugin.csproj targets net48 and references the
+    Windows-only PlayIt Live host assembly (PlayItLive.exe) and, optionally, the native
+    MR-WebRTC mrwebrtc.dll. That project cannot build or run off-Windows. This project
+    therefore targets a runnable TFM and exercises only PURE, host-independent logic that
+    MIRRORS the algorithms in PartylineScript.cs (see Tests/README.md). It does NOT
+    reference the plugin assembly.
+
+    TFM: net8.0 per the task. RollForward=Major lets it run on the installed .NET 10
+    runtime when no net8.0 runtime is present.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RollForward>Major</RollForward>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <LangVersion>10.0</LangVersion>
+    <AssemblyName>Partyline.Tests</AssemblyName>
+    <RootNamespace>Partyline.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <!-- Property-based testing (>=100 cases per property). -->
+    <PackageReference Include="FsCheck.Xunit" Version="2.16.6" />
+    <!--
+      Concentus pinned to 1.1.7 to MATCH the plugin's fallback adapter (task 5.3 /
+      PartylinePlugin.csproj). Pure-managed Opus codec, restores on any OS. Used by the
+      task 5.10 real mono Opus encode->decode round-trip.
+    -->
+    <PackageReference Include="Concentus" Version="1.1.7" />
+  </ItemGroup>
+
+</Project>

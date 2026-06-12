@@ -1,67 +1,71 @@
 # Partyline PlayIt Live Plugin — Co-Host Bridge
 
-A PlayIt Live plugin that accepts WebRTC connections from remote co-hosts and mixes their audio directly into PlayIt Live's main output. No virtual cables, no external relay, no cloud services needed for audio.
+A PlayIt Live plugin that connects remote co-hosts over a WebRTC/Opus mesh and mixes their audio directly into PlayIt Live's main output. No virtual cables and no audio relay — Cloudflare is used for signaling only, and the media flows peer-to-peer between co-hosts.
 
 ## Architecture
 
 ```
-Remote Co-Host (browser)
-    │
-    ├── WebRTC audio (Opus) ──→ Plugin decodes → PlayIt Live Main Mix
-    │                                              (via IAudioPipeline.RegisterSpecialAudioStream)
-    │
-    └── WebRTC audio (receive) ←── Plugin captures loopback of PlayIt Live output
-                                     (co-host hears DJ + music)
+Remote Co-Host (peer)                         PlayIt Live host (this plugin: NewPlugin)
+    │                                              │
+    ├── Cloudflare Worker (signaling only) ────────┤   SDP offer/answer + ICE candidates
+    │   (no audio passes through Cloudflare)        │
+    │                                              │
+    └── WebRTC audio (Opus) ◀───── peer-to-peer mesh ─────▶ decode → PlayIt Live Main Mix
+                                                       (via IAudioPipeline.RegisterSpecialAudioStream)
 ```
+
+The plugin entry point is the `NewPlugin` class in `PartylineScript.cs`. It builds a WebRTC/Opus
+co-host mesh (`Partyline.WebRtc` namespace: `IWebRtcPeer`, `WebRtcMeshClient`, the SIPSorcery +
+Concentus peer adapter, and an optional MR-WebRTC peer behind `#if PARTYLINE_MRWEBRTC`). Cloudflare
+provides signaling (SDP/ICE exchange and ICE server config) only — audio never traverses Cloudflare.
 
 ## How It Works
 
-1. Plugin starts an HTTP listener on port 25433 (shared with PlayIt Live via HTTP.sys) at path `/partyline/`
-2. Co-host opens `http://your-ip:25433/partyline/join` in their browser
-3. Browser captures mic, establishes WebRTC connection directly to the plugin
-4. Plugin decodes Opus audio and injects PCM samples into PlayIt Live's main mix using `RegisterSpecialAudioStream`
-5. Plugin captures PlayIt Live's audio output (loopback) and sends it back to the co-host via WebRTC
-6. Both parties hear each other + the music. Audience hears everything.
-
-## Port Sharing
-
-The plugin shares port 25433 with PlayIt Live using Windows HTTP.sys URL ACL reservations. On first run, it prompts for admin permission to register:
-
-```
-http://+:25433/partyline/
-```
-
-If port sharing fails (e.g., PlayIt Live binds exclusively), the plugin falls back to port 8080.
-
-## Co-Host Page
-
-The co-host webpage at `/partyline/join` provides:
-- One-click connect button (requests mic permission)
-- Push-to-Talk (hold to unmute, release to mute)
-- Connection status indicator
-- VU meter
+1. The plugin (`NewPlugin`) registers a special audio stream into PlayIt Live's main mix via `IAudioPipeline.RegisterSpecialAudioStream`.
+2. Co-hosts exchange WebRTC SDP offers/answers and ICE candidates through the Cloudflare signaling Worker.
+3. Once signaled, Opus audio flows peer-to-peer over the WebRTC mesh — it does not pass through Cloudflare.
+4. The plugin decodes incoming Opus to PCM and mixes co-host audio into PlayIt Live's main output.
+5. The audience hears the DJ plus all connected co-hosts.
 
 ## Building
 
 ### Prerequisites
-- Visual Studio 2022 with .NET Framework 4.8 targeting pack
-- PlayIt Live installed (need reference to PlayItLive.exe)
+- Visual Studio 2022 (or the .NET SDK) with the .NET Framework 4.8 targeting pack
+- PlayIt Live installed (needed for the reference to `PlayItLive.exe`)
+
+### How the plugin is built
+
+The plugin ships as the **compiled DLL** `PartylinePlugin.dll`, built from `PartylinePlugin.csproj`
+with `NewPlugin` (in `PartylineScript.cs`) as the single plugin entry point. The third-party
+packages — SIPSorcery, Concentus, and Newtonsoft.Json — resolve via NuGet during the DLL build.
+
+> **The in-app `.pips` script editor cannot be used for this plugin.** PlayIt Live's in-app script
+> editor has no third-party references, so SIPSorcery/Concentus types do not resolve there. Build and
+> ship the compiled DLL instead.
+
+The superseded older plugin (`PartylinePlugin.cs` and its helpers `CoHostManager.cs`, `CoHostPage.cs`,
+`PartylineMixerForm.cs`, `PartylineStatusStrip.cs`) is kept on disk for reference but excluded from the
+build via `<Compile Remove="..." />` in `PartylinePlugin.csproj`, so there is exactly one entry point.
 
 ### Steps
-1. Open `PartylinePlugin.csproj` in Visual Studio
-2. Update the `PlayItLive` reference HintPath if needed
-3. Build in Release mode
-4. Copy output DLLs to PlayIt Live's `Plugins` folder:
-   - `PartylinePlugin.dll`
-   - `SIPSorcery.dll`
-   - `SIPSorceryMedia.Windows.dll`
-   - `Newtonsoft.Json.dll` (if not already present in PlayIt Live folder)
+1. Open `PartylinePlugin.csproj` in Visual Studio (or build from the CLI with `dotnet build`).
+2. Update the `PlayItLive` reference HintPath if your install path differs (defaults to `C:\Program Files (x86)\PlayIt Live\PlayItLive.exe`).
+3. Build in Release mode.
+4. Copy the runtime DLLs into PlayIt Live's `Plugins` folder (see Install below).
 
 ### Install
-1. Copy DLLs to `C:\Program Files (x86)\PlayIt Live\Plugins\`
-2. Restart PlayIt Live
-3. A "Partyline" menu item appears
-4. On first connect attempt, accept the UAC prompt for port sharing
+1. Copy the following DLLs to `C:\Program Files (x86)\PlayIt Live\Plugins\`:
+   - `PartylinePlugin.dll` (the plugin)
+   - `SIPSorcery.dll`
+   - `SIPSorceryMedia.Abstractions.dll`
+   - `Concentus.dll`
+   - `Newtonsoft.Json.dll`
+   - SIPSorcery's dependency closure (already vendored in `deps/`):
+     - `BouncyCastle.Crypto.dll`
+     - `DnsClient.dll`
+     - `Microsoft.Extensions.Logging.Abstractions.dll`
+2. Restart PlayIt Live.
+3. A "Partyline" menu item appears.
 
 ## Key Interfaces Used (Undocumented)
 
@@ -81,9 +85,10 @@ StreamFunc GetStreamFunc(); // delegate int StreamFunc(int length, IntPtr buffer
 
 ## Dependencies
 
-- **SIPSorcery** — Pure C# WebRTC implementation
-- **opus.dll** — Already bundled with PlayIt Live (used for Opus decoding)
-- **Newtonsoft.Json** — Already bundled with PlayIt Live
+- **SIPSorcery** (6.2.4) — Pure C# WebRTC implementation (signaling + media transport)
+- **Concentus** (1.1.7) — Pure-managed C# Opus codec used by the SIPSorcery + Concentus peer adapter
+- **Newtonsoft.Json** (13.0.3) — JSON serialization for signaling messages
+- SIPSorcery dependency closure vendored in `deps/`: `BouncyCastle.Crypto.dll`, `DnsClient.dll`, `Microsoft.Extensions.Logging.Abstractions.dll`
 
 ## Limitations
 

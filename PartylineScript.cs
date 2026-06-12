@@ -2,23 +2,37 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq.Expressions;
 using System.Net;
-using System.Reflection;
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using PlayIt.PluginEngine;
 
-public class NewPlugin : Plugin<IPlayItLiveApp>
+// NOTE: This type lives in PartylinePlugin.dll. PlayIt Live only loads `.pips`
+// script plugins, not arbitrary DLLs, so a thin `.pips` bootstrapper loads this
+// assembly by reflection and calls Run(App)/Cleanup()/Configure(). It is therefore
+// NOT a Plugin<IPlayItLiveApp> subclass; the host application is injected via Run().
+public class NewPlugin
 {
+    // Injected PlayIt Live application (passed by the .pips loader). Replaces the
+    // inherited Plugin<>.App property.
+    private IPlayItLiveApp _app;
     private CancellationTokenSource _cts;
-    private int _activePort;
+
+    // Hardcoded signaling server (Cloudflare Worker custom domain). The signaling
+    // endpoint is not user-configurable — the plugin always talks to this origin.
+    private const string SignalingBaseUrl = "https://signalling.compressed.stream";
+
     private static string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Partyline", "partyline.log");
     private SettingsManager _settingsManager = new SettingsManager();
     private string _stationName = "Partyline Co-Host";
-    private string _listenUrl = "";
+    // Retained settings: the relay URL + station key are now REUSED to derive the
+    // WebRTC mesh signaling base URL and room slug (see DeriveMeshBaseUrl /
+    // DeriveRoomSlug). No new required config is introduced by the migration.
+    private string _relayUrl = "";
+    private string _stationKey = "";
 
     // Co-host sessions
     private ConcurrentDictionary<string, CoHostState> _cohosts = new ConcurrentDictionary<string, CoHostState>();
@@ -27,6 +41,61 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     private AuthenticationManager _authManager;
     private AudioMixer _audioMixer;
 
+    // --- WebRTC mesh outbound pump (task 5.4) ---
+    // Bridges the BASS-captured main mix into the WebRTC outbound track. The active
+    // peer + signaling client are wired at startup in Run() (task 5.7).
+    private IWebRtcPeer _webRtcPeer;
+    private WebRtcMeshClient _webRtcMesh;
+
+    // Latching mic toggle for the mesh outbound path (the UI button is task 5.6).
+    // Defaults OFF; the pump only transmits while this is true (replaces PTT gating).
+    private volatile bool _micOn;
+
+    // Lifecycle flag + thread for the main-mix -> Opus outbound pump.
+    private volatile bool _meshActive;
+    private Thread _audioPumpThread;
+
+    // Static accessor for mesh connection status (used by the UI panel). Repoints
+    // the former relay-status accessors at the WebRTC mesh transport.
+    private static WebRtcMeshClient _staticWebRtcMesh;
+
+    /// <summary>True while the WebRTC mesh signaling client reports a live connection.</summary>
+    public static bool IsMeshConnected
+    {
+        get { return _staticWebRtcMesh != null && _staticWebRtcMesh.IsConnected; }
+    }
+
+    /// <summary>True once a WebRTC mesh signaling client has been wired at startup.</summary>
+    public static bool IsMeshEnabled
+    {
+        get { return _staticWebRtcMesh != null; }
+    }
+
+    // --- Mic toggle wiring for the UI panel (task 5.6) ---
+    // PartylineControlPanel does not hold a reference to the running NewPlugin
+    // instance, so the instance publishes a latching-toggle hook the panel invokes
+    // on click, plus a status accessor the panel polls to reflect on-air/muted
+    // (mirrors the IsMeshConnected static-accessor pattern above).
+    private static Action<bool> _staticMicToggle;
+    private static volatile bool _staticMicOn;
+
+    /// <summary>True while the plugin's outbound mic is ON (on air); used by the UI.</summary>
+    public static bool IsMicOn
+    {
+        get { return _staticMicOn; }
+    }
+
+    /// <summary>
+    /// Invoked by the UI's latching Mic button to flip the plugin's outbound mic
+    /// state. Routes to the running instance's <see cref="SetMicOn"/>; a safe no-op
+    /// if the plugin has not wired the hook yet.
+    /// </summary>
+    public static void RequestMicToggle(bool on)
+    {
+        Action<bool> hook = _staticMicToggle;
+        if (hook != null) hook(on);
+    }
+
     // Return audio (BASS mixer capture)
     private int _mixerHandle;
     private int _mixerChannels = 2; // default stereo, updated from BASS_ChannelGetInfo
@@ -34,6 +103,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     private byte[] _returnBuffer = new byte[44100 * 2 * 4]; // 4 seconds of 16-bit mono at 44.1kHz
     private int _returnWritePos;
     private int _returnReadPos;
+    private int _returnAvailable;
     private readonly object _returnLock = new object();
     private Thread _captureThread;
     private volatile bool _captureRunning;
@@ -60,6 +130,19 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     [DllImport("bass", CallingConvention = CallingConvention.StdCall)]
     private static extern int BASS_ChannelGetData(int handle, [Out] float[] buffer, int length);
 
+    // DSP callback for non-consuming mixer tap
+    private delegate void DSPPROC(int handle, int channel, IntPtr buffer, int length, IntPtr user);
+
+    [DllImport("bass", CallingConvention = CallingConvention.StdCall)]
+    private static extern int BASS_ChannelSetDSP(int handle, DSPPROC proc, IntPtr user, int priority);
+
+    [DllImport("bass", CallingConvention = CallingConvention.StdCall)]
+    private static extern bool BASS_ChannelRemoveDSP(int handle, int dsp);
+
+    private DSPPROC _dspDelegate;
+    private System.Runtime.InteropServices.GCHandle _dspGcHandle;
+    private int _dspHandle;
+
     private static void Log(string message)
     {
         try
@@ -76,17 +159,21 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         Log(message);
     }
 
-    public override void Run()
+    public void Run(IPlayItLiveApp app)
     {
         try
         {
             _cts = new CancellationTokenSource();
+            _app = app;
             Log("Plugin starting...");
 
             // Load settings and initialize subsystems
             List<CoHostAccount> accounts = _settingsManager.Load();
             _stationName = _settingsManager.LoadStationName();
-            _listenUrl = _settingsManager.LoadListenUrl();
+            _relayUrl = _settingsManager.LoadRelayUrl();
+            _stationKey = _settingsManager.LoadStationKey();
+
+            Log("Relay URL (reused for mesh base): " + _relayUrl);
 
             _authManager = new AuthenticationManager();
             _authManager.SetAccounts(accounts);
@@ -95,792 +182,119 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
             Log("Initialized AuthenticationManager and AudioMixer.");
 
+            // --- WebRTC mesh transport (Requirement 6.4) ---
+            // Establish co-host audio transport through the WebRTC binding instead of
+            // the deprecated WebSocket raw-PCM relay.
+            //
+            // Adapter selection: the MR-WebRTC primary adapter (Google libwebrtc) lives
+            // behind the PARTYLINE_MRWEBRTC build symbol (OFF by default). When that
+            // symbol is defined AND the native engine loads, construct it; otherwise
+            // fall back to the pure-managed SIPSorcery + Concentus adapter (the default
+            // path on this build).
+            IWebRtcPeer peer = null;
+#if PARTYLINE_MRWEBRTC
+            if (MixedRealityWebRtcLoader.TryLoad())
+            {
+                try
+                {
+                    peer = new Partyline.WebRtc.MixedRealityWebRtcPeer();
+                    Log("WebRTC binding: Microsoft.MixedReality.WebRTC (libwebrtc primary).");
+                }
+                catch (Exception ex)
+                {
+                    Log("MR-WebRTC construction failed; falling back to SIPSorcery: " + ex.Message);
+                    peer = null;
+                }
+            }
+            else
+            {
+                Log("MR-WebRTC native engine unavailable; falling back to SIPSorcery.");
+            }
+#endif
+            if (peer == null)
+            {
+                // Default path (PARTYLINE_MRWEBRTC off, or MR load/construction failed):
+                // pure-managed SIPSorcery + Concentus fallback (R5.1 amendment is
+                // documented on the adapter type).
+                peer = new Partyline.WebRtc.SipSorceryWebRtcPeer();
+                Log("WebRTC binding: SIPSorcery + Concentus (managed fallback).");
+            }
+
+            _webRtcPeer = peer;
+
+            // Hook decoded remote audio -> AudioMixer (task 5.5) and connection-state logging.
+            WireWebRtcPeer(_webRtcPeer);
+            _webRtcPeer.OnConnectionStateChanged = OnWebRtcConnectionStateChanged;
+
+            // Derive the mesh signaling base URL + room slug from the EXISTING settings
+            // so no new required config is introduced:
+            //   * baseUrl: the configured relay URL converted to an https origin
+            //     (wss:// -> https://, ws:// -> http://, bare host -> https://) with any
+            //     path/query/fragment stripped. WebRtcMeshClient appends the /api/...
+            //     paths itself.
+            //   * slug:    the station key when set, else the station name, normalised to
+            //     a URL-safe room slug.
+            // If no relay/base URL is configured, log and skip starting the mesh (the peer
+            // is still ready; we just don't open signaling) rather than crashing.
+            // Signaling transport is fixed (hardcoded origin) and the room identity
+            // is auto-generated on first run — there is no user-configurable URL,
+            // room name, or room password. The plugin claims its own room with a
+            // private DJ key and authorizes co-hosts via per-user invite passwords.
+            string[] ident = _settingsManager.EnsureRoomIdentity();
+            string meshBaseUrl = SignalingBaseUrl;
+            string meshSlug = ident[0];   // public room id (appears in invite URLs)
+            string djKey = ident[1];      // private DJ credential (never shared)
+
+            if (meshSlug != null && meshSlug.Length > 0 && djKey != null && djKey.Length > 0)
+            {
+                // The client auto-provisions/claims the room with djKey, authenticates
+                // as the DJ, and publishes the co-host accounts as invites.
+                _webRtcMesh = new WebRtcMeshClient(meshBaseUrl, meshSlug, "plugin", _webRtcPeer, djKey, accounts);
+                _staticWebRtcMesh = _webRtcMesh;
+                _webRtcMesh.Start(_cts.Token);
+                Log("WebRTC mesh signaling started: base=" + meshBaseUrl + " room=" + meshSlug);
+            }
+            else
+            {
+                Log("Room identity unavailable; WebRTC mesh signaling skipped (peer ready).");
+            }
+
             // Register audio stream into PlayIt Live's main mix
-            // NOTE: RegisterSpecialAudioStream handles source creation and routing internally.
-            // Do NOT call CreateSource/Connect/Start — those are for file-based sources only.
             Log("Registering special audio stream 'partyline'...");
-            App.AudioPipeline.RegisterSpecialAudioStream("partyline", new PartylineStream(this));
+            _app.AudioPipeline.RegisterSpecialAudioStream("partyline", new PartylineStream(this));
             Log("Special audio stream registered. PlayIt Live will call CreateStream/GetStreamFunc internally.");
 
             // Capture mixer handle for return audio (delayed — mixer may not be ready at startup)
             var captureStartThread = new Thread(() => StartCaptureWhenReady()) { IsBackground = true, Name = "PartylineCaptureInit" };
             captureStartThread.Start();
 
+            // Start the WebRTC outbound pump (task 5.4). The peer is wired above; the
+            // pump only transmits while the mic toggle is ON.
+            _meshActive = true;
+            _audioPumpThread = new Thread(AudioPumpLoop);
+            _audioPumpThread.IsBackground = true;
+            _audioPumpThread.Name = "PartylineAudioPump";
+            _audioPumpThread.Start();
+            Log("Audio pump thread started (transmits while mic on).");
+
             // Register embedded UI control
             Log("Registering UI control...");
-            App.RegisterUserControl(() => new PartylineControlPanel(_audioMixer, _authManager, accounts, _settingsManager), UserControlLocation.AboveTrackGroupSelector, 100);
+            // Publish the latching mic-toggle hook + initial state so the panel's
+            // Mic button (task 5.6) can drive _micOn and reflect on-air/muted.
+            _staticMicOn = _micOn;
+            _staticMicToggle = SetMicOn;
+            _app.RegisterUserControl(() => new PartylineControlPanel(_audioMixer, _authManager, accounts, _settingsManager), UserControlLocation.AboveTrackGroupSelector, 100);
             Log("UI control registered.");
-
-            // Hook into PlayIt Live's ServiceStack HTTP server on port 25434
-            // Wait for the server to start (user clicks "Start Server" manually)
-            var hookThread = new Thread(() => WaitAndHook()) { IsBackground = true, Name = "PartylineHook" };
-            hookThread.Start();
 
             Log("Plugin started successfully.");
 
             // Keep plugin running - this blocks until plugin is stopped
-            App.WaitForPluginStop();
+            _app.WaitForPluginStop();
         }
         catch (Exception ex)
         {
             Log("FATAL in Run(): " + ex.ToString());
         }
-    }
-
-    private void WaitAndHook()
-    {
-        Log("Waiting for ServiceStack server...");
-        // Give PlayIt Live a few seconds to start
-        Thread.Sleep(5000);
-
-        try
-        {
-            Type hostType = null;
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                hostType = asm.GetType("ServiceStack.ServiceStackHost");
-                if (hostType != null) break;
-            }
-
-            if (hostType == null)
-            {
-                Log("ERROR: ServiceStackHost type not found");
-                return;
-            }
-
-            var instanceProp = hostType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
-            var instance = instanceProp.GetValue(null);
-
-            if (instance == null)
-            {
-                Log("Instance is null after 5s, waiting more...");
-                for (int i = 0; i < 60; i++)
-                {
-                    Thread.Sleep(2000);
-                    if (_cts.IsCancellationRequested) return;
-                    instance = instanceProp.GetValue(null);
-                    if (instance != null) break;
-                }
-            }
-
-            if (instance == null)
-            {
-                Log("ERROR: Instance never became non-null");
-                return;
-            }
-
-            Log("Found instance: " + instance.GetType().FullName + ". Detecting port...");
-
-            // Detect port from HttpListener prefixes via reflection
-            int detectedPort = 25434; // fallback
-            try
-            {
-                // Walk the type hierarchy looking for a Listener property or field
-                object listener = null;
-                Type searchType = instance.GetType();
-                while (searchType != null && listener == null)
-                {
-                    PropertyInfo listenerProp = searchType.GetProperty("Listener", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    if (listenerProp != null)
-                    {
-                        listener = listenerProp.GetValue(instance);
-                    }
-                    else
-                    {
-                        FieldInfo listenerField = searchType.GetField("Listener", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                        if (listenerField != null)
-                        {
-                            listener = listenerField.GetValue(instance);
-                        }
-                    }
-                    searchType = searchType.BaseType;
-                }
-
-                if (listener == null)
-                {
-                    // Try common alternative names
-                    searchType = instance.GetType();
-                    while (searchType != null && listener == null)
-                    {
-                        foreach (var prop in searchType.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
-                        {
-                            if (prop.PropertyType == typeof(HttpListener) || prop.PropertyType.Name == "HttpListener")
-                            {
-                                listener = prop.GetValue(instance);
-                                if (listener != null) break;
-                            }
-                        }
-                        if (listener == null)
-                        {
-                            foreach (var field in searchType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
-                            {
-                                if (field.FieldType == typeof(HttpListener) || field.FieldType.Name == "HttpListener")
-                                {
-                                    listener = field.GetValue(instance);
-                                    if (listener != null) break;
-                                }
-                            }
-                        }
-                        searchType = searchType.BaseType;
-                    }
-                }
-
-                if (listener != null)
-                {
-                    Log("Found listener object: " + listener.GetType().FullName);
-
-                    // Get Prefixes from the HttpListener
-                    PropertyInfo prefixesProp = listener.GetType().GetProperty("Prefixes", BindingFlags.Public | BindingFlags.Instance);
-                    if (prefixesProp != null)
-                    {
-                        var prefixes = prefixesProp.GetValue(listener);
-                        if (prefixes != null)
-                        {
-                            // Enumerate prefixes to find port - pattern: https://+:25434/
-                            var enumerator = prefixes.GetType().GetMethod("GetEnumerator");
-                            if (enumerator != null)
-                            {
-                                var iter = enumerator.Invoke(prefixes, null) as System.Collections.IEnumerator;
-                                if (iter != null && iter.MoveNext())
-                                {
-                                    string prefix = iter.Current as string;
-                                    if (prefix != null)
-                                    {
-                                        Log("Found prefix: " + prefix);
-                                        // Parse port from URL like https://+:25434/ or http://localhost:12345/
-                                        int colonIdx = prefix.LastIndexOf(':');
-                                        if (colonIdx > 0)
-                                        {
-                                            int slashIdx = prefix.IndexOf('/', colonIdx);
-                                            if (slashIdx < 0) slashIdx = prefix.Length;
-                                            string portStr = prefix.Substring(colonIdx + 1, slashIdx - colonIdx - 1);
-                                            int parsedPort;
-                                            if (int.TryParse(portStr, out parsedPort) && parsedPort > 0 && parsedPort <= 65535)
-                                            {
-                                                detectedPort = parsedPort;
-                                                Log("Detected port from prefix: " + detectedPort);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    Log("Could not find Listener on instance, using fallback port 25434");
-                }
-            }
-            catch (Exception portEx)
-            {
-                Log("Port detection error (using fallback 25434): " + portEx.Message);
-            }
-
-            _activePort = detectedPort;
-            Log("Active port set to: " + _activePort);
-
-            HookIntoServiceStack();
-        }
-        catch (Exception ex)
-        {
-            Log("WaitAndHook error: " + ex.ToString());
-        }
-    }
-
-    private void HookIntoServiceStack()
-    {
-        Log("Hooking into ServiceStack on port " + _activePort + "...");
-
-        // Find ServiceStackHost.Instance
-        Type hostType = null;
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            hostType = asm.GetType("ServiceStack.ServiceStackHost");
-            if (hostType != null) break;
-        }
-
-        if (hostType == null)
-        {
-            Log("ERROR: ServiceStack.ServiceStackHost type not found in loaded assemblies");
-            return;
-        }
-
-        Log("Found ServiceStackHost type: " + hostType.FullName);
-
-        var instanceProp = hostType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
-        if (instanceProp == null)
-        {
-            Log("ERROR: Instance property not found");
-            return;
-        }
-
-        var instance = instanceProp.GetValue(null);
-        if (instance == null)
-        {
-            Log("ERROR: ServiceStackHost.Instance is null");
-            return;
-        }
-
-        Log("Got AppHost instance: " + instance.GetType().FullName);
-
-        // Get RawHttpHandlers list
-        var rawProp = instance.GetType().GetProperty("RawHttpHandlers", BindingFlags.Public | BindingFlags.Instance);
-        if (rawProp == null)
-        {
-            // Try on the base type
-            rawProp = hostType.GetProperty("RawHttpHandlers", BindingFlags.Public | BindingFlags.Instance);
-        }
-
-        if (rawProp == null)
-        {
-            Log("ERROR: RawHttpHandlers property not found");
-            return;
-        }
-
-        var handlersList = rawProp.GetValue(instance);
-        Log("Got RawHttpHandlers list: " + handlersList.GetType().FullName);
-
-        // The list is List<Func<IHttpRequest, IHttpHandler>>
-        // Find the types
-        Type iHttpRequestType = null;
-        Type iHttpHandlerType = null;
-
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            if (iHttpRequestType == null)
-                iHttpRequestType = asm.GetType("ServiceStack.Web.IHttpRequest");
-            if (iHttpHandlerType == null)
-                iHttpHandlerType = asm.GetType("ServiceStack.Web.IHttpHandler");
-        }
-
-        if (iHttpRequestType == null)
-        {
-            Log("ERROR: Could not find ServiceStack.Web.IHttpRequest");
-            return;
-        }
-        if (iHttpHandlerType == null)
-        {
-            Log("ERROR: Could not find ServiceStack.Web.IHttpHandler - trying System.Web.IHttpHandler");
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                iHttpHandlerType = asm.GetType("System.Web.IHttpHandler");
-                if (iHttpHandlerType != null) break;
-            }
-        }
-
-        // The list is List<Func<ServiceStack.Web.IHttpRequest, System.Web.IHttpHandler>>
-        // We need to add a Func that accepts IHttpRequest and returns IHttpHandler (or null).
-        // We'll use CustomActionHandler (ServiceStack's built-in handler class)
-        // which implements IServiceStackHandler properly.
-
-        var pathInfoProp = iHttpRequestType.GetProperty("PathInfo");
-        if (pathInfoProp == null)
-        {
-            foreach (var iface in iHttpRequestType.GetInterfaces())
-            {
-                pathInfoProp = iface.GetProperty("PathInfo");
-                if (pathInfoProp != null) break;
-            }
-        }
-        Log("PathInfo: " + (pathInfoProp != null ? "found" : "NOT FOUND"));
-
-        // Find CustomActionHandler type
-        Type customHandlerType = null;
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            customHandlerType = asm.GetType("ServiceStack.Host.Handlers.CustomActionHandler");
-            if (customHandlerType != null) break;
-        }
-        Log("CustomActionHandler: " + (customHandlerType != null ? "found" : "NOT FOUND"));
-
-        // Find IRequest and IResponse types for the Action<IRequest, IResponse>
-        Type iRequestType = null;
-        Type iResponseType = null;
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            if (iRequestType == null) iRequestType = asm.GetType("ServiceStack.Web.IRequest");
-            if (iResponseType == null) iResponseType = asm.GetType("ServiceStack.Web.IResponse");
-        }
-        Log("IRequest: " + (iRequestType != null ? "found" : "NOT FOUND"));
-        Log("IResponse: " + (iResponseType != null ? "found" : "NOT FOUND"));
-
-        // Store references for runtime use
-        _pathInfoProp = pathInfoProp;
-        _customHandlerType = customHandlerType;
-        _iRequestType = iRequestType;
-        _iResponseType = iResponseType;
-
-        // Build expression: (req) => this.CreateHandler(req.PathInfo)
-        // CreateHandler returns System.Web.IHttpHandler (CustomActionHandler implements it)
-        var reqParam = Expression.Parameter(iHttpRequestType, "req");
-        var castExpr = Expression.Convert(reqParam, pathInfoProp.DeclaringType);
-        var pathExpr = Expression.Property(castExpr, pathInfoProp);
-
-        var createHandlerMethod = typeof(NewPlugin).GetMethod("CreateHandler", BindingFlags.Public | BindingFlags.Instance);
-        var pluginConst = Expression.Constant(this);
-        var callExpr = Expression.Call(pluginConst, createHandlerMethod, pathExpr);
-
-        var funcTypeFromList = handlersList.GetType().GetGenericArguments()[0];
-        var lambda = Expression.Lambda(funcTypeFromList, callExpr, reqParam);
-        var del = lambda.Compile();
-        Log("Lambda compiled");
-
-        // Insert at position 0
-        var insertMethod = handlersList.GetType().GetMethod("Insert");
-        insertMethod.Invoke(handlersList, new object[] { 0, del });
-        Log("Handler inserted");
-
-        // CRITICAL: Rebuild the internal cached array
-        // ServiceStack reads from RawHttpHandlersArray (Func[]), not the List
-        Type searchType = instance.GetType();
-        bool rebuilt = false;
-        while (searchType != null && !rebuilt)
-        {
-            foreach (var f in searchType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
-            {
-                if (f.Name.Contains("RawHttpHandler") && f.FieldType.IsArray)
-                {
-                    var toArray = handlersList.GetType().GetMethod("ToArray");
-                    var newArray = toArray.Invoke(handlersList, null);
-                    f.SetValue(instance, newArray);
-                    Log("Rebuilt cached array: " + f.Name + " (length=" + ((Array)newArray).Length + ")");
-                    rebuilt = true;
-                    break;
-                }
-            }
-            searchType = searchType.BaseType;
-        }
-        if (!rebuilt)
-        {
-            Log("WARNING: Could not find cached array field. Listing candidate fields:");
-            searchType = instance.GetType();
-            while (searchType != null)
-            {
-                foreach (var f in searchType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
-                {
-                    if (f.FieldType.IsArray || f.Name.Contains("Handler") || f.Name.Contains("Raw"))
-                        Log("  " + searchType.Name + "." + f.Name + " : " + f.FieldType.Name);
-                }
-                searchType = searchType.BaseType;
-            }
-        }
-
-        Log("Partyline available at https://localhost:" + _activePort + "/partyline/join");
-    }
-
-    // These are set during hook setup
-    private PropertyInfo _pathInfoProp;
-    private Type _customHandlerType;
-    private Type _iRequestType;
-    private Type _iResponseType;
-
-    // Called by the expression tree lambda for each request
-    public System.Web.IHttpHandler CreateHandler(string pathInfo)
-    {
-        if (pathInfo == null || !pathInfo.StartsWith("/partyline")) return null;
-
-        try
-        {
-            // Create Action<IRequest, IResponse> delegate
-            var actionType = typeof(Action<,>).MakeGenericType(_iRequestType, _iResponseType);
-            var handleMethod = typeof(NewPlugin).GetMethod("HandlePartylineRequest", BindingFlags.Public | BindingFlags.Instance);
-            var action = Delegate.CreateDelegate(actionType, this, handleMethod);
-
-            // new CustomActionHandler(action)
-            var ctor = _customHandlerType.GetConstructor(new Type[] { actionType });
-            var handler = ctor.Invoke(new object[] { action });
-            return (System.Web.IHttpHandler)handler;
-        }
-        catch (Exception ex)
-        {
-            Log("CreateHandler error: " + ex.Message);
-            return null;
-        }
-    }
-
-    // Called by CustomActionHandler when it processes the request
-    public void HandlePartylineRequest(object request, object response)
-    {
-        try
-        {
-            // Get PathInfo from request
-            string pathInfo = _pathInfoProp.GetValue(request) as string;
-            string subPath = (pathInfo ?? "").Replace("/partyline", "").TrimStart('/');
-
-            // Get response OutputStream and ContentType
-            var resType = response.GetType();
-            var contentTypeProp = resType.GetProperty("ContentType");
-            var outputStreamProp = resType.GetProperty("OutputStream");
-
-            // --- POST /partyline/login ---
-            if (subPath == "login")
-            {
-                string reqBody = ReadRequestBody(request);
-                string hash = ExtractJsonStringValueFromBody(reqBody, "hash");
-                string username = ExtractJsonStringValueFromBody(reqBody, "username");
-                string password = ExtractJsonStringValueFromBody(reqBody, "password");
-
-                AuthResult authResult;
-                if (hash != null && hash.Length > 0)
-                {
-                    // Hash-based login (auto-login via URL hash)
-                    authResult = _authManager.AuthenticateByHash(hash);
-                }
-                else
-                {
-                    authResult = _authManager.Authenticate(username, password);
-                }
-
-                // Capture remote IP on successful login
-                if (authResult.Success)
-                {
-                    string remoteIp = GetRemoteIp(request);
-                    string cohostIdForIp = authResult.DisplayName;
-                    // Resolve cohostId from token session
-                    string tokenCohostId;
-                    if (_authManager.ValidateToken(authResult.Token, out tokenCohostId))
-                    {
-                        cohostIdForIp = tokenCohostId;
-                    }
-                    if (remoteIp != null && remoteIp.Length > 0)
-                    {
-                        _audioMixer.SetIp(cohostIdForIp, remoteIp);
-                    }
-                }
-
-                string jsonResponse;
-                if (authResult.Success)
-                {
-                    jsonResponse = "{\"success\":true,\"token\":\"" + EscapeJsonStringValue(authResult.Token) + "\",\"displayName\":\"" + EscapeJsonStringValue(authResult.DisplayName) + "\"}";
-                }
-                else
-                {
-                    jsonResponse = "{\"success\":false,\"error\":\"" + EscapeJsonStringValue(authResult.Error) + "\"}";
-                }
-
-                contentTypeProp.SetValue(response, "application/json");
-                var stream = outputStreamProp.GetValue(response) as Stream;
-                if (stream != null)
-                {
-                    var bytes = Encoding.UTF8.GetBytes(jsonResponse);
-                    stream.Write(bytes, 0, bytes.Length);
-                }
-                return;
-            }
-
-            // --- POST /partyline/audio ---
-            if (subPath == "audio")
-            {
-                // Extract X-Session-Token header via reflection
-                string token = GetRequestHeader(request, "X-Session-Token");
-
-                string cohostId;
-                if (token == null || !_authManager.ValidateToken(token, out cohostId))
-                {
-                    // Return 401 Unauthorized
-                    contentTypeProp.SetValue(response, "text/plain");
-                    var statusCodeProp = resType.GetProperty("StatusCode");
-                    if (statusCodeProp != null)
-                    {
-                        statusCodeProp.SetValue(response, 401);
-                    }
-                    var stream = outputStreamProp.GetValue(response) as Stream;
-                    if (stream != null)
-                    {
-                        var bytes = Encoding.UTF8.GetBytes("Unauthorized");
-                        stream.Write(bytes, 0, bytes.Length);
-                    }
-                    return;
-                }
-
-                // Extract X-Audio-Timestamp header for latency calculation
-                string timestampHeader = GetRequestHeader(request, "X-Audio-Timestamp");
-                long clientTimestampMs = -1;
-                if (timestampHeader != null)
-                {
-                    long.TryParse(timestampHeader, out clientTimestampMs);
-                }
-
-                // Read the request body (PCM audio data)
-                var reqType = request.GetType();
-                var inputStreamProp = reqType.GetProperty("InputStream");
-                if (inputStreamProp != null)
-                {
-                    var inputStream = inputStreamProp.GetValue(request) as Stream;
-                    if (inputStream != null)
-                    {
-                        using (var ms = new MemoryStream())
-                        {
-                            inputStream.CopyTo(ms);
-                            var data = ms.ToArray();
-                            if (data.Length > 0)
-                            {
-                                _audioMixer.IngestAudio(cohostId, data, data.Length, clientTimestampMs);
-                            }
-                        }
-                    }
-                }
-
-                contentTypeProp.SetValue(response, "text/plain");
-                var outStream = outputStreamProp.GetValue(response) as Stream;
-                if (outStream != null)
-                {
-                    var bytes = Encoding.UTF8.GetBytes("OK");
-                    outStream.Write(bytes, 0, bytes.Length);
-                }
-                return;
-            }
-
-            // --- GET /partyline/listen ---
-            if (subPath == "listen")
-            {
-                // Authenticate the request
-                string listenToken = GetRequestHeader(request, "X-Session-Token");
-                string listenCohostId;
-                if (listenToken == null || !_authManager.ValidateToken(listenToken, out listenCohostId))
-                {
-                    contentTypeProp.SetValue(response, "text/plain");
-                    var statusCodeProp2 = resType.GetProperty("StatusCode");
-                    if (statusCodeProp2 != null) statusCodeProp2.SetValue(response, 401);
-                    var s401 = outputStreamProp.GetValue(response) as Stream;
-                    if (s401 != null)
-                    {
-                        var bytes401 = Encoding.UTF8.GetBytes("Unauthorized");
-                        s401.Write(bytes401, 0, bytes401.Length);
-                    }
-                    return;
-                }
-
-                // Serve raw PCM data from the return audio buffer (16-bit mono 44.1kHz)
-                byte[] pcmData = ReadReturnAudio(8192);
-                contentTypeProp.SetValue(response, "application/octet-stream");
-                var listenStream = outputStreamProp.GetValue(response) as Stream;
-                if (listenStream != null && pcmData.Length > 0)
-                {
-                    listenStream.Write(pcmData, 0, pcmData.Length);
-                }
-                return;
-            }
-
-            // --- GET /partyline/status ---
-            if (subPath == "status")
-            {
-                string token = GetRequestHeader(request, "X-Session-Token");
-                string cohostId;
-                bool kicked = true;
-                if (token != null && _authManager.ValidateToken(token, out cohostId))
-                {
-                    kicked = false;
-                }
-
-                string jsonResponse = "{\"kicked\":" + (kicked ? "true" : "false") + "}";
-                contentTypeProp.SetValue(response, "application/json");
-                var stream = outputStreamProp.GetValue(response) as Stream;
-                if (stream != null)
-                {
-                    var bytes = Encoding.UTF8.GetBytes(jsonResponse);
-                    stream.Write(bytes, 0, bytes.Length);
-                }
-                return;
-            }
-
-            // --- GET /partyline/join ---
-            string body;
-            string contentType;
-
-            if (subPath == "" || subPath == "join" || subPath == "join/")
-            {
-                contentType = "text/html; charset=utf-8";
-                body = GetCoHostPageHtml();
-            }
-            else if (subPath == "api/status")
-            {
-                contentType = "application/json";
-                body = "{\"connected\":" + _cohosts.Count + "}";
-            }
-            else
-            {
-                contentType = "text/plain";
-                body = "Not found";
-            }
-
-            contentTypeProp.SetValue(response, contentType);
-            var finalStream = outputStreamProp.GetValue(response) as Stream;
-            if (finalStream != null)
-            {
-                var bytes = Encoding.UTF8.GetBytes(body);
-                finalStream.Write(bytes, 0, bytes.Length);
-            }
-        }
-        catch (Exception ex)
-        {
-            Log("HandlePartylineRequest error: " + ex.Message);
-        }
-    }
-
-    private string ReadRequestBody(object request)
-    {
-        try
-        {
-            var reqType = request.GetType();
-            var inputStreamProp = reqType.GetProperty("InputStream");
-            if (inputStreamProp == null) return "";
-
-            var inputStream = inputStreamProp.GetValue(request) as Stream;
-            if (inputStream == null) return "";
-
-            using (var reader = new StreamReader(inputStream, Encoding.UTF8))
-            {
-                return reader.ReadToEnd();
-            }
-        }
-        catch
-        {
-            return "";
-        }
-    }
-
-    private string GetRemoteIp(object request)
-    {
-        try
-        {
-            var reqType = request.GetType();
-
-            // Try RemoteIp property directly on the request object
-            PropertyInfo remoteIpProp = reqType.GetProperty("RemoteIp");
-            if (remoteIpProp != null)
-            {
-                string ip = remoteIpProp.GetValue(request) as string;
-                if (ip != null && ip.Length > 0) return ip;
-            }
-
-            // Try UserHostAddress property
-            PropertyInfo hostAddrProp = reqType.GetProperty("UserHostAddress");
-            if (hostAddrProp != null)
-            {
-                string ip = hostAddrProp.GetValue(request) as string;
-                if (ip != null && ip.Length > 0) return ip;
-            }
-
-            // Check interfaces for RemoteIp or UserHostAddress
-            Type[] interfaces = reqType.GetInterfaces();
-            for (int i = 0; i < interfaces.Length; i++)
-            {
-                PropertyInfo ifaceProp = interfaces[i].GetProperty("RemoteIp");
-                if (ifaceProp != null)
-                {
-                    string ip = ifaceProp.GetValue(request) as string;
-                    if (ip != null && ip.Length > 0) return ip;
-                }
-                ifaceProp = interfaces[i].GetProperty("UserHostAddress");
-                if (ifaceProp != null)
-                {
-                    string ip = ifaceProp.GetValue(request) as string;
-                    if (ip != null && ip.Length > 0) return ip;
-                }
-            }
-
-            return "";
-        }
-        catch
-        {
-            return "";
-        }
-    }
-
-    private string GetRequestHeader(object request, string headerName)
-    {
-        try
-        {
-            var reqType = request.GetType();
-            var headersProp = reqType.GetProperty("Headers");
-            if (headersProp == null) return null;
-
-            var headers = headersProp.GetValue(request);
-            if (headers == null) return null;
-
-            // Try to call .Get(headerName) via reflection
-            var getMethod = headers.GetType().GetMethod("Get", new Type[] { typeof(string) });
-            if (getMethod != null)
-            {
-                return getMethod.Invoke(headers, new object[] { headerName }) as string;
-            }
-
-            // Fallback: try indexer
-            var indexer = headers.GetType().GetProperty("Item", new Type[] { typeof(string) });
-            if (indexer != null)
-            {
-                return indexer.GetValue(headers, new object[] { headerName }) as string;
-            }
-
-            return null;
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private string ExtractJsonStringValueFromBody(string json, string key)
-    {
-        if (json == null) return null;
-        string searchKey = "\"" + key + "\"";
-        int keyIdx = json.IndexOf(searchKey);
-        if (keyIdx < 0) return null;
-
-        int colonIdx = json.IndexOf(':', keyIdx + searchKey.Length);
-        if (colonIdx < 0) return null;
-
-        int valueStart = json.IndexOf('"', colonIdx + 1);
-        if (valueStart < 0) return null;
-
-        int valueEnd = valueStart + 1;
-        while (valueEnd < json.Length)
-        {
-            if (json[valueEnd] == '"' && json[valueEnd - 1] != '\\')
-                break;
-            valueEnd++;
-        }
-
-        if (valueEnd >= json.Length) return null;
-        return json.Substring(valueStart + 1, valueEnd - valueStart - 1)
-            .Replace("\\\"", "\"")
-            .Replace("\\\\", "\\")
-            .Replace("\\n", "\n")
-            .Replace("\\r", "\r")
-            .Replace("\\t", "\t");
-    }
-
-    private string EscapeJsonStringValue(string value)
-    {
-        if (value == null) return "";
-        var sb = new StringBuilder();
-        foreach (char c in value)
-        {
-            switch (c)
-            {
-                case '"':
-                    sb.Append("\\\"");
-                    break;
-                case '\\':
-                    sb.Append("\\\\");
-                    break;
-                case '\n':
-                    sb.Append("\\n");
-                    break;
-                case '\r':
-                    sb.Append("\\r");
-                    break;
-                case '\t':
-                    sb.Append("\\t");
-                    break;
-                default:
-                    sb.Append(c);
-                    break;
-            }
-        }
-        return sb.ToString();
     }
 
     // Called by PlayIt Live's audio pipeline when it needs samples
@@ -928,7 +342,6 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     }
 
     public int GetCoHostCount() { return _cohosts.Count; }
-    public string GetLink() { return "https://" + Dns.GetHostName() + ":" + _activePort + "/partyline/join"; }
 
     private void StartCaptureWhenReady()
     {
@@ -940,7 +353,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
 
             try
             {
-                var mainMix = App.AudioPipeline.GetMainMix();
+                var mainMix = _app.AudioPipeline.GetMainMix();
                 if (mainMix == null) continue;
 
                 int handle = mainMix.GetMixerChannelHandle();
@@ -963,9 +376,21 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
                     }
 
                     _captureRunning = true;
-                    _captureThread = new Thread(CaptureLoop) { IsBackground = true, Name = "PartylineCapture" };
-                    _captureThread.Start();
-                    Log("Return audio capture thread started.");
+                    
+                    // Register DSP callback to tap mixer audio without consuming it
+                    _dspDelegate = new DSPPROC(DspCallback);
+                    _dspGcHandle = System.Runtime.InteropServices.GCHandle.Alloc(_dspDelegate);
+                    _dspHandle = BASS_ChannelSetDSP(_mixerHandle, _dspDelegate, IntPtr.Zero, 0);
+                    if (_dspHandle != 0)
+                    {
+                        Log("DSP callback registered on mixer (handle=" + _dspHandle + "). Return audio active.");
+                    }
+                    else
+                    {
+                        Log("WARNING: BASS_ChannelSetDSP failed. Return audio disabled.");
+                    }
+
+                    Log("Return audio capture ready.");
                     return;
                 }
             }
@@ -977,78 +402,85 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         Log("WARNING: Mixer handle never became valid, return audio disabled.");
     }
 
-    private void CaptureLoop()
+    /// <summary>
+    /// BASS DSP callback — called by BASS for every audio buffer that passes through the mixer.
+    /// This does NOT consume data; it just observes/copies it.
+    /// Buffer contains float samples in the mixer's format (stereo 44100Hz float).
+    /// </summary>
+    private bool _dspFirstCallLogged;
+
+    private void DspCallback(int handle, int channel, IntPtr buffer, int length, IntPtr user)
     {
-        float[] floatChunk = new float[4096]; // 4096 float samples
-        Log("CaptureLoop started, handle=" + _mixerHandle + " channels=" + _mixerChannels + " freq=" + _mixerFreq);
-
-        while (_captureRunning)
+        if (!_dspFirstCallLogged)
         {
-            try
+            _dspFirstCallLogged = true;
+            Log("DspCallback firing: length=" + length + " channels=" + _mixerChannels);
+        }
+
+        if (!_meshActive) return;
+
+        try
+        {
+            int floatSamples = length / 4;
+            int channels = _mixerChannels;
+            int monoSamples = floatSamples / channels;
+
+            // Copy float data from native buffer
+            float[] floatData = new float[floatSamples];
+            Marshal.Copy(buffer, floatData, 0, floatSamples);
+
+            // Convert to PCM16 mono
+            byte[] pcm16 = new byte[monoSamples * 2];
+            for (int i = 0; i < monoSamples; i++)
             {
-                // Request 4096 float samples * 4 bytes each = 16384 bytes
-                int bytesRead = BASS_ChannelGetData(_mixerHandle, floatChunk, 4096 * 4);
-                if (bytesRead > 0)
+                float sum = 0;
+                for (int ch = 0; ch < channels; ch++)
                 {
-                    int floatSamples = bytesRead / 4;
-                    int channels = _mixerChannels;
-                    int monoSamples = floatSamples / channels;
-                    byte[] pcm16 = new byte[monoSamples * 2];
-
-                    for (int i = 0; i < monoSamples; i++)
+                    int idx = i * channels + ch;
+                    if (idx < floatSamples)
                     {
-                        float sum = 0;
-                        for (int ch = 0; ch < channels; ch++)
-                        {
-                            sum += floatChunk[i * channels + ch];
-                        }
-                        float mono = sum / channels;
-                        // Clamp to [-1, 1] and convert to 16-bit signed
-                        if (mono > 1f) mono = 1f;
-                        if (mono < -1f) mono = -1f;
-                        short s16 = (short)(mono * 32767f);
-                        pcm16[i * 2] = (byte)(s16 & 0xFF);
-                        pcm16[i * 2 + 1] = (byte)((s16 >> 8) & 0xFF);
+                        sum += floatData[idx];
                     }
+                }
+                float mono = sum / channels;
+                // Reduce level by 6dB to prevent clipping
+                mono = mono * 0.5f;
+                if (mono > 1f) mono = 1f;
+                if (mono < -1f) mono = -1f;
+                short s16 = (short)(mono * 32767f);
+                pcm16[i * 2] = (byte)(s16 & 0xFF);
+                pcm16[i * 2 + 1] = (byte)((s16 >> 8) & 0xFF);
+            }
 
-                    lock (_returnLock)
+            lock (_returnLock)
+            {
+                for (int i = 0; i < pcm16.Length; i++)
+                {
+                    _returnBuffer[_returnWritePos] = pcm16[i];
+                    _returnWritePos = (_returnWritePos + 1) % _returnBuffer.Length;
+                    if (_returnAvailable < _returnBuffer.Length)
                     {
-                        for (int i = 0; i < pcm16.Length; i++)
-                        {
-                            _returnBuffer[_returnWritePos] = pcm16[i];
-                            _returnWritePos = (_returnWritePos + 1) % _returnBuffer.Length;
-                        }
+                        _returnAvailable++;
+                    }
+                    else
+                    {
+                        // Buffer full: drop oldest byte by advancing the read pointer so
+                        // the available count never reports stale/overwritten data.
+                        _returnReadPos = (_returnReadPos + 1) % _returnBuffer.Length;
                     }
                 }
             }
-            catch (Exception ex)
-            {
-                Log("CaptureLoop error: " + ex.Message);
-            }
-
-            Thread.Sleep(50);
         }
-
-        Log("CaptureLoop exited.");
+        catch { }
     }
 
     internal byte[] ReadReturnAudio(int maxBytes)
     {
         lock (_returnLock)
         {
-            int available;
-            if (_returnWritePos >= _returnReadPos)
-            {
-                available = _returnWritePos - _returnReadPos;
-            }
-            else
-            {
-                available = _returnBuffer.Length - _returnReadPos + _returnWritePos;
-            }
+            if (_returnAvailable <= 0) return new byte[0];
 
-            if (available <= 0) return new byte[0];
-
-            int toRead = Math.Min(available, maxBytes);
+            int toRead = Math.Min(_returnAvailable, maxBytes);
             byte[] result = new byte[toRead];
 
             for (int i = 0; i < toRead; i++)
@@ -1057,6 +489,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
                 _returnReadPos = (_returnReadPos + 1) % _returnBuffer.Length;
             }
 
+            _returnAvailable -= toRead;
             return result;
         }
     }
@@ -1065,9 +498,7 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
     public void UnmuteAll() { foreach (var c in _cohosts.Values) c.IsMuted = false; }
     public void KickAll() { _cohosts.Clear(); }
 
-    internal string GetCoHostPageHtml() { return GetCoHostPage(); }
-
-    public override void Cleanup()
+    public void Cleanup()
     {
         if (_cts != null) _cts.Cancel();
 
@@ -1075,6 +506,36 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         if (_captureThread != null)
         {
             try { _captureThread.Join(2000); } catch { }
+        }
+
+        // Remove DSP callback
+        if (_dspHandle != 0 && _mixerHandle != 0)
+        {
+            try { BASS_ChannelRemoveDSP(_mixerHandle, _dspHandle); } catch { }
+            _dspHandle = 0;
+        }
+        if (_dspGcHandle.IsAllocated)
+        {
+            _dspGcHandle.Free();
+        }
+
+        _meshActive = false;
+        if (_audioPumpThread != null)
+        {
+            try { _audioPumpThread.Join(2000); } catch { }
+        }
+
+        // Tear down the WebRTC mesh signaling/peer. Stop() sends a best-effort 'leave'
+        // and closes the signaling connection; then dispose/close the peer connections.
+        if (_webRtcMesh != null)
+        {
+            try { _webRtcMesh.Stop(); }
+            catch (Exception ex) { Log("Error stopping WebRtcMeshClient: " + ex.Message); }
+        }
+        if (_webRtcPeer != null)
+        {
+            try { _webRtcPeer.CloseAll(); }
+            catch (Exception ex) { Log("Error closing WebRTC peer: " + ex.Message); }
         }
 
         if (_authManager != null)
@@ -1086,276 +547,276 @@ public class NewPlugin : Plugin<IPlayItLiveApp>
         Log("Plugin cleanup completed.");
     }
 
-    public override void Configure()
+    public void Configure()
     {
         var form = new PartylineConfigForm(_settingsManager);
         form.ShowDialog();
     }
 
-    private string GetCoHostPage()
+    /// <summary>
+    /// Inbound remote-audio handler (task 5.5) — the remote Opus → <see cref="AudioMixer"/>
+    /// ingest bridge that replaced the deprecated relay's PCM-receive loop. Called by the
+    /// active <see cref="IWebRtcPeer"/> (its <c>OnRemoteAudioFrame</c> callback) with decoded
+    /// remote PCM16 for a single peer. The adapter contract delivers mono samples
+    /// (<paramref name="sampleCount"/> mono PCM16 samples at <paramref name="sampleRate"/>,
+    /// e.g. 48 kHz from Opus).
+    ///
+    /// We resample to the PlayIt mixer rate (<c>_mixerFreq</c>, e.g. 44.1 kHz) using the same
+    /// nearest-sample approach the rest of the bridge uses, then ingest into the per-co-host
+    /// mixer channel via the existing <see cref="AudioMixer.EnsureCoHost"/> /
+    /// <see cref="AudioMixer.IngestAudio"/> path. <see cref="AudioMixer"/> sums per-co-host
+    /// channels into the buffer <c>PartylineStream</c> feeds back into the PlayIt main mix, so
+    /// inbound remote voice reaches the broadcast exactly as before — only the decode source
+    /// changed from raw-PCM-over-WebSocket to Opus-over-WebRTC.
+    /// (Requirement 5.3)
+    /// </summary>
+    private void OnRemoteAudioFrame(string peerId, short[] pcm, int sampleCount, int sampleRate)
     {
-        string safeStationName = EscapeHtmlContent(_stationName ?? "Partyline Co-Host");
-        string html = @"<!DOCTYPE html>
-<html>
-<head>
-<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>{{STATION_NAME}}</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center}
-.c{max-width:500px;width:100%;padding:2rem}
-h1{font-size:1.5rem;margin-bottom:1.5rem;text-align:center}
-.status{padding:1rem;border-radius:8px;margin-bottom:1.5rem;text-align:center;font-weight:bold}
-.s-off{background:rgba(239,68,68,.2);border:1px solid #ef4444}
-.s-on{background:rgba(34,197,94,.2);border:1px solid #22c55e}
-.s-wait{background:rgba(234,179,8,.2);border:1px solid #eab308}
-.s-kick{background:rgba(239,68,68,.3);border:1px solid #ef4444}
-.btn{width:100%;padding:1rem;font-size:1.1rem;border:none;border-radius:8px;cursor:pointer;font-weight:bold;margin-bottom:1rem}
-.btn-blue{background:#3b82f6;color:#fff}
-.btn-blue:disabled{opacity:.5;cursor:not-allowed}
-.ptt{padding:2rem;font-size:1.5rem;border-radius:12px;user-select:none;transition:all .1s}
-.ptt-off{background:#64748b;color:#fff}
-.ptt-on{background:#ef4444;color:#fff;transform:scale(.98)}
-.ptt:disabled{opacity:.5;cursor:not-allowed}
-.vu{height:8px;background:rgba(255,255,255,.1);border-radius:4px;overflow:hidden;margin-top:1rem}
-.vu-fill{height:100%;background:#22c55e;width:0%;transition:width .05s}
-.info{margin-top:1rem;font-size:.8rem;color:#94a3b8;text-align:center}
-.input{width:100%;padding:.75rem;font-size:1rem;border:1px solid #334155;border-radius:8px;margin-bottom:.75rem;background:#0f172a;color:#fff}
-.input:focus{outline:none;border-color:#3b82f6}
-.error{color:#ef4444;font-size:.9rem;text-align:center;margin-bottom:1rem;min-height:1.2em}
-.welcome{font-size:1.1rem;text-align:center;margin-bottom:1rem;color:#22c55e}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:6px}
-.hidden{display:none}
-</style>
-</head>
-<body>
-<div class='c'>
-<h1>🎙️ {{STATION_NAME}}</h1>
+        if (_audioMixer == null || peerId == null || pcm == null || sampleCount <= 0) return;
 
-<!-- Login State -->
-<div id='loginPanel'>
-<input id='username' class='input' type='text' placeholder='Username' autocomplete='username'>
-<input id='password' class='input' type='password' placeholder='Password' autocomplete='current-password'>
-<div id='errorMsg' class='error'></div>
-<button id='connectBtn' class='btn btn-blue' onclick='doLogin()'>Connect</button>
-</div>
+        int srcRate = sampleRate > 0 ? sampleRate : 48000;
+        int dstRate = _mixerFreq > 0 ? _mixerFreq : 44100;
 
-<!-- Connected State -->
-<div id='connectedPanel' class='hidden'>
-<div id='welcomeMsg' class='welcome'></div>
-<div id='st' class='status s-on'><span class='dot'></span>Connected</div>
-<button id='ptt' class='btn ptt ptt-off' disabled
- onclick='toggleMic()'>
-MIC OFF</button>
-<div class='vu'><div id='vu' class='vu-fill'></div></div>
-<div class='info'>Click the button to toggle your microphone on or off.<br>You'll hear yourself in your headphones while mic is on (sidetone).</div>
-</div>
+        byte[] mixerPcm = ResampleToMixerRate(pcm, sampleCount, srcRate, dstRate);
+        if (mixerPcm.Length == 0) return;
 
-<!-- Kicked State -->
-<div id='kickedPanel' class='hidden'>
-<div class='status s-kick'>Disconnected by host</div>
-<div class='info'>Your session has been ended by the DJ.</div>
-</div>
-
-</div>
-<script>
-var ctx,src,proc,sending=false,connected=false;
-var sessionToken=null,displayName='';
-var statusInterval=null;
-var SR=44100,BUF=4096;
-var BASE=location.origin+'/partyline';
-var stationName='{{STATION_NAME_JS}}';
-
-// Return audio playback state
-var listenCtx=null,listenInterval=null;
-var listenQueue=[],listenPlaying=false,listenNextTime=0;
-
-(function(){
- var h=location.hash?location.hash.substring(1):'';
- if(h&&h.length>0){
-  document.addEventListener('DOMContentLoaded',function(){doHashLogin(h);});
- }
-})();
-
-function doHashLogin(hash){
- document.getElementById('loginPanel').className='hidden';
- var xhr=new XMLHttpRequest();
- xhr.open('POST',BASE+'/login',true);
- xhr.setRequestHeader('Content-Type','application/json');
- xhr.onload=function(){
-  try{
-   var r=JSON.parse(xhr.responseText);
-   if(r.success){
-    sessionToken=r.token;
-    displayName=r.displayName||'Co-Host';
-    showConnected();
-   }else{
-    document.getElementById('loginPanel').className='';
-    document.getElementById('errorMsg').innerText=r.error||'Auto-login failed';
-   }
-  }catch(e){
-   document.getElementById('loginPanel').className='';
-   document.getElementById('errorMsg').innerText='Connection error';
-  }
- };
- xhr.onerror=function(){
-  document.getElementById('loginPanel').className='';
-  document.getElementById('errorMsg').innerText='Connection error';
- };
- xhr.send(JSON.stringify({hash:hash}));
-}
-
-function doLogin(){
- var u=document.getElementById('username').value.trim();
- var p=document.getElementById('password').value;
- document.getElementById('errorMsg').innerText='';
- if(!u||!p){document.getElementById('errorMsg').innerText='Please enter username and password.';return;}
- document.getElementById('connectBtn').disabled=true;
- var xhr=new XMLHttpRequest();
- xhr.open('POST',BASE+'/login',true);
- xhr.setRequestHeader('Content-Type','application/json');
- xhr.onload=function(){
-  document.getElementById('connectBtn').disabled=false;
-  try{
-   var r=JSON.parse(xhr.responseText);
-   if(r.success){
-    sessionToken=r.token;
-    displayName=r.displayName||u;
-    showConnected();
-   }else{
-    document.getElementById('errorMsg').innerText=r.error||'Login failed';
-   }
-  }catch(e){document.getElementById('errorMsg').innerText='Connection error';}
- };
- xhr.onerror=function(){
-  document.getElementById('connectBtn').disabled=false;
-  document.getElementById('errorMsg').innerText='Connection error';
- };
- xhr.send(JSON.stringify({username:u,password:p}));
-}
-
-function showConnected(){
- document.getElementById('loginPanel').className='hidden';
- document.getElementById('connectedPanel').className='';
- document.getElementById('welcomeMsg').innerText='Welcome to '+stationName+', '+displayName+'!';
- startAudio();
- startListenStream();
- statusInterval=setInterval(pollStatus,3000);
-}
-
-function startListenStream(){
- listenCtx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
- listenNextTime=listenCtx.currentTime+0.5;
- listenInterval=setInterval(pollListen,150);
-}
-
-function pollListen(){
- if(!sessionToken||!listenCtx)return;
- var xhr=new XMLHttpRequest();
- xhr.open('GET',BASE+'/listen',true);
- xhr.responseType='arraybuffer';
- xhr.setRequestHeader('X-Session-Token',sessionToken);
- xhr.onload=function(){
-  if(xhr.status===200&&xhr.response&&xhr.response.byteLength>0){
-   var raw=new Int16Array(xhr.response);
-   var floats=new Float32Array(raw.length);
-   for(var i=0;i<raw.length;i++)floats[i]=raw[i]/32768.0;
-   var buf=listenCtx.createBuffer(1,floats.length,SR);
-   buf.getChannelData(0).set(floats);
-   var src2=listenCtx.createBufferSource();
-   src2.buffer=buf;
-   src2.connect(listenCtx.destination);
-   var now=listenCtx.currentTime;
-   if(listenNextTime<now)listenNextTime=now+0.05;
-   src2.start(listenNextTime);
-   listenNextTime+=buf.duration;
-  }
- };
- xhr.send();
-}
-
-function pollStatus(){
- if(!sessionToken)return;
- var xhr=new XMLHttpRequest();
- xhr.open('GET',BASE+'/status',true);
- xhr.setRequestHeader('X-Session-Token',sessionToken);
- xhr.onload=function(){
-  try{
-   var r=JSON.parse(xhr.responseText);
-   if(r.kicked){showKicked();}
-  }catch(e){}
- };
- xhr.send();
-}
-
-function showKicked(){
- connected=false;
- sending=false;
- if(statusInterval){clearInterval(statusInterval);statusInterval=null;}
- if(listenInterval){clearInterval(listenInterval);listenInterval=null;}
- if(ctx){try{ctx.close();}catch(e){}}
- if(listenCtx){try{listenCtx.close();}catch(e){}}
- document.getElementById('connectedPanel').className='hidden';
- document.getElementById('kickedPanel').className='';
-}
-
-function startAudio(){
- navigator.mediaDevices.getUserMedia({audio:{sampleRate:SR,channelCount:1,echoCancellation:true}}).then(function(stream){
-  ctx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
-  src=ctx.createMediaStreamSource(stream);
-  proc=ctx.createScriptProcessor(BUF,1,1);
-  src.connect(proc);proc.connect(ctx.destination);
-  // Sidetone: let co-host hear themselves at low volume
-  var sidetoneGain=ctx.createGain();
-  sidetoneGain.gain.value=0.3;
-  src.connect(sidetoneGain);
-  sidetoneGain.connect(ctx.destination);
-  connected=true;
-  document.getElementById('ptt').disabled=false;
-  proc.onaudioprocess=function(e){
-   if(!sending||!connected)return;
-   var d=e.inputBuffer.getChannelData(0);
-   var p=new Int16Array(d.length);
-   for(var i=0;i<d.length;i++)p[i]=Math.max(-32768,Math.min(32767,Math.round(d[i]*32767)));
-   var xhr=new XMLHttpRequest();
-   xhr.open('POST',BASE+'/audio',true);
-   xhr.setRequestHeader('Content-Type','application/octet-stream');
-   xhr.setRequestHeader('X-Session-Token',sessionToken);
-   xhr.setRequestHeader('X-Audio-Timestamp',Date.now().toString());
-   xhr.send(p.buffer);
-   var m=0;for(var i=0;i<d.length;i++){var v=Math.abs(d[i]);if(v>m)m=v;}
-   document.getElementById('vu').style.width=(m*100)+'%';
-  };
- }).catch(function(err){
-  document.getElementById('st').className='status s-off';
-  document.getElementById('st').innerText='Mic error: '+err.message;
- });
-}
-
-function toggleMic(){
- if(!connected)return;
- sending=!sending;
- if(sending){
-  document.getElementById('ptt').className='btn ptt ptt-on';
-  document.getElementById('ptt').innerText='MIC ON';
- }else{
-  document.getElementById('ptt').className='btn ptt ptt-off';
-  document.getElementById('ptt').innerText='MIC OFF';
-  document.getElementById('vu').style.width='0%';
- }
-}
-</script>
-</body>
-</html>";
-        html = html.Replace("{{STATION_NAME}}", safeStationName);
-        html = html.Replace("{{STATION_NAME_JS}}", EscapeJsonStringValue(safeStationName));
-        return html;
+        _audioMixer.EnsureCoHost(peerId);
+        _audioMixer.IngestAudio(peerId, mixerPcm, mixerPcm.Length);
     }
 
-    private string EscapeHtmlContent(string value)
+    /// <summary>
+    /// Wires a peer's decoded-remote-frame callback to <see cref="OnRemoteAudioFrame"/> so
+    /// inbound Opus reaches the mixer. Intended to be called by the future startup wiring task
+    /// (along with the other <see cref="IWebRtcPeer"/> callbacks); defined here so 5.5 has a
+    /// single place that owns the inbound hookup. Safe to call before <c>_webRtcPeer</c> is
+    /// otherwise used.
+    /// </summary>
+    private void WireWebRtcPeer(IWebRtcPeer peer)
     {
-        if (value == null) return "";
-        return value.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;").Replace("'", "&#39;");
+        if (peer == null) return;
+        _webRtcPeer = peer;
+        peer.OnRemoteAudioFrame = OnRemoteAudioFrame;
+    }
+
+    /// <summary>
+    /// Logs WebRTC per-peer connection-state transitions (e.g. "failed" for Req 1.5).
+    /// Wired to <c>IWebRtcPeer.OnConnectionStateChanged</c> at startup.
+    /// </summary>
+    private void OnWebRtcConnectionStateChanged(string peerId, string state)
+    {
+        Log("WebRTC connection state [" + (peerId ?? "?") + "]: " + (state ?? "?"));
+    }
+
+    /// <summary>
+    /// Derives the WebRTC mesh signaling base origin from the configured relay URL,
+    /// reusing existing settings rather than introducing new config (Req 6.4). The
+    /// relay used ws/wss; the mesh signaling is plain HTTPS, so the scheme is
+    /// normalised (wss:// -> https://, ws:// -> http://, a bare host -> https://) and
+    /// any path/query/fragment is stripped, leaving only "scheme://host[:port]".
+    /// <see cref="WebRtcMeshClient"/> appends the /api/... paths itself. Returns null
+    /// when no relay URL is configured (caller then skips starting the mesh).
+    /// </summary>
+    internal static string DeriveMeshBaseUrl(string relayUrl)
+    {
+        if (relayUrl == null) return null;
+        string u = relayUrl.Trim();
+        if (u.Length == 0) return null;
+
+        if (u.StartsWith("wss://", StringComparison.OrdinalIgnoreCase))
+            u = "https://" + u.Substring(6);
+        else if (u.StartsWith("ws://", StringComparison.OrdinalIgnoreCase))
+            u = "http://" + u.Substring(5);
+        else if (!u.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                 !u.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            u = "https://" + u; // bare host -> assume https
+
+        int schemeEnd = u.IndexOf("://", StringComparison.Ordinal);
+        if (schemeEnd < 0) return null;
+        schemeEnd += 3;
+        int pathStart = u.IndexOfAny(new char[] { '/', '?', '#' }, schemeEnd);
+        if (pathStart >= 0) u = u.Substring(0, pathStart);
+        return u;
+    }
+
+    /// <summary>
+    /// Derives a URL-safe room slug from existing settings: the station key when set,
+    /// otherwise the station name (Req 6.4, no new config). Lowercases, keeps
+    /// alphanumerics, collapses any run of other characters to a single hyphen, and
+    /// trims leading/trailing hyphens. Returns null when neither setting is usable.
+    /// </summary>
+    internal static string DeriveRoomSlug(string stationKey, string stationName)
+    {
+        string raw = (stationKey != null && stationKey.Trim().Length > 0) ? stationKey : stationName;
+        if (raw == null) return null;
+        raw = raw.Trim();
+        if (raw.Length == 0) return null;
+
+        StringBuilder sb = new StringBuilder(raw.Length);
+        bool lastDash = false;
+        for (int i = 0; i < raw.Length; i++)
+        {
+            char c = raw[i];
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))
+            {
+                sb.Append(c);
+                lastDash = false;
+            }
+            else if (c >= 'A' && c <= 'Z')
+            {
+                sb.Append((char)(c + 32)); // ASCII lowercase
+                lastDash = false;
+            }
+            else if (!lastDash && sb.Length > 0)
+            {
+                sb.Append('-');
+                lastDash = true;
+            }
+        }
+        string slug = sb.ToString();
+        if (slug.Length > 0 && slug[slug.Length - 1] == '-')
+            slug = slug.Substring(0, slug.Length - 1);
+        return slug.Length > 0 ? slug : null;
+    }
+
+    /// <summary>
+    /// Drives the plugin's outbound mic state from the latching UI toggle (task 5.6).
+    /// Sets the <c>_micOn</c> gate the <see cref="AudioPumpLoop"/> checks (ON begins
+    /// transmitting captured main-mix frames to connected peers, OFF stops), mirrors
+    /// the value into the static accessor the UI polls, and broadcasts a
+    /// <c>mic-state</c> signal via the mesh client when present so consoles render the
+    /// plugin's on-air/muted indicator. This is a latching flip (each call sets an
+    /// explicit state) — never momentary, never always-open.
+    /// (Requirements 7.3, 7.4, 7.5, 7.6, 7.7, 7.8)
+    /// </summary>
+    public void SetMicOn(bool on)
+    {
+        _micOn = on;
+        _staticMicOn = on;
+
+        if (_webRtcMesh != null)
+        {
+            try { _webRtcMesh.SetMicState(on); }
+            catch (Exception ex) { Log("Error broadcasting mic-state: " + ex.Message); }
+        }
+
+        Log("Mic toggled " + (on ? "ON (on air)" : "OFF (muted)"));
+    }
+
+    /// <summary>
+    /// Resamples mono PCM16 from <paramref name="srcRate"/> to <paramref name="dstRate"/> using
+    /// a nearest-sample mapping (consistent with <see cref="TryReadMainMixFrame"/>),
+    /// returning little-endian PCM16 bytes ready for
+    /// <see cref="AudioMixer.IngestAudio"/>. When the rates already match, this is a straight
+    /// short[] → byte[] conversion.
+    /// </summary>
+    private static byte[] ResampleToMixerRate(short[] pcm, int sampleCount, int srcRate, int dstRate)
+    {
+        if (pcm == null || sampleCount <= 0 || srcRate <= 0 || dstRate <= 0)
+            return new byte[0];
+
+        // Clamp to the actual buffer length in case the caller over-reported sampleCount.
+        int inputSamples = sampleCount <= pcm.Length ? sampleCount : pcm.Length;
+        if (inputSamples <= 0) return new byte[0];
+
+        int outputSamples = (int)((long)inputSamples * dstRate / srcRate);
+        if (outputSamples < 1) outputSamples = 1;
+
+        byte[] outBytes = new byte[outputSamples * 2];
+        for (int i = 0; i < outputSamples; i++)
+        {
+            // Nearest-sample resample dstRate -> srcRate index lookup.
+            int srcIdx = (int)((long)i * srcRate / dstRate);
+            if (srcIdx >= inputSamples) srcIdx = inputSamples - 1;
+            short s = pcm[srcIdx];
+            outBytes[i * 2] = (byte)(s & 0xFF);
+            outBytes[i * 2 + 1] = (byte)((s >> 8) & 0xFF);
+        }
+        return outBytes;
+    }
+
+    /// <summary>
+    /// Outbound frame pump (task 5.4) — the BASS main-mix → Opus outbound bridge that
+    /// replaces the deprecated relay's PCM-send loop. Reads 20 ms / 960-sample mono
+    /// PCM16 @ 48 kHz frames from the existing DSP ring buffer (<see cref="ReadReturnAudio"/>)
+    /// and pushes them to the active <see cref="IWebRtcPeer"/>, which performs the mono
+    /// Opus encode + SRTP transmit to every connected peer.
+    ///
+    /// Transmission is gated by the latching mic toggle (<c>_micOn</c>), replacing PTT.
+    /// The loop always drains a frame per tick so latency stays bounded, but only pushes
+    /// while the mic is ON and a peer is wired. It no-ops safely when <c>_webRtcPeer</c>
+    /// is null, so nothing breaks before the startup wiring (later task) lands.
+    /// (Requirements 5.2, 5.5)
+    /// </summary>
+    private void AudioPumpLoop()
+    {
+        Log("AudioPumpLoop started.");
+        const int frameSamples = 960; // 20 ms @ 48 kHz mono
+        short[] frame = new short[frameSamples];
+        bool firstPushLogged = false;
+
+        while (_meshActive)
+        {
+            try
+            {
+                // Always drain a frame so the ring buffer does not accumulate latency
+                // while the mic is OFF / no peer is wired.
+                bool haveFrame = TryReadMainMixFrame(frame);
+
+                // Only transmit when the mic toggle is ON (replaces PTT gating) and a
+                // peer is wired. Snapshot the field so a concurrent swap is safe.
+                IWebRtcPeer peer = _webRtcPeer;
+                if (haveFrame && _micOn && peer != null)
+                {
+                    peer.PushOutboundAudio(frame, frameSamples, 48000, 1);
+                    if (!firstPushLogged)
+                    {
+                        firstPushLogged = true;
+                        Log("AudioPumpLoop: first outbound frame pushed (" + frameSamples + " samples @ 48kHz mono).");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("AudioPumpLoop error: " + ex.Message);
+            }
+            Thread.Sleep(20);
+        }
+        Log("AudioPumpLoop exited.");
+    }
+
+    /// <summary>
+    /// Fills a 960-sample mono PCM16 frame at 48 kHz (20 ms) from the DSP ring buffer,
+    /// resampling from the mixer rate (<c>_mixerFreq</c>, e.g. 44.1 kHz) to 48 kHz with
+    /// a nearest-sample approach. Returns false
+    /// when no captured audio is currently available.
+    /// </summary>
+    private bool TryReadMainMixFrame(short[] frame)
+    {
+        const int outputSamples = 960; // 20 ms @ 48 kHz mono
+        int srcFreq = _mixerFreq > 0 ? _mixerFreq : 44100;
+
+        // Source (mono PCM16) sample count needed to produce 960 samples at 48 kHz.
+        int inputSamplesNeeded = (int)((long)outputSamples * srcFreq / 48000);
+        if (inputSamplesNeeded < 1) inputSamplesNeeded = 1;
+
+        byte[] raw = ReadReturnAudio(inputSamplesNeeded * 2);
+        if (raw == null || raw.Length < 4)
+        {
+            // No real audio available this tick.
+            return false;
+        }
+
+        int inputSamples = raw.Length / 2;
+        for (int i = 0; i < outputSamples; i++)
+        {
+            // Nearest-sample resample srcFreq -> 48 kHz.
+            int srcIdx = (int)((long)i * srcFreq / 48000);
+            if (srcIdx >= inputSamples) srcIdx = inputSamples - 1;
+            int lo = raw[srcIdx * 2];
+            int hi = raw[srcIdx * 2 + 1];
+            frame[i] = (short)(lo | (hi << 8));
+        }
+        return true;
     }
 }
 
@@ -1545,6 +1006,31 @@ public class AuthenticationManager
             }
         }
         return false;
+    }
+
+    public bool HasAnyActiveSession()
+    {
+        return _sessions.Count > 0;
+    }
+
+    /// <summary>
+    /// Registers a session for a co-host that joined via the relay.
+    /// This allows the UI to show them as "Connected".
+    /// </summary>
+    public void RegisterRelaySession(string cohostId, string displayName)
+    {
+        if (cohostId == null) return;
+
+        // Remove any existing session for this cohostId first
+        InvalidateSession(cohostId);
+
+        string token = "relay_" + Guid.NewGuid().ToString("N");
+        ActiveSession session = new ActiveSession();
+        session.Token = token;
+        session.CohostId = cohostId;
+        session.DisplayName = displayName ?? cohostId;
+        session.CreatedAt = DateTime.UtcNow;
+        _sessions[token] = session;
     }
 
     public void SetAccounts(List<CoHostAccount> accounts)
@@ -2026,6 +1512,81 @@ public class SettingsManager
         "Partyline",
         "cohosts.json");
 
+    // Auto-generated room identity, persisted on first run. roomId is the PUBLIC
+    // room slug embedded in co-host invite URLs; djKey is the PRIVATE credential
+    // the plugin uses to claim/authenticate the room with the signaling server and
+    // is NEVER shared. Neither is user-configurable — they are generated once and
+    // reused, so co-host invite links always resolve to the same room.
+    private static readonly string IdentityPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "Partyline",
+        "identity.json");
+
+    /// <summary>
+    /// Returns the persisted room identity as { roomId, djKey }, generating and
+    /// saving a fresh pair (32 hex chars each) on first run. Stored separately from
+    /// the co-host accounts so the account-editing path can never clobber it.
+    /// </summary>
+    public string[] EnsureRoomIdentity()
+    {
+        try
+        {
+            if (File.Exists(IdentityPath))
+            {
+                string json = File.ReadAllText(IdentityPath, Encoding.UTF8);
+                string rid = ExtractTopLevelString(json, "roomId");
+                string dk = ExtractTopLevelString(json, "djKey");
+                if (!string.IsNullOrEmpty(rid) && !string.IsNullOrEmpty(dk))
+                {
+                    return new string[] { rid, dk };
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            NewPlugin.LogStatic("ERROR reading identity.json: " + ex.Message);
+        }
+
+        // Generate a fresh identity (two independent 32-hex-char tokens).
+        string roomId = Guid.NewGuid().ToString("N"); // 32 hex chars
+        string djKey = Guid.NewGuid().ToString("N"); // 32 hex chars
+        try
+        {
+            string dir = Path.GetDirectoryName(IdentityPath);
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            string body = "{\"roomId\":\"" + roomId + "\",\"djKey\":\"" + djKey + "\"}";
+            File.WriteAllText(IdentityPath, body, Encoding.UTF8);
+            NewPlugin.LogStatic("Generated new room identity (roomId=" + roomId + ").");
+        }
+        catch (Exception ex)
+        {
+            NewPlugin.LogStatic("ERROR writing identity.json: " + ex.Message);
+        }
+        return new string[] { roomId, djKey };
+    }
+
+    /// <summary>Convenience: just the public room slug.</summary>
+    public string LoadRoomId()
+    {
+        return EnsureRoomIdentity()[0];
+    }
+
+    private static string ExtractTopLevelString(string json, string key)
+    {
+        if (json == null) return null;
+        string searchKey = "\"" + key + "\"";
+        int keyIdx = json.IndexOf(searchKey);
+        if (keyIdx < 0) return null;
+        int colonIdx = json.IndexOf(':', keyIdx + searchKey.Length);
+        if (colonIdx < 0) return null;
+        int valueStart = json.IndexOf('"', colonIdx + 1);
+        if (valueStart < 0) return null;
+        int valueEnd = valueStart + 1;
+        while (valueEnd < json.Length && json[valueEnd] != '"') valueEnd++;
+        if (valueEnd >= json.Length) return null;
+        return json.Substring(valueStart + 1, valueEnd - valueStart - 1);
+    }
+
     public List<CoHostAccount> Load()
     {
         try
@@ -2056,8 +1617,7 @@ public class SettingsManager
                 try
                 {
                     string stationName = ExtractJsonStringValue(json, "stationName");
-                    string listenUrl = ExtractJsonStringValue(json, "listenUrl");
-                    Save(accounts, stationName, listenUrl);
+                    Save(accounts, stationName);
                     NewPlugin.LogStatic("Re-saved settings with generated hashes");
                 }
                 catch (Exception saveEx)
@@ -2099,7 +1659,7 @@ public class SettingsManager
         }
     }
 
-    public string LoadListenUrl()
+    public string LoadRelayUrl()
     {
         try
         {
@@ -2109,7 +1669,7 @@ public class SettingsManager
             }
 
             string json = File.ReadAllText(SettingsPath, Encoding.UTF8);
-            string url = ExtractJsonStringValue(json, "listenUrl");
+            string url = ExtractJsonStringValue(json, "relayUrl");
             if (string.IsNullOrEmpty(url))
             {
                 return "";
@@ -2118,15 +1678,37 @@ public class SettingsManager
         }
         catch (Exception ex)
         {
-            NewPlugin.LogStatic("ERROR loading listen URL: " + ex.Message);
+            NewPlugin.LogStatic("ERROR loading relay URL: " + ex.Message);
+            return "";
+        }
+    }
+
+    public string LoadStationKey()
+    {
+        try
+        {
+            if (!File.Exists(SettingsPath))
+            {
+                return "";
+            }
+
+            string json = File.ReadAllText(SettingsPath, Encoding.UTF8);
+            string key = ExtractJsonStringValue(json, "stationKey");
+            if (string.IsNullOrEmpty(key))
+            {
+                return "";
+            }
+            return key;
+        }
+        catch (Exception ex)
+        {
+            NewPlugin.LogStatic("ERROR loading station key: " + ex.Message);
             return "";
         }
     }
 
     private List<CoHostAccount> ParseAccountsJson(string json)
     {
-        // Simple JSON parser for our known format:
-        // {"accounts":[{"username":"x","password":"y","displayName":"z"}, ...]}
         var result = new List<CoHostAccount>();
 
         int accountsIdx = json.IndexOf("\"accounts\"");
@@ -2216,15 +1798,15 @@ public class SettingsManager
 
     public void Save(List<CoHostAccount> accounts)
     {
-        Save(accounts, null, null);
+        Save(accounts, null, null, null);
     }
 
     public void Save(List<CoHostAccount> accounts, string stationName)
     {
-        Save(accounts, stationName, null);
+        Save(accounts, stationName, null, null);
     }
 
-    public void Save(List<CoHostAccount> accounts, string stationName, string listenUrl)
+    public void Save(List<CoHostAccount> accounts, string stationName, string relayUrl, string stationKey)
     {
         try
         {
@@ -2240,18 +1822,26 @@ public class SettingsManager
                 stationName = LoadStationName();
             }
 
-            // If listenUrl not provided, preserve the existing one
-            if (listenUrl == null)
+            // If relayUrl not provided, preserve the existing one
+            if (relayUrl == null)
             {
-                listenUrl = LoadListenUrl();
+                relayUrl = LoadRelayUrl();
+            }
+
+            // If stationKey not provided, preserve the existing one
+            if (stationKey == null)
+            {
+                stationKey = LoadStationKey();
             }
 
             var sb = new StringBuilder();
             sb.Append("{");
             sb.Append("\"stationName\":");
             sb.Append(EscapeJsonString(stationName));
-            sb.Append(",\"listenUrl\":");
-            sb.Append(EscapeJsonString(listenUrl));
+            sb.Append(",\"relayUrl\":");
+            sb.Append(EscapeJsonString(relayUrl));
+            sb.Append(",\"stationKey\":");
+            sb.Append(EscapeJsonString(stationKey));
             sb.Append(",\"accounts\":[");
 
             for (int i = 0; i < accounts.Count; i++)
@@ -2344,14 +1934,16 @@ public class PartylineConfigForm : Form
     private SettingsManager _settingsManager;
     private List<CoHostAccount> _accounts;
     private string _stationName;
-    private string _listenUrl;
+    private string _relayUrl;
+    private string _stationKey;
     private DataGridView _grid;
     private Panel _editPanel;
     private TextBox _txtUsername;
     private TextBox _txtPassword;
     private TextBox _txtDisplayName;
     private TextBox _txtStationName;
-    private TextBox _txtListenUrl;
+    private TextBox _txtRelayUrl;
+    private TextBox _txtStationKey;
     private Button _btnSave;
     private Button _btnCancel;
     private Button _btnAdd;
@@ -2362,7 +1954,8 @@ public class PartylineConfigForm : Form
         _settingsManager = settingsManager;
         _accounts = _settingsManager.Load();
         _stationName = _settingsManager.LoadStationName();
-        _listenUrl = _settingsManager.LoadListenUrl();
+        _relayUrl = _settingsManager.LoadRelayUrl();
+        _stationKey = _settingsManager.LoadStationKey();
         _editingIndex = -1;
         InitializeFormComponents();
         LoadGrid();
@@ -2372,58 +1965,32 @@ public class PartylineConfigForm : Form
     {
         Text = "Partyline Co-Host Configuration";
         Width = 550;
-        Height = 560;
+        Height = 620;
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
 
-        // Station Name field at top
-        Label lblStation = new Label();
-        lblStation.Text = "Station Name:";
-        lblStation.Location = new System.Drawing.Point(12, 12);
-        lblStation.AutoSize = true;
-        lblStation.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
-        Controls.Add(lblStation);
-
-        _txtStationName = new TextBox();
-        _txtStationName.Location = new System.Drawing.Point(120, 10);
-        _txtStationName.Size = new System.Drawing.Size(300, 22);
-        _txtStationName.Text = _stationName;
-        Controls.Add(_txtStationName);
-
-        // Listen URL field
-        Label lblListenUrl = new Label();
-        lblListenUrl.Text = "Listen URL:";
-        lblListenUrl.Location = new System.Drawing.Point(12, 40);
-        lblListenUrl.AutoSize = true;
-        lblListenUrl.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
-        Controls.Add(lblListenUrl);
-
-        _txtListenUrl = new TextBox();
-        _txtListenUrl.Location = new System.Drawing.Point(120, 38);
-        _txtListenUrl.Size = new System.Drawing.Size(300, 22);
-        _txtListenUrl.Text = _listenUrl;
-        Controls.Add(_txtListenUrl);
-
-        Label lblListenHint = new Label();
-        lblListenHint.Text = "(Icecast/Shoutcast stream URL for co-hosts to hear the mix)";
-        lblListenHint.Location = new System.Drawing.Point(120, 62);
-        lblListenHint.AutoSize = true;
-        lblListenHint.ForeColor = System.Drawing.SystemColors.GrayText;
-        lblListenHint.Font = new System.Drawing.Font("Segoe UI", 7.5f);
-        Controls.Add(lblListenHint);
+        // Co-host accounts are the ONLY user-configurable settings. The signaling
+        // server is hardcoded and the room identity is auto-generated, so there is
+        // no station name, URL, or room-password field here.
+        Label lblIntro = new Label();
+        lblIntro.Text = "Add a co-host below and set their password. Use the Copy button to send each co-host their personal join link.";
+        lblIntro.Location = new System.Drawing.Point(12, 12);
+        lblIntro.Size = new System.Drawing.Size(510, 32);
+        lblIntro.ForeColor = System.Drawing.SystemColors.GrayText;
+        Controls.Add(lblIntro);
 
         Label lblTitle = new Label();
         lblTitle.Text = "Co-Host Accounts:";
-        lblTitle.Location = new System.Drawing.Point(12, 82);
+        lblTitle.Location = new System.Drawing.Point(12, 48);
         lblTitle.AutoSize = true;
         lblTitle.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
         Controls.Add(lblTitle);
 
         // DataGridView for account list
         _grid = new DataGridView();
-        _grid.Location = new System.Drawing.Point(12, 104);
+        _grid.Location = new System.Drawing.Point(12, 70);
         _grid.Size = new System.Drawing.Size(510, 200);
         _grid.AllowUserToAddRows = false;
         _grid.AllowUserToDeleteRows = false;
@@ -2483,14 +2050,14 @@ public class PartylineConfigForm : Form
         // Add button
         _btnAdd = new Button();
         _btnAdd.Text = "+ Add Co-Host";
-        _btnAdd.Location = new System.Drawing.Point(12, 312);
+        _btnAdd.Location = new System.Drawing.Point(12, 354);
         _btnAdd.Size = new System.Drawing.Size(120, 28);
         _btnAdd.Click += OnAddClick;
         Controls.Add(_btnAdd);
 
         // Edit panel
         _editPanel = new Panel();
-        _editPanel.Location = new System.Drawing.Point(12, 348);
+        _editPanel.Location = new System.Drawing.Point(12, 390);
         _editPanel.Size = new System.Drawing.Size(510, 150);
         _editPanel.Visible = false;
 
@@ -2572,14 +2139,10 @@ public class PartylineConfigForm : Form
 
     private void OnSaveCloseClick(object sender, EventArgs e)
     {
-        string stationName = _txtStationName.Text.Trim();
-        if (!string.IsNullOrEmpty(stationName))
-        {
-            _stationName = stationName;
-        }
-        string listenUrl = _txtListenUrl.Text.Trim();
-        _listenUrl = listenUrl;
-        _settingsManager.Save(_accounts, _stationName, _listenUrl);
+        // Co-host accounts are the only configurable settings. The signaling URL is
+        // hardcoded and the room identity is auto-generated, so there is nothing
+        // else to validate or persist here.
+        _settingsManager.Save(_accounts);
         DialogResult = DialogResult.OK;
         Close();
     }
@@ -2590,17 +2153,34 @@ public class PartylineConfigForm : Form
         Close();
     }
 
+    // Builds the co-host join URL for the new Cloudflare room console:
+    //   <worker-origin>/room/<slug>?invite=<hash>
+    // The origin and slug are derived with the SAME logic the running plugin uses
+    // (NewPlugin.DeriveMeshBaseUrl / DeriveRoomSlug) so the link always points at
+    // the room the plugin actually joins. Returns "" if no signaling URL or slug
+    // can be derived (e.g. blank config) so the grid shows an empty cell rather
+    // than a broken link.
+    private string BuildJoinUrl(CoHostAccount acct)
+    {
+        string origin = "https://signalling.compressed.stream";
+        string slug = _settingsManager.LoadRoomId();
+        if (string.IsNullOrEmpty(slug)) return "";
+
+        string url = origin + "/room/" + slug;
+        if (acct != null && !string.IsNullOrEmpty(acct.Hash))
+        {
+            url += "?invite=" + acct.Hash;
+        }
+        return url;
+    }
+
     private void LoadGrid()
     {
         _grid.Rows.Clear();
         for (int i = 0; i < _accounts.Count; i++)
         {
             CoHostAccount acct = _accounts[i];
-            string joinUrl = "";
-            if (!string.IsNullOrEmpty(acct.Hash))
-            {
-                joinUrl = "/partyline/join#" + acct.Hash;
-            }
+            string joinUrl = BuildJoinUrl(acct);
             _grid.Rows.Add(acct.Username, acct.DisplayName, joinUrl);
         }
     }
@@ -2618,11 +2198,15 @@ public class PartylineConfigForm : Form
             if (e.RowIndex >= 0 && e.RowIndex < _accounts.Count)
             {
                 CoHostAccount acct = _accounts[e.RowIndex];
-                if (!string.IsNullOrEmpty(acct.Hash))
+                string fullUrl = BuildJoinUrl(acct);
+                if (!string.IsNullOrEmpty(fullUrl))
                 {
-                    string fullUrl = "/partyline/join#" + acct.Hash;
                     Clipboard.SetText(fullUrl);
                     MessageBox.Show("Join URL copied to clipboard.", "Partyline", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else
+                {
+                    MessageBox.Show("Set the Signaling Server URL and Station Key/Name first to generate a join link.", "Partyline", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
             }
         }
@@ -2739,7 +2323,8 @@ public class PartylineControlPanel : UserControl
     private ToolTip _toolTip;
     private SettingsManager _settingsManager;
     private int _pulseCounter;
-
+    private Label _meshStatusLabel;
+    private Button _micButton;
     public PartylineControlPanel(AudioMixer audioMixer, AuthenticationManager authManager, List<CoHostAccount> accounts, SettingsManager settingsManager)
     {
         _audioMixer = audioMixer;
@@ -2799,6 +2384,36 @@ public class PartylineControlPanel : UserControl
         configBtn.Click += OnConfigureClick;
         titlePanel.Controls.Add(configBtn);
         _toolTip.SetToolTip(configBtn, "Configure co-host accounts");
+
+        // Mesh status indicator (pill label, docked right of config button).
+        // Repointed from the former relay-status pill to the WebRTC mesh transport.
+        _meshStatusLabel = new Label();
+        _meshStatusLabel.Text = "Mesh";
+        _meshStatusLabel.Font = new System.Drawing.Font("Segoe UI", 7f, System.Drawing.FontStyle.Bold);
+        _meshStatusLabel.Size = new System.Drawing.Size(70, 18);
+        _meshStatusLabel.Dock = DockStyle.Right;
+        _meshStatusLabel.TextAlign = System.Drawing.ContentAlignment.MiddleCenter;
+        _meshStatusLabel.Padding = new Padding(2, 3, 2, 0);
+        _meshStatusLabel.ForeColor = System.Drawing.Color.Gray;
+        _meshStatusLabel.BackColor = System.Drawing.Color.FromArgb(50, 50, 55);
+        titlePanel.Controls.Add(_meshStatusLabel);
+        _toolTip.SetToolTip(_meshStatusLabel, "WebRTC mesh connection status");
+
+        // Latching Mic toggle (task 5.6) — replaces any push-to-talk control. Each
+        // click flips the plugin's outbound mic state via NewPlugin (sets the gate the
+        // AudioPumpLoop checks and broadcasts mic-state). Never momentary, never
+        // always-open. Label/color reflect on-air vs muted (Req 7.3-7.8).
+        _micButton = new Button();
+        _micButton.FlatStyle = FlatStyle.Flat;
+        _micButton.Size = new System.Drawing.Size(96, 22);
+        _micButton.Dock = DockStyle.Right;
+        _micButton.Font = new System.Drawing.Font("Segoe UI", 8f, System.Drawing.FontStyle.Bold);
+        _micButton.FlatAppearance.BorderSize = 0;
+        _micButton.Cursor = Cursors.Hand;
+        _micButton.Click += OnMicToggleClick;
+        titlePanel.Controls.Add(_micButton);
+        _toolTip.SetToolTip(_micButton, "Toggle your microphone on/off air");
+        UpdateMicButton(NewPlugin.IsMicOn);
 
         Controls.Add(titlePanel);
 
@@ -2878,7 +2493,7 @@ public class PartylineControlPanel : UserControl
         row.VuFill = vuFill;
         row.VuOuter = vuOuter;
 
-        // Combined latency + IP label (single line: "45ms | 192.168.1.5")
+        // Combined latency + IP label
         Label latencyLabel = new Label();
         latencyLabel.Text = "";
         latencyLabel.ForeColor = System.Drawing.Color.White;
@@ -2995,6 +2610,46 @@ public class PartylineControlPanel : UserControl
         form.ShowDialog();
     }
 
+    /// <summary>
+    /// Latching Mic toggle handler (task 5.6). Reads the current outbound mic state,
+    /// flips it, and pushes the new state to the plugin via
+    /// <see cref="NewPlugin.RequestMicToggle"/> (which sets the AudioPumpLoop gate and
+    /// broadcasts mic-state). Then repaints the button to the on-air/muted style. There
+    /// is no mouse-down/mouse-up (momentary) behavior and no always-open mode
+    /// (Req 7.4, 7.5, 7.6).
+    /// </summary>
+    private void OnMicToggleClick(object sender, EventArgs e)
+    {
+        bool next = !NewPlugin.IsMicOn;
+        NewPlugin.RequestMicToggle(next);
+        UpdateMicButton(NewPlugin.IsMicOn);
+    }
+
+    /// <summary>
+    /// Paints the Mic button to reflect the plugin's outbound mic state: a red
+    /// "ON AIR" indicator while transmitting (Req 7.7) and a muted indicator while off
+    /// (Req 7.8).
+    /// </summary>
+    private void UpdateMicButton(bool on)
+    {
+        if (_micButton == null) return;
+
+        if (on)
+        {
+            // U+1F399 studio microphone + on-air, red.
+            _micButton.Text = "\uD83C\uDF99 ON AIR";
+            _micButton.ForeColor = System.Drawing.Color.White;
+            _micButton.BackColor = System.Drawing.Color.FromArgb(239, 68, 68);
+        }
+        else
+        {
+            // U+1F507 muted speaker.
+            _micButton.Text = "\uD83D\uDD07 Muted";
+            _micButton.ForeColor = System.Drawing.Color.FromArgb(200, 200, 210);
+            _micButton.BackColor = System.Drawing.Color.FromArgb(60, 60, 70);
+        }
+    }
+
     private void UpdateRowState(string cohostId)
     {
         for (int i = 0; i < _rows.Count; i++)
@@ -3049,6 +2704,37 @@ public class PartylineControlPanel : UserControl
     private void OnVuTimerTick(object sender, EventArgs e)
     {
         _pulseCounter++;
+
+        // Update mesh status indicator
+        if (_meshStatusLabel != null)
+        {
+            if (!NewPlugin.IsMeshEnabled)
+            {
+                _meshStatusLabel.Text = "No Mesh";
+                _meshStatusLabel.ForeColor = System.Drawing.Color.FromArgb(140, 140, 150);
+                _meshStatusLabel.BackColor = System.Drawing.Color.FromArgb(50, 50, 55);
+            }
+            else if (NewPlugin.IsMeshConnected)
+            {
+                _meshStatusLabel.Text = "\u25CF Mesh";
+                _meshStatusLabel.ForeColor = System.Drawing.Color.FromArgb(34, 197, 94);
+                _meshStatusLabel.BackColor = System.Drawing.Color.FromArgb(20, 50, 30);
+            }
+            else
+            {
+                _meshStatusLabel.Text = "\u2716 Mesh";
+                _meshStatusLabel.ForeColor = System.Drawing.Color.FromArgb(239, 68, 68);
+                _meshStatusLabel.BackColor = System.Drawing.Color.FromArgb(60, 30, 30);
+            }
+        }
+
+        // Keep the Mic button in sync with the plugin's outbound mic state so the
+        // on-air/muted indicator stays correct if state changes outside a click.
+        if (_micButton != null)
+        {
+            UpdateMicButton(NewPlugin.IsMicOn);
+        }
+
         for (int i = 0; i < _rows.Count; i++)
         {
             CoHostRow row = _rows[i];
@@ -3073,7 +2759,7 @@ public class PartylineControlPanel : UserControl
             }
 
             // Update connected indicator pill (based on active session, not audio)
-            bool connected = _authManager.HasActiveSession(row.CohostId);
+            bool connected = _authManager.HasActiveSession(row.CohostId) || _authManager.HasAnyActiveSession();
             if (connected)
             {
                 row.ConnectedIndicator.Text = "Connected";
@@ -3207,3 +2893,2252 @@ internal class CoHostRow
         set { _latencyLabel = value; }
     }
 }
+
+// =============================================================================
+// WebRTC mesh layer (Requirements 5.1, 6.4)
+//
+// This is the new co-host audio transport that replaces the WebSocket raw-PCM
+// relay. The actual libwebrtc binding is hidden behind IWebRtcPeer so the
+// MR-WebRTC primary adapter (task 5.2) and the SIPSorcery fallback adapter
+// (task 5.3) can be swapped without touching the signaling client.
+//
+// NOTE: The deprecated WebSocket raw-PCM relay (RelaySignalingClient /
+// AudioStreamLoop / OnRelayBinaryReceived) was removed in task 5.7; this mesh
+// transport replaces it end to end.
+// =============================================================================
+
+/// <summary>
+/// A single ICE server entry returned by GET /api/rtc-config/:slug.
+/// </summary>
+public class WebRtcIceServer
+{
+    public string[] Urls;
+    public string Username;
+    public string Credential;
+}
+
+/// <summary>
+/// Abstraction over the underlying libwebrtc-based binding. One implementation
+/// wraps Microsoft.MixedReality.WebRTC (primary, task 5.2); another wraps
+/// SIPSorcery + Concentus (fallback, task 5.3). The signaling client
+/// (WebRtcMeshClient) drives an instance of this interface and never depends on
+/// the concrete binding types.
+///
+/// All audio is mono Opus on the wire; PCM is exchanged across this boundary as
+/// PCM16 (short[]) and the binding performs the Opus encode/decode.
+/// </summary>
+public interface IWebRtcPeer
+{
+    // --- ICE configuration ---
+
+    /// <summary>Apply the ICE servers fetched from /api/rtc-config/:slug.</summary>
+    void SetIceServers(WebRtcIceServer[] iceServers);
+
+    // --- Connection lifecycle (one RTCPeerConnection per remote peerId) ---
+
+    /// <summary>Create (or reuse) the peer connection to the given remote peer.</summary>
+    void CreatePeerConnection(string peerId);
+
+    /// <summary>Close and dispose the connection to a single remote peer.</summary>
+    void ClosePeerConnection(string peerId);
+
+    /// <summary>Close every peer connection (used on shutdown).</summary>
+    void CloseAll();
+
+    // --- SDP negotiation ---
+
+    /// <summary>Create an SDP offer for a remote peer. Returns the SDP text.</summary>
+    string CreateOffer(string peerId);
+
+    /// <summary>Create an SDP answer for a remote peer after a remote offer was applied.</summary>
+    string CreateAnswer(string peerId);
+
+    /// <summary>Apply a remote SDP description. <paramref name="type"/> is "offer" or "answer".</summary>
+    void ApplyRemoteDescription(string peerId, string type, string sdp);
+
+    // --- Trickle ICE ---
+
+    /// <summary>Apply a remote ICE candidate (raw RTCIceCandidateInit JSON).</summary>
+    void AddIceCandidate(string peerId, string candidateJson);
+
+    // --- Outbound audio ---
+
+    /// <summary>
+    /// Feed one frame of the external outbound audio source (the BASS main-mix tap).
+    /// PCM is mono/stereo PCM16 at <paramref name="sampleRate"/>; the binding encodes
+    /// it to mono Opus and transmits to every connected peer. The same source is
+    /// shared across all peer connections so encode happens once.
+    /// </summary>
+    void PushOutboundAudio(short[] pcm, int sampleCount, int sampleRate, int channels);
+
+    // --- Callbacks (Action delegates for C# 5 compatibility) ---
+
+    /// <summary>(peerId, candidateJson) raised when the binding discovers a local ICE candidate.</summary>
+    Action<string, string> OnLocalIceCandidate { get; set; }
+
+    /// <summary>(peerId, pcm, sampleCount, sampleRate) raised with decoded remote PCM16, per remote peer.</summary>
+    Action<string, short[], int, int> OnRemoteAudioFrame { get; set; }
+
+    /// <summary>(peerId, state) raised on connection-state transitions, e.g. "failed" for Req 1.5.</summary>
+    Action<string, string> OnConnectionStateChanged { get; set; }
+}
+
+/// <summary>
+/// Placeholder no-op IWebRtcPeer so the signaling client compiles and can be
+/// wired before the real adapters land. Replaced by the MR-WebRTC adapter
+/// (task 5.2) and the SIPSorcery fallback (task 5.3). DO NOT ship as the
+/// runtime peer -- it carries no media.
+/// </summary>
+public class NoOpWebRtcPeer : IWebRtcPeer
+{
+    public Action<string, string> OnLocalIceCandidate { get; set; }
+    public Action<string, short[], int, int> OnRemoteAudioFrame { get; set; }
+    public Action<string, string> OnConnectionStateChanged { get; set; }
+
+    public void SetIceServers(WebRtcIceServer[] iceServers) { }
+    public void CreatePeerConnection(string peerId) { }
+    public void ClosePeerConnection(string peerId) { }
+    public void CloseAll() { }
+    public string CreateOffer(string peerId) { return null; }
+    public string CreateAnswer(string peerId) { return null; }
+    public void ApplyRemoteDescription(string peerId, string type, string sdp) { }
+    public void AddIceCandidate(string peerId, string candidateJson) { }
+    public void PushOutboundAudio(short[] pcm, int sampleCount, int sampleRate, int channels) { }
+}
+
+/// <summary>
+/// Signaling client for the WebRTC mesh. Speaks ONLY plain HTTPS (no WebSocket,
+/// per Requirement 6):
+///   * GET  /api/rtc-config/:slug         -> ICE servers (fetched at join)
+///   * GET  /api/telemetry/stream/:slug   -> SSE; parse "signal" events for peerId "plugin"
+///   * POST /api/signal/:slug             -> publish offer/answer/ice + join/leave/mic-state
+///
+/// It drives an IWebRtcPeer instance: applies remote SDP/ICE, requests offers
+/// and answers, and forwards locally-discovered ICE candidates. Mirrors the
+/// existing RelaySignalingClient patterns (TLS 1.2 enablement, background
+/// reconnect loop with exponential backoff, CancellationToken usage, and the
+/// same lightweight JSON helpers / Log() style).
+/// </summary>
+public class WebRtcMeshClient
+{
+    private readonly string _baseUrl;     // e.g. https://partyline.example.com
+    private readonly string _slug;        // room slug
+    private readonly string _peerId;      // "plugin"
+    private readonly string _role;        // "plugin"
+    private readonly IWebRtcPeer _peer;
+
+    // Room password used to authenticate as the DJ to POST /api/plugin/auth and
+    // obtain a signaling session token. The co-host accounts are published as
+    // room invites once, right after auth, so browser co-hosts are authorized by
+    // the plugin's local account list.
+    private readonly string _password;
+    private readonly List<CoHostAccount> _accounts;
+    private string _token;                // bearer session token (role 'dj')
+    private volatile bool _invitesPublished;
+
+    private HttpClient _httpClient;       // short requests (config + POST signal)
+    private HttpClient _streamClient;     // long-lived SSE read (infinite timeout)
+
+    private Thread _reconnectThread;
+    private volatile bool _running;
+    private volatile bool _connected;
+    private volatile bool _micOn;
+    private int _reconnectDelay = 1000;
+    private CancellationTokenSource _cts;
+
+    // Remote peers we have observed in the room (keyed by peerId).
+    private readonly ConcurrentDictionary<string, byte> _knownPeers = new ConcurrentDictionary<string, byte>();
+
+    public bool IsConnected
+    {
+        get { return _connected; }
+    }
+
+    public WebRtcMeshClient(string baseUrl, string slug, string peerId, IWebRtcPeer peer)
+        : this(baseUrl, slug, peerId, peer, null, null)
+    {
+    }
+
+    public WebRtcMeshClient(string baseUrl, string slug, string peerId, IWebRtcPeer peer, string password, List<CoHostAccount> accounts)
+    {
+        _baseUrl = baseUrl != null ? baseUrl : "";
+        _slug = slug != null ? slug : "";
+        _peerId = (peerId != null && peerId.Length > 0) ? peerId : "plugin";
+        _role = "plugin";
+        _peer = peer;
+        _password = password != null ? password : "";
+        _accounts = accounts;
+    }
+
+    public void Start(CancellationToken ct)
+    {
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _running = true;
+
+        if (_peer != null)
+        {
+            // Forward locally-discovered ICE candidates to the addressed peer.
+            _peer.OnLocalIceCandidate = OnPeerIceCandidate;
+        }
+
+        _reconnectThread = new Thread(ReconnectLoop);
+        _reconnectThread.IsBackground = true;
+        _reconnectThread.Name = "WebRtcMeshSignaling";
+        _reconnectThread.Start();
+    }
+
+    public void Stop()
+    {
+        _running = false;
+        try
+        {
+            // Best-effort leave so the roster prunes us promptly.
+            PostSignal("leave", null, "\"role\":\"" + EscapeJson(_role) + "\"");
+        }
+        catch { }
+
+        if (_cts != null)
+        {
+            _cts.Cancel();
+        }
+
+        if (_peer != null)
+        {
+            try { _peer.CloseAll(); }
+            catch (Exception ex) { Log("CloseAll error: " + ex.Message); }
+        }
+
+        DisposeClients();
+
+        if (_reconnectThread != null && _reconnectThread.IsAlive)
+        {
+            _reconnectThread.Join(5000);
+        }
+    }
+
+    /// <summary>Latching mic toggle. Broadcasts mic-state to the room (Req 7.3-7.8).</summary>
+    public void SetMicState(bool on)
+    {
+        _micOn = on;
+        PostSignal("mic-state", null, "\"micOn\":" + (on ? "true" : "false"));
+    }
+
+    public bool MicOn
+    {
+        get { return _micOn; }
+    }
+
+    // --- Connection loop -----------------------------------------------------
+
+    private void ReconnectLoop()
+    {
+        _reconnectDelay = 1000;
+        EnsureClients();
+
+        while (_running && !_cts.IsCancellationRequested)
+        {
+            try
+            {
+                Provision();
+                Authenticate();
+                PublishInvitesOnce();
+                FetchRtcConfig();
+                Join();
+                _connected = true;
+                _reconnectDelay = 1000; // reset on a successful (re)subscribe
+                OpenSignalStream();     // blocks until the SSE stream drops
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Log("Signaling connection lost: " + ex.Message);
+            }
+
+            _connected = false;
+            if (!_running || _cts.IsCancellationRequested) break;
+
+            Log("Reconnecting signaling in " + _reconnectDelay + "ms...");
+            try { Thread.Sleep(_reconnectDelay); }
+            catch (ThreadInterruptedException) { break; }
+
+            // Exponential backoff: 1s -> 2s -> 4s -> 8s -> 16s -> 30s cap
+            _reconnectDelay = Math.Min(_reconnectDelay * 2, 30000);
+        }
+    }
+
+    private void EnsureClients()
+    {
+        // Ensure TLS 1.2 is enabled (.NET 4.8 may default to older protocols).
+        System.Net.ServicePointManager.SecurityProtocol =
+            System.Net.ServicePointManager.SecurityProtocol | System.Net.SecurityProtocolType.Tls12;
+
+        if (_httpClient == null)
+        {
+            _httpClient = new HttpClient();
+            _httpClient.Timeout = TimeSpan.FromSeconds(15);
+        }
+        if (_streamClient == null)
+        {
+            _streamClient = new HttpClient();
+            _streamClient.Timeout = Timeout.InfiniteTimeSpan; // SSE is long-lived
+        }
+    }
+
+    private void DisposeClients()
+    {
+        try { if (_httpClient != null) _httpClient.Dispose(); } catch { }
+        try { if (_streamClient != null) _streamClient.Dispose(); } catch { }
+        _httpClient = null;
+        _streamClient = null;
+    }
+
+    // --- DJ authentication + invite publishing ------------------------------
+
+    /// <summary>
+    /// Claims/refreshes this plugin's room on the signaling server using the
+    /// private DJ key. Idempotent: creates the room on first run, and on later
+    /// startups simply re-validates and refreshes the room's lifetime. Throws on
+    /// failure so ReconnectLoop backs off and retries. A 403 here means the room
+    /// id is already claimed by a different DJ key (should never happen for a
+    /// stable install).
+    /// </summary>
+    private void Provision()
+    {
+        string url = _baseUrl.TrimEnd('/') + "/api/plugin/provision/" + Uri.EscapeDataString(_slug);
+        string body = "{\"djKey\":\"" + EscapeJson(_password) + "\"}";
+        string resp = HttpPost(url, body);
+        if (resp == null)
+        {
+            throw new Exception("Room provision failed (no response).");
+        }
+        Log("Room provisioned/claimed: " + _slug);
+    }
+
+    /// <summary>
+    /// Authenticates the plugin as the room DJ using the configured room password
+    /// and stores the returned signaling session token. The token is attached as
+    /// a Bearer header on the short-request HttpClient (covers FetchRtcConfig and
+    /// every PostSignal) and as a ?token= query param on the SSE stream URL.
+    /// Throws on failure so ReconnectLoop backs off and retries.
+    /// </summary>
+    private void Authenticate()
+    {
+        string url = _baseUrl.TrimEnd('/') + "/api/plugin/auth/" + Uri.EscapeDataString(_slug);
+        string body = "{\"password\":\"" + EscapeJson(_password) + "\"}";
+        string resp = HttpPost(url, body);
+        if (resp == null)
+        {
+            throw new Exception("Plugin auth failed (no/again-error response). Check the room password and that the room exists.");
+        }
+        string token = ExtractJsonValue(resp, "token");
+        if (token == null || token.Length == 0)
+        {
+            throw new Exception("Plugin auth returned no token.");
+        }
+        _token = token;
+        // Attach the bearer token to all subsequent short requests.
+        try
+        {
+            _httpClient.DefaultRequestHeaders.Remove("Authorization");
+            _httpClient.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", "Bearer " + token);
+        }
+        catch { }
+        Log("Plugin authenticated as DJ; signaling token acquired.");
+    }
+
+    /// <summary>
+    /// Publishes the plugin's local co-host accounts as room invites (once per
+    /// process) so browser co-hosts authenticate against the plugin's account
+    /// list. Each invite's id is the account's stable Hash, matching the join URL
+    /// the config dialog generates (.../room/&lt;slug&gt;?invite=&lt;hash&gt;).
+    /// Best-effort: logs and continues on failure (mesh still works for the DJ).
+    /// </summary>
+    private void PublishInvitesOnce()
+    {
+        if (_invitesPublished) return;
+        if (_accounts == null || _accounts.Count == 0) { _invitesPublished = true; return; }
+
+        var sb = new StringBuilder();
+        sb.Append("{\"invites\":[");
+        int n = 0;
+        for (int i = 0; i < _accounts.Count; i++)
+        {
+            CoHostAccount a = _accounts[i];
+            if (a == null || string.IsNullOrEmpty(a.Hash) || string.IsNullOrEmpty(a.Password)) continue;
+            string name = !string.IsNullOrEmpty(a.DisplayName) ? a.DisplayName : a.Username;
+            if (string.IsNullOrEmpty(name)) name = a.Hash;
+            if (n > 0) sb.Append(",");
+            sb.Append("{\"inviteId\":\"").Append(EscapeJson(a.Hash)).Append("\",");
+            sb.Append("\"name\":\"").Append(EscapeJson(name)).Append("\",");
+            sb.Append("\"password\":\"").Append(EscapeJson(a.Password)).Append("\"}");
+            n++;
+        }
+        sb.Append("]}");
+
+        if (n == 0) { _invitesPublished = true; return; }
+
+        string url = _baseUrl.TrimEnd('/') + "/api/plugin/invites/" + Uri.EscapeDataString(_slug);
+        string resp = HttpPost(url, sb.ToString());
+        if (resp != null)
+        {
+            _invitesPublished = true;
+            Log("Published " + n + " co-host invite(s) to the room.");
+        }
+        else
+        {
+            Log("WARNING: failed to publish co-host invites (will retry on reconnect).");
+        }
+    }
+
+    // --- ICE configuration ---------------------------------------------------
+
+    private void FetchRtcConfig()
+    {
+        string url = _baseUrl.TrimEnd('/') + "/api/rtc-config/" + Uri.EscapeDataString(_slug);
+        string body = HttpGet(url);
+        if (body == null)
+        {
+            Log("rtc-config fetch returned no body");
+            return;
+        }
+        WebRtcIceServer[] servers = ParseIceServers(body);
+        if (_peer != null)
+        {
+            _peer.SetIceServers(servers);
+        }
+        Log("Applied " + servers.Length + " ICE server entries");
+    }
+
+    // --- Join / roster -------------------------------------------------------
+
+    private void Join()
+    {
+        string resp = PostSignal("join", null, "\"role\":\"" + EscapeJson(_role) + "\"");
+        if (resp == null) return;
+
+        // The join response returns the current roster; offer to existing peers.
+        List<string> peerObjs = ExtractJsonArrayObjects(resp, "peers");
+        if (peerObjs.Count == 0) peerObjs = ExtractJsonArrayObjects(resp, "roster");
+
+        for (int i = 0; i < peerObjs.Count; i++)
+        {
+            string pid = ExtractJsonValue(peerObjs[i], "peerId");
+            if (pid == null || pid == _peerId) continue;
+            _knownPeers[pid] = 1;
+            if (IsInitiator(pid)) InitiateOffer(pid);
+        }
+    }
+
+    // Perfect-negotiation initiator rule: the lexicographically smaller peerId
+    // initiates the offer, so each pair negotiates exactly one connection.
+    private bool IsInitiator(string remotePeerId)
+    {
+        return string.CompareOrdinal(_peerId, remotePeerId) < 0;
+    }
+
+    private void InitiateOffer(string remotePeerId)
+    {
+        if (_peer == null) return;
+        try
+        {
+            _peer.CreatePeerConnection(remotePeerId);
+            string sdp = _peer.CreateOffer(remotePeerId);
+            if (sdp != null)
+            {
+                PostSignal("offer", remotePeerId, "\"sdp\":\"" + EscapeJson(sdp) + "\"");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("InitiateOffer error for " + remotePeerId + ": " + ex.Message);
+        }
+    }
+
+    private void OnPeerIceCandidate(string remotePeerId, string candidateJson)
+    {
+        if (candidateJson == null) return;
+        // candidateJson is already a JSON object (RTCIceCandidateInit); embed raw.
+        PostSignal("ice-candidate", remotePeerId, "\"candidate\":" + candidateJson);
+    }
+
+    // --- SSE signal stream ---------------------------------------------------
+
+    private void OpenSignalStream()
+    {
+        string url = _baseUrl.TrimEnd('/') + "/api/telemetry/stream/" + Uri.EscapeDataString(_slug)
+            + "?peerId=" + Uri.EscapeDataString(_peerId)
+            + (string.IsNullOrEmpty(_token) ? "" : "&token=" + Uri.EscapeDataString(_token));
+
+        var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.TryAddWithoutValidation("Accept", "text/event-stream");
+
+        HttpResponseMessage response = null;
+        try
+        {
+            var sendTask = _streamClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, _cts.Token);
+            sendTask.Wait(_cts.Token);
+            response = UnwrapResult(sendTask);
+            response.EnsureSuccessStatusCode();
+
+            var streamTask = response.Content.ReadAsStreamAsync();
+            streamTask.Wait(_cts.Token);
+            var stream = UnwrapResult(streamTask);
+
+            Log("Signal stream open: " + url);
+
+            using (var reader = new StreamReader(stream, Encoding.UTF8))
+            {
+                string eventName = null;
+                var dataBuffer = new StringBuilder();
+
+                while (_running && !_cts.IsCancellationRequested)
+                {
+                    string line = reader.ReadLine();
+                    if (line == null) break; // stream closed
+
+                    if (line.Length == 0)
+                    {
+                        // Blank line terminates an SSE event.
+                        if (dataBuffer.Length > 0)
+                        {
+                            DispatchSseEvent(eventName, dataBuffer.ToString());
+                        }
+                        eventName = null;
+                        dataBuffer.Length = 0;
+                        continue;
+                    }
+
+                    if (line[0] == ':') continue; // SSE comment / keep-alive
+
+                    if (line.StartsWith("event:"))
+                    {
+                        eventName = line.Substring(6).Trim();
+                    }
+                    else if (line.StartsWith("data:"))
+                    {
+                        if (dataBuffer.Length > 0) dataBuffer.Append("\n");
+                        dataBuffer.Append(line.Substring(5).Trim());
+                    }
+                }
+            }
+        }
+        finally
+        {
+            if (response != null)
+            {
+                try { response.Dispose(); } catch { }
+            }
+        }
+    }
+
+    private void DispatchSseEvent(string eventName, string data)
+    {
+        // Only signaling events drive the mesh; telemetry/chat/intercom are
+        // handled elsewhere and ignored here.
+        if (eventName != "signal") return;
+        try
+        {
+            HandleSignal(data);
+        }
+        catch (Exception ex)
+        {
+            Log("HandleSignal error: " + ex.Message);
+        }
+    }
+
+    private void HandleSignal(string json)
+    {
+        if (_peer == null || json == null) return;
+
+        string type = ExtractJsonValue(json, "type");
+        string from = ExtractJsonValue(json, "from");
+        string to = ExtractJsonValue(json, "to"); // null => broadcast
+        if (type == null) return;
+
+        // Ignore messages addressed to a different peer.
+        if (to != null && to != _peerId && to != "*") return;
+        // Never act on our own broadcasts.
+        if (from != null && from == _peerId) return;
+
+        string payload = ExtractRawJsonObject(json, "payload");
+
+        if (type == "offer")
+        {
+            string sdp = ExtractJsonValue(payload, "sdp");
+            if (from == null || sdp == null) return;
+            _knownPeers[from] = 1;
+            _peer.CreatePeerConnection(from);
+            _peer.ApplyRemoteDescription(from, "offer", sdp);
+            string answer = _peer.CreateAnswer(from);
+            if (answer != null)
+            {
+                PostSignal("answer", from, "\"sdp\":\"" + EscapeJson(answer) + "\"");
+            }
+        }
+        else if (type == "answer")
+        {
+            string sdp = ExtractJsonValue(payload, "sdp");
+            if (from == null || sdp == null) return;
+            _peer.ApplyRemoteDescription(from, "answer", sdp);
+        }
+        else if (type == "ice-candidate")
+        {
+            string candidate = ExtractRawJsonObject(payload, "candidate");
+            if (from == null || candidate == null) return;
+            _peer.AddIceCandidate(from, candidate);
+        }
+        else if (type == "join")
+        {
+            // A new peer announced itself; offer if we are the initiator.
+            if (from == null) return;
+            _knownPeers[from] = 1;
+            if (IsInitiator(from)) InitiateOffer(from);
+        }
+        else if (type == "leave")
+        {
+            if (from == null) return;
+            byte ignored;
+            _knownPeers.TryRemove(from, out ignored);
+            _peer.ClosePeerConnection(from);
+            Log("Peer left: " + from);
+        }
+        else if (type == "mic-state")
+        {
+            // On-air/muted indicators are surfaced by the UI layer; just log here.
+            string micOn = ExtractJsonValue(payload, "micOn");
+            Log("mic-state from " + (from ?? "?") + ": " + (micOn ?? "?"));
+        }
+    }
+
+    // --- HTTP helpers --------------------------------------------------------
+
+    private string PostSignal(string type, string to, string payloadInner)
+    {
+        if (_httpClient == null) EnsureClients();
+
+        var sb = new StringBuilder();
+        sb.Append("{\"type\":\"");
+        sb.Append(EscapeJson(type));
+        sb.Append("\",\"slug\":\"");
+        sb.Append(EscapeJson(_slug));
+        sb.Append("\",\"from\":\"");
+        sb.Append(EscapeJson(_peerId));
+        sb.Append("\",\"to\":");
+        if (to == null) sb.Append("null");
+        else { sb.Append("\""); sb.Append(EscapeJson(to)); sb.Append("\""); }
+        sb.Append(",\"payload\":{");
+        if (payloadInner != null) sb.Append(payloadInner);
+        sb.Append("}}");
+
+        string url = _baseUrl.TrimEnd('/') + "/api/signal/" + Uri.EscapeDataString(_slug);
+        return HttpPost(url, sb.ToString());
+    }
+
+    private string HttpGet(string url)
+    {
+        try
+        {
+            var task = _httpClient.GetAsync(url, _cts.Token);
+            task.Wait(_cts.Token);
+            var resp = UnwrapResult(task);
+            resp.EnsureSuccessStatusCode();
+            var bodyTask = resp.Content.ReadAsStringAsync();
+            bodyTask.Wait(_cts.Token);
+            return UnwrapResult(bodyTask);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Log("GET " + url + " failed: " + ex.Message);
+            return null;
+        }
+    }
+
+    private string HttpPost(string url, string jsonBody)
+    {
+        try
+        {
+            var content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
+            var task = _httpClient.PostAsync(url, content, _cts.Token);
+            task.Wait(_cts.Token);
+            var resp = UnwrapResult(task);
+            resp.EnsureSuccessStatusCode();
+            var bodyTask = resp.Content.ReadAsStringAsync();
+            bodyTask.Wait(_cts.Token);
+            return UnwrapResult(bodyTask);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Log("POST " + url + " failed: " + ex.Message);
+            return null;
+        }
+    }
+
+    // Unwrap a faulted Task<T> to its inner exception (mirrors RelaySignalingClient).
+    private static T UnwrapResult<T>(System.Threading.Tasks.Task<T> task)
+    {
+        try
+        {
+            return task.Result;
+        }
+        catch (AggregateException ae)
+        {
+            throw ae.InnerException ?? ae;
+        }
+    }
+
+    // --- JSON helpers (same lightweight style as RelaySignalingClient) -------
+
+    private string EscapeJson(string value)
+    {
+        if (value == null) return "";
+        var sb = new StringBuilder();
+        foreach (char c in value)
+        {
+            switch (c)
+            {
+                case '"': sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                default: sb.Append(c); break;
+            }
+        }
+        return sb.ToString();
+    }
+
+    private string ExtractJsonValue(string json, string key)
+    {
+        if (json == null) return null;
+        string searchKey = "\"" + key + "\"";
+        int keyIdx = json.IndexOf(searchKey);
+        if (keyIdx < 0) return null;
+
+        int colonIdx = json.IndexOf(':', keyIdx + searchKey.Length);
+        if (colonIdx < 0) return null;
+
+        int i = colonIdx + 1;
+        while (i < json.Length && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n'))
+        {
+            i++;
+        }
+        if (i >= json.Length) return null;
+
+        // String value
+        if (json[i] == '"')
+        {
+            int valueStart = i;
+            int valueEnd = valueStart + 1;
+            while (valueEnd < json.Length)
+            {
+                if (json[valueEnd] == '"' && json[valueEnd - 1] != '\\')
+                    break;
+                valueEnd++;
+            }
+            if (valueEnd >= json.Length) return null;
+            return json.Substring(valueStart + 1, valueEnd - valueStart - 1)
+                .Replace("\\\"", "\"")
+                .Replace("\\\\", "\\")
+                .Replace("\\n", "\n")
+                .Replace("\\r", "\r")
+                .Replace("\\t", "\t");
+        }
+
+        // Not a scalar (array/object); callers use ExtractRawJsonObject /
+        // ExtractJsonStringArray for those.
+        if (json[i] == '[' || json[i] == '{') return null;
+
+        // Bare value (number / bool / null) up to the next delimiter.
+        int tokenEnd = i;
+        while (tokenEnd < json.Length
+               && json[tokenEnd] != ','
+               && json[tokenEnd] != '}'
+               && json[tokenEnd] != ']'
+               && json[tokenEnd] != ' '
+               && json[tokenEnd] != '\r'
+               && json[tokenEnd] != '\n'
+               && json[tokenEnd] != '\t')
+        {
+            tokenEnd++;
+        }
+        string token = json.Substring(i, tokenEnd - i);
+        if (token == "null" || token.Length == 0) return null;
+        return token;
+    }
+
+    /// <summary>
+    /// Returns the raw JSON object (including braces) assigned to <paramref name="key"/>,
+    /// or null if the key is missing or its value is not an object.
+    /// </summary>
+    private string ExtractRawJsonObject(string json, string key)
+    {
+        if (json == null) return null;
+        string searchKey = "\"" + key + "\"";
+        int keyIdx = json.IndexOf(searchKey);
+        if (keyIdx < 0) return null;
+
+        int colonIdx = json.IndexOf(':', keyIdx + searchKey.Length);
+        if (colonIdx < 0) return null;
+
+        int braceIdx = json.IndexOf('{', colonIdx);
+        if (braceIdx < 0) return null;
+
+        int depth = 1;
+        int end = braceIdx + 1;
+        while (end < json.Length && depth > 0)
+        {
+            if (json[end] == '{') depth++;
+            else if (json[end] == '}') depth--;
+            end++;
+        }
+        if (depth != 0) return null;
+        return json.Substring(braceIdx, end - braceIdx);
+    }
+
+    /// <summary>
+    /// Returns each top-level JSON object (including braces) found inside the array
+    /// assigned to <paramref name="key"/>. Empty list if missing.
+    /// </summary>
+    private List<string> ExtractJsonArrayObjects(string json, string key)
+    {
+        var result = new List<string>();
+        if (json == null) return result;
+
+        string searchKey = "\"" + key + "\"";
+        int keyIdx = json.IndexOf(searchKey);
+        if (keyIdx < 0) return result;
+
+        int colonIdx = json.IndexOf(':', keyIdx + searchKey.Length);
+        if (colonIdx < 0) return result;
+
+        int bracketIdx = json.IndexOf('[', colonIdx);
+        if (bracketIdx < 0) return result;
+
+        int i = bracketIdx + 1;
+        while (i < json.Length && json[i] != ']')
+        {
+            if (json[i] == '{')
+            {
+                int depth = 1;
+                int start = i;
+                int end = i + 1;
+                while (end < json.Length && depth > 0)
+                {
+                    if (json[end] == '{') depth++;
+                    else if (json[end] == '}') depth--;
+                    end++;
+                }
+                if (depth != 0) break;
+                result.Add(json.Substring(start, end - start));
+                i = end;
+            }
+            else
+            {
+                i++;
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Returns the quoted strings inside the array assigned to <paramref name="key"/>.
+    /// Empty array if missing.
+    /// </summary>
+    private string[] ExtractJsonStringArray(string json, string key)
+    {
+        var result = new List<string>();
+        if (json == null) return result.ToArray();
+
+        string searchKey = "\"" + key + "\"";
+        int keyIdx = json.IndexOf(searchKey);
+        if (keyIdx < 0) return result.ToArray();
+
+        int colonIdx = json.IndexOf(':', keyIdx + searchKey.Length);
+        if (colonIdx < 0) return result.ToArray();
+
+        int bracketIdx = json.IndexOf('[', colonIdx);
+        if (bracketIdx < 0) return result.ToArray();
+
+        int i = bracketIdx + 1;
+        while (i < json.Length && json[i] != ']')
+        {
+            if (json[i] == '"')
+            {
+                int valueStart = i;
+                int valueEnd = valueStart + 1;
+                while (valueEnd < json.Length)
+                {
+                    if (json[valueEnd] == '"' && json[valueEnd - 1] != '\\')
+                        break;
+                    valueEnd++;
+                }
+                if (valueEnd >= json.Length) break;
+                result.Add(json.Substring(valueStart + 1, valueEnd - valueStart - 1));
+                i = valueEnd + 1;
+            }
+            else
+            {
+                i++;
+            }
+        }
+        return result.ToArray();
+    }
+
+    private WebRtcIceServer[] ParseIceServers(string json)
+    {
+        var servers = new List<WebRtcIceServer>();
+        List<string> objs = ExtractJsonArrayObjects(json, "iceServers");
+        for (int i = 0; i < objs.Count; i++)
+        {
+            string obj = objs[i];
+            var server = new WebRtcIceServer();
+
+            // "urls" may be a single string or an array of strings.
+            string single = ExtractJsonValue(obj, "urls");
+            if (single != null)
+            {
+                server.Urls = new string[] { single };
+            }
+            else
+            {
+                server.Urls = ExtractJsonStringArray(obj, "urls");
+            }
+
+            server.Username = ExtractJsonValue(obj, "username");
+            server.Credential = ExtractJsonValue(obj, "credential");
+            servers.Add(server);
+        }
+        return servers.ToArray();
+    }
+
+    private static void Log(string message)
+    {
+        NewPlugin.LogStatic("[WebRtcMesh] " + message);
+    }
+}
+
+// =============================================================================
+// ====================  MR-WEBRTC PRIMARY ADAPTER (task 5.2)  =================
+// =============================================================================
+// Everything between this banner and the matching "END MR-WEBRTC" banner was
+// added by task 5.2 (the Microsoft.MixedReality.WebRTC primary IWebRtcPeer
+// adapter over Google libwebrtc). It is self-contained so the SIPSorcery +
+// Concentus fallback adapter (task 5.3) can be added alongside it without
+// merge conflicts. The deprecated WebSocket raw-PCM relay was removed in
+// task 5.7.
+//
+// Build / packaging notes (Requirements 5.1, 5.2, 5.3, 5.4):
+//   * NuGet: Microsoft.MixedReality.WebRTC, pinned to 2.0.2 (last published
+//     release; the project is archived/read-only since 2022, so the version is
+//     pinned and the native binaries are vendored rather than tracked).
+//   * The managed assembly loads as a normal .NET 4.6.2+ assembly inside the
+//     PlayIt Live WinForms host. The native engine ships as mrwebrtc.dll, one
+//     per architecture (win-x86 / win-x64). The vendored mrwebrtc.dll MUST match
+//     the PlayIt Live host process bitness, exactly as bass.dll already does.
+//   * Opus is configured *inside* libwebrtc: the engine offers/answers Opus in
+//     the SDP and performs the encode/decode. We only ever hand it mono PCM16
+//     (channelCount = 1) on the outbound external source and downmix decoded
+//     remote frames to mono, so the wire format stays mono Opus speech audio.
+//
+// Conditional compilation:
+//   The adapter that references Microsoft.MixedReality.WebRTC types is wrapped
+//   in "#if PARTYLINE_MRWEBRTC". That symbol is OFF by default (see
+//   PartylinePlugin.csproj -> PartylineMrWebRtc). With it off, the language
+//   server / Roslyn never sees the MR-WebRTC types, so diagnostics on the rest
+//   of this file stay clean on machines that cannot restore the native package
+//   (e.g. the macOS dev box). Build the primary adapter on Windows with:
+//       dotnet build -p:PartylineMrWebRtc=true
+//   which both defines PARTYLINE_MRWEBRTC and pulls in the NuGet package.
+//
+//   NOTE: enabling PARTYLINE_MRWEBRTC requires an MR-WebRTC build whose managed
+//   assembly + native mrwebrtc.dll expose the external *audio* track source
+//   (ExternalAudioTrackSource). This is the push-PCM source the BASS bridge
+//   feeds; if a given vendored build lacks it, use the SIPSorcery fallback
+//   (task 5.3) instead, selected at startup via MixedRealityWebRtcLoader below.
+// =============================================================================
+
+/// <summary>
+/// Native load + bitness assertion for mrwebrtc.dll. Intentionally carries NO
+/// Microsoft.MixedReality.WebRTC type dependencies, so it compiles and runs
+/// regardless of the PARTYLINE_MRWEBRTC build symbol. Startup / fallback wiring
+/// (task 5.4) calls <see cref="TryLoad()"/> (or reads <see cref="IsAvailable"/>)
+/// to decide whether to construct the MR-WebRTC primary adapter or fall back to
+/// the SIPSorcery adapter (Requirement 5.1 fallback path).
+/// </summary>
+public static class MixedRealityWebRtcLoader
+{
+    private const string NativeBaseName = "mrwebrtc";
+
+    private static readonly object _lock = new object();
+    private static bool _probed;
+    private static bool _available;
+
+    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr LoadLibrary(string fileName);
+
+    /// <summary>True once the native engine has been located, verified for
+    /// bitness, and loaded. Probes lazily on first access.</summary>
+    public static bool IsAvailable
+    {
+        get
+        {
+            lock (_lock)
+            {
+                if (!_probed) TryLoadInternal(null);
+                return _available;
+            }
+        }
+    }
+
+    /// <summary>Probe + load mrwebrtc.dll from the default search locations.</summary>
+    public static bool TryLoad()
+    {
+        return TryLoad(null);
+    }
+
+    /// <summary>
+    /// Probe + load mrwebrtc.dll, optionally from an explicit directory. Verifies
+    /// the native DLL architecture matches Environment.Is64BitProcess and logs
+    /// the outcome via NewPlugin.LogStatic. Returns false (rather than throwing)
+    /// so the caller can fall back to the managed SIPSorcery adapter.
+    /// </summary>
+    public static bool TryLoad(string nativeDir)
+    {
+        lock (_lock)
+        {
+            return TryLoadInternal(nativeDir);
+        }
+    }
+
+    private static bool TryLoadInternal(string nativeDir)
+    {
+        _probed = true;
+        _available = false;
+        try
+        {
+            string arch = Environment.Is64BitProcess ? "x64" : "x86";
+            string dllName = NativeBaseName + ".dll";
+            string path = ResolveDllPath(nativeDir, dllName, arch);
+            if (path == null)
+            {
+                NewPlugin.LogStatic("[MRWebRTC] " + dllName + " not found for host arch " + arch + "; falling back.");
+                return false;
+            }
+
+            // Bitness assertion: the native engine MUST match the host process,
+            // the same constraint bass.dll already has.
+            ushort machine;
+            if (TryReadPeMachine(path, out machine))
+            {
+                bool dll64 = (machine == 0x8664 || machine == 0xAA64); // AMD64 / ARM64
+                bool dll32 = (machine == 0x014C);                      // I386
+                bool hostMatches = Environment.Is64BitProcess ? dll64 : dll32;
+                if (!hostMatches)
+                {
+                    NewPlugin.LogStatic("[MRWebRTC] BITNESS MISMATCH: host is "
+                        + (Environment.Is64BitProcess ? "64-bit" : "32-bit")
+                        + " but " + path + " reports machine=0x" + machine.ToString("X4")
+                        + "; falling back.");
+                    return false;
+                }
+            }
+            else
+            {
+                NewPlugin.LogStatic("[MRWebRTC] WARNING: could not read PE header of " + path + "; attempting load anyway.");
+            }
+
+            IntPtr handle = LoadLibrary(path);
+            if (handle == IntPtr.Zero)
+            {
+                int err = Marshal.GetLastWin32Error();
+                NewPlugin.LogStatic("[MRWebRTC] LoadLibrary failed for " + path + " (win32=" + err + "); falling back.");
+                return false;
+            }
+
+            NewPlugin.LogStatic("[MRWebRTC] Loaded native engine " + path + " (host " + arch + ").");
+            _available = true;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            NewPlugin.LogStatic("[MRWebRTC] TryLoad error: " + ex.Message + "; falling back.");
+            return false;
+        }
+    }
+
+    private static string ResolveDllPath(string nativeDir, string dllName, string arch)
+    {
+        var candidates = new List<string>();
+        string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+        if (baseDir == null) baseDir = "";
+
+        if (nativeDir != null && nativeDir.Length > 0)
+        {
+            candidates.Add(Path.Combine(nativeDir, dllName));
+            candidates.Add(Path.Combine(Path.Combine(nativeDir, arch), dllName));
+        }
+        candidates.Add(Path.Combine(baseDir, dllName));
+        candidates.Add(Path.Combine(Path.Combine(baseDir, arch), dllName));
+        // NuGet runtimes layout: runtimes/win-x64/native/mrwebrtc.dll
+        candidates.Add(Path.Combine(baseDir, Path.Combine("runtimes", Path.Combine("win-" + arch, Path.Combine("native", dllName)))));
+
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            try
+            {
+                if (File.Exists(candidates[i])) return candidates[i];
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    // Reads the COFF "machine" field from a PE/DLL file. Returns false if the
+    // file is not a valid PE image.
+    private static bool TryReadPeMachine(string path, out ushort machine)
+    {
+        machine = 0;
+        try
+        {
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var br = new BinaryReader(fs))
+            {
+                if (fs.Length < 0x40) return false;
+                fs.Seek(0, SeekOrigin.Begin);
+                if (br.ReadUInt16() != 0x5A4D) return false;   // "MZ"
+                fs.Seek(0x3C, SeekOrigin.Begin);
+                int peOffset = br.ReadInt32();
+                if (peOffset <= 0 || peOffset + 6 > fs.Length) return false;
+                fs.Seek(peOffset, SeekOrigin.Begin);
+                if (br.ReadUInt32() != 0x00004550) return false; // "PE\0\0"
+                machine = br.ReadUInt16();
+                return true;
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+}
+
+#if PARTYLINE_MRWEBRTC
+namespace Partyline.WebRtc
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Runtime.InteropServices;
+    using System.Threading.Tasks;
+    using Microsoft.MixedReality.WebRTC;
+
+    /// <summary>
+    /// Primary <see cref="IWebRtcPeer"/> implementation over
+    /// Microsoft.MixedReality.WebRTC (Google libwebrtc). One PeerConnection is
+    /// maintained per remote peerId. A single shared ExternalAudioTrackSource
+    /// carries the BASS main-mix tap outbound (encoded once as mono Opus by
+    /// libwebrtc and sent to every peer); decoded remote frames are raised per
+    /// peer via OnRemoteAudioFrame for the AudioMixer ingest path.
+    ///
+    /// SDP negotiation in MR-WebRTC is event-driven (CreateOffer/CreateAnswer
+    /// complete asynchronously through LocalSdpReadytoSend). The IWebRtcPeer
+    /// contract is synchronous, so each offer/answer is bridged through a
+    /// per-peer TaskCompletionSource that the LocalSdpReadytoSend handler
+    /// completes with the SDP text.
+    /// </summary>
+    public class MixedRealityWebRtcPeer : IWebRtcPeer, IDisposable
+    {
+        private const int OutboundSampleRate = 48000;   // mono Opus capture rate
+        private const int SdpTimeoutMs = 10000;
+        private const int InitTimeoutMs = 10000;
+
+        private readonly object _sync = new object();
+        private readonly Dictionary<string, PeerEntry> _peers = new Dictionary<string, PeerEntry>();
+        private List<IceServer> _iceServers = new List<IceServer>();
+
+        // Single outbound source shared by every peer connection (encode once).
+        private ExternalAudioTrackSource _outboundSource;
+        private readonly object _ringLock = new object();
+        private short[] _ring = new short[OutboundSampleRate];   // ~1s mono ring
+        private int _ringRead;
+        private int _ringWrite;
+        private int _ringCount;
+
+        // --- IWebRtcPeer callbacks (Action delegates for C# 5 parity) --------
+        public Action<string, string> OnLocalIceCandidate { get; set; }
+        public Action<string, short[], int, int> OnRemoteAudioFrame { get; set; }
+        public Action<string, string> OnConnectionStateChanged { get; set; }
+
+        private class PeerEntry
+        {
+            public string PeerId;
+            public PeerConnection Pc;
+            public LocalAudioTrack LocalTrack;
+            public Transceiver Transceiver;
+            public RemoteAudioTrack RemoteTrack;
+            public volatile TaskCompletionSource<string> SdpReady;
+        }
+
+        // --- ICE configuration ----------------------------------------------
+
+        public void SetIceServers(WebRtcIceServer[] iceServers)
+        {
+            var list = new List<IceServer>();
+            if (iceServers != null)
+            {
+                for (int i = 0; i < iceServers.Length; i++)
+                {
+                    WebRtcIceServer s = iceServers[i];
+                    if (s == null || s.Urls == null || s.Urls.Length == 0) continue;
+                    var srv = new IceServer();
+                    srv.Urls = new List<string>(s.Urls);
+                    if (s.Username != null) srv.TurnUserName = s.Username;
+                    if (s.Credential != null) srv.TurnPassword = s.Credential;
+                    list.Add(srv);
+                }
+            }
+            lock (_sync) { _iceServers = list; }
+            NewPlugin.LogStatic("[MRWebRTC] Applied " + list.Count + " ICE server entries.");
+        }
+
+        private List<IceServer> BuildIceServers()
+        {
+            lock (_sync)
+            {
+                return _iceServers != null ? new List<IceServer>(_iceServers) : new List<IceServer>();
+            }
+        }
+
+        // --- Connection lifecycle -------------------------------------------
+
+        public void CreatePeerConnection(string peerId)
+        {
+            if (peerId == null) return;
+            lock (_sync)
+            {
+                if (_peers.ContainsKey(peerId)) return;
+            }
+
+            EnsureOutboundSource();
+
+            var pc = new PeerConnection();
+            var config = new PeerConnectionConfiguration();
+            config.IceServers = BuildIceServers();
+            // Unified Plan is required for browser interop (Chromium peers).
+            config.SdpSemantic = SdpSemantic.UnifiedPlan;
+
+            try
+            {
+                pc.InitializeAsync(config).Wait(InitTimeoutMs);
+            }
+            catch (Exception ex)
+            {
+                NewPlugin.LogStatic("[MRWebRTC] InitializeAsync failed for " + peerId + ": " + ex.Message);
+                try { pc.Dispose(); } catch { }
+                return;
+            }
+
+            var entry = new PeerEntry();
+            entry.PeerId = peerId;
+            entry.Pc = pc;
+            WirePeerEvents(entry);
+
+            try
+            {
+                // Outbound mono track from the shared external source.
+                var trackConfig = new LocalAudioTrackInitConfig();
+                trackConfig.trackName = "partyline-out";
+                LocalAudioTrack localTrack = LocalAudioTrack.CreateFromSource(_outboundSource, trackConfig);
+                entry.LocalTrack = localTrack;
+
+                var txSettings = new TransceiverInitSettings();
+                txSettings.Name = "audio-" + peerId;
+                txSettings.InitialDesiredDirection = Transceiver.Direction.SendReceive;
+                Transceiver tx = pc.AddTransceiver(MediaKind.Audio, txSettings);
+                tx.LocalAudioTrack = localTrack;
+                entry.Transceiver = tx;
+            }
+            catch (Exception ex)
+            {
+                NewPlugin.LogStatic("[MRWebRTC] track setup failed for " + peerId + ": " + ex.Message);
+            }
+
+            lock (_sync)
+            {
+                if (_peers.ContainsKey(peerId))
+                {
+                    // Lost a race; dispose the duplicate.
+                    DisposeEntry(entry);
+                    return;
+                }
+                _peers[peerId] = entry;
+            }
+            NewPlugin.LogStatic("[MRWebRTC] PeerConnection created for " + peerId);
+        }
+
+        public void ClosePeerConnection(string peerId)
+        {
+            PeerEntry e;
+            lock (_sync)
+            {
+                if (peerId == null || !_peers.TryGetValue(peerId, out e)) return;
+                _peers.Remove(peerId);
+            }
+            DisposeEntry(e);
+            NewPlugin.LogStatic("[MRWebRTC] PeerConnection closed for " + peerId);
+        }
+
+        public void CloseAll()
+        {
+            List<PeerEntry> all;
+            lock (_sync)
+            {
+                all = new List<PeerEntry>(_peers.Values);
+                _peers.Clear();
+            }
+            for (int i = 0; i < all.Count; i++) DisposeEntry(all[i]);
+
+            lock (_sync)
+            {
+                if (_outboundSource != null)
+                {
+                    try { _outboundSource.Dispose(); } catch { }
+                    _outboundSource = null;
+                }
+            }
+        }
+
+        private void DisposeEntry(PeerEntry e)
+        {
+            if (e == null) return;
+            try { if (e.LocalTrack != null) e.LocalTrack.Dispose(); } catch { }
+            try { if (e.Pc != null) e.Pc.Close(); } catch { }
+            try { if (e.Pc != null) e.Pc.Dispose(); } catch { }
+        }
+
+        // --- SDP negotiation -------------------------------------------------
+
+        public string CreateOffer(string peerId)
+        {
+            PeerEntry e = Get(peerId);
+            if (e == null) return null;
+            var tcs = new TaskCompletionSource<string>();
+            e.SdpReady = tcs;
+            try
+            {
+                if (!e.Pc.CreateOffer())
+                {
+                    e.SdpReady = null;
+                    NewPlugin.LogStatic("[MRWebRTC] CreateOffer returned false for " + peerId);
+                    return null;
+                }
+            }
+            catch (Exception ex)
+            {
+                e.SdpReady = null;
+                NewPlugin.LogStatic("[MRWebRTC] CreateOffer error for " + peerId + ": " + ex.Message);
+                return null;
+            }
+            if (tcs.Task.Wait(SdpTimeoutMs)) return tcs.Task.Result;
+            NewPlugin.LogStatic("[MRWebRTC] CreateOffer timed out for " + peerId);
+            return null;
+        }
+
+        public string CreateAnswer(string peerId)
+        {
+            PeerEntry e = Get(peerId);
+            if (e == null) return null;
+            var tcs = new TaskCompletionSource<string>();
+            e.SdpReady = tcs;
+            try
+            {
+                if (!e.Pc.CreateAnswer())
+                {
+                    e.SdpReady = null;
+                    NewPlugin.LogStatic("[MRWebRTC] CreateAnswer returned false for " + peerId);
+                    return null;
+                }
+            }
+            catch (Exception ex)
+            {
+                e.SdpReady = null;
+                NewPlugin.LogStatic("[MRWebRTC] CreateAnswer error for " + peerId + ": " + ex.Message);
+                return null;
+            }
+            if (tcs.Task.Wait(SdpTimeoutMs)) return tcs.Task.Result;
+            NewPlugin.LogStatic("[MRWebRTC] CreateAnswer timed out for " + peerId);
+            return null;
+        }
+
+        public void ApplyRemoteDescription(string peerId, string type, string sdp)
+        {
+            PeerEntry e = Get(peerId);
+            if (e == null || sdp == null) return;
+            var msg = new SdpMessage();
+            msg.Type = (type == "offer") ? SdpMessageType.Offer : SdpMessageType.Answer;
+            msg.Content = sdp;
+            try
+            {
+                e.Pc.SetRemoteDescriptionAsync(msg).Wait(SdpTimeoutMs);
+            }
+            catch (Exception ex)
+            {
+                NewPlugin.LogStatic("[MRWebRTC] SetRemoteDescription error for " + peerId + ": " + ex.Message);
+            }
+        }
+
+        // --- Trickle ICE -----------------------------------------------------
+
+        public void AddIceCandidate(string peerId, string candidateJson)
+        {
+            PeerEntry e = Get(peerId);
+            if (e == null || candidateJson == null) return;
+
+            // Parse the RTCIceCandidateInit JSON: { candidate, sdpMid, sdpMLineIndex }.
+            string candidate = JsonString(candidateJson, "candidate");
+            string sdpMid = JsonString(candidateJson, "sdpMid");
+            int sdpMLineIndex = JsonInt(candidateJson, "sdpMLineIndex", 0);
+            if (candidate == null) return;
+
+            var c = new IceCandidate();
+            c.Content = candidate;
+            c.SdpMid = sdpMid;
+            c.SdpMlineIndex = sdpMLineIndex;
+            try
+            {
+                e.Pc.AddIceCandidate(c);
+            }
+            catch (Exception ex)
+            {
+                NewPlugin.LogStatic("[MRWebRTC] AddIceCandidate error for " + peerId + ": " + ex.Message);
+            }
+        }
+
+        // --- Outbound audio (BASS main-mix tap -> shared external source) ----
+
+        public void PushOutboundAudio(short[] pcm, int sampleCount, int sampleRate, int channels)
+        {
+            if (pcm == null || sampleCount <= 0) return;
+            EnsureOutboundSource();
+
+            lock (_ringLock)
+            {
+                if (channels <= 1)
+                {
+                    int n = Math.Min(sampleCount, pcm.Length);
+                    for (int i = 0; i < n; i++) Enqueue(pcm[i]);
+                }
+                else
+                {
+                    // Interleaved multi-channel -> mono average.
+                    for (int f = 0; f < sampleCount; f++)
+                    {
+                        int sum = 0;
+                        int count = 0;
+                        for (int c = 0; c < channels; c++)
+                        {
+                            int idx = f * channels + c;
+                            if (idx < pcm.Length) { sum += pcm[idx]; count++; }
+                        }
+                        if (count == 0) break;
+                        Enqueue((short)(sum / count));
+                    }
+                }
+            }
+        }
+
+        private void Enqueue(short sample)
+        {
+            // Caller holds _ringLock.
+            _ring[_ringWrite] = sample;
+            _ringWrite = (_ringWrite + 1) % _ring.Length;
+            if (_ringCount < _ring.Length)
+            {
+                _ringCount++;
+            }
+            else
+            {
+                // Full: drop the oldest sample to bound latency.
+                _ringRead = (_ringRead + 1) % _ring.Length;
+            }
+        }
+
+        private void EnsureOutboundSource()
+        {
+            if (_outboundSource != null) return;
+            lock (_sync)
+            {
+                if (_outboundSource != null) return;
+                // Opus mono is configured by libwebrtc itself; we guarantee the
+                // mono layout by always completing frame requests with
+                // channelCount = 1 at 48 kHz.
+                _outboundSource = ExternalAudioTrackSource.CreateFromCallback(OnAudioFrameRequest);
+            }
+        }
+
+        // Pull callback: libwebrtc asks the external source for a frame. We drain
+        // the BASS-fed ring buffer, padding with silence on underrun.
+        private void OnAudioFrameRequest(in AudioFrameRequest request)
+        {
+            int rate = request.sampleRate > 0 ? request.sampleRate : OutboundSampleRate;
+            int needed = request.sampleCount;
+            if (needed <= 0) needed = rate / 100; // 10 ms default chunk
+
+            short[] buf = new short[needed];
+            lock (_ringLock)
+            {
+                for (int i = 0; i < needed; i++)
+                {
+                    if (_ringCount > 0)
+                    {
+                        buf[i] = _ring[_ringRead];
+                        _ringRead = (_ringRead + 1) % _ring.Length;
+                        _ringCount--;
+                    }
+                    else
+                    {
+                        buf[i] = 0; // underrun -> silence
+                    }
+                }
+            }
+
+            GCHandle gc = GCHandle.Alloc(buf, GCHandleType.Pinned);
+            try
+            {
+                var frame = new AudioFrame();
+                frame.audioData = gc.AddrOfPinnedObject();
+                frame.bitsPerSample = 16;
+                frame.sampleRate = (uint)rate;
+                frame.channelCount = 1;     // mono Opus
+                frame.sampleCount = (uint)needed;
+                request.CompleteRequest(frame);
+            }
+            finally
+            {
+                gc.Free();
+            }
+        }
+
+        // --- Event wiring ----------------------------------------------------
+
+        private void WirePeerEvents(PeerEntry e)
+        {
+            string peerId = e.PeerId;
+            PeerConnection pc = e.Pc;
+
+            pc.LocalSdpReadytoSend += (SdpMessage msg) =>
+            {
+                TaskCompletionSource<string> t = e.SdpReady;
+                if (t != null)
+                {
+                    e.SdpReady = null;
+                    t.TrySetResult(msg.Content);
+                }
+            };
+
+            pc.IceCandidateReadytoSend += (IceCandidate cand) =>
+            {
+                Action<string, string> h = OnLocalIceCandidate;
+                if (h == null || cand == null) return;
+                string json = BuildCandidateJson(cand.Content, cand.SdpMid, cand.SdpMlineIndex);
+                h(peerId, json);
+            };
+
+            pc.IceStateChanged += (IceConnectionState st) =>
+            {
+                Action<string, string> h = OnConnectionStateChanged;
+                if (h != null) h(peerId, MapIceState(st));
+            };
+
+            pc.AudioTrackAdded += (RemoteAudioTrack track) =>
+            {
+                e.RemoteTrack = track;
+                track.AudioFrameReady += (AudioFrame frame) => OnRemoteFrame(peerId, frame);
+            };
+        }
+
+        private void OnRemoteFrame(string peerId, AudioFrame frame)
+        {
+            Action<string, short[], int, int> h = OnRemoteAudioFrame;
+            if (h == null || frame.audioData == IntPtr.Zero) return;
+            if (frame.bitsPerSample != 16) return; // mixer ingest expects PCM16
+
+            int channels = (int)frame.channelCount;
+            if (channels < 1) channels = 1;
+            int perChannel = (int)frame.sampleCount;
+            int total = perChannel * channels;
+            if (total <= 0) return;
+
+            short[] interleaved = new short[total];
+            Marshal.Copy(frame.audioData, interleaved, 0, total);
+
+            short[] mono;
+            if (channels == 1)
+            {
+                mono = interleaved;
+            }
+            else
+            {
+                mono = new short[perChannel];
+                for (int f = 0; f < perChannel; f++)
+                {
+                    int sum = 0;
+                    for (int c = 0; c < channels; c++) sum += interleaved[f * channels + c];
+                    mono[f] = (short)(sum / channels);
+                }
+            }
+            h(peerId, mono, perChannel, (int)frame.sampleRate);
+        }
+
+        // Map MR-WebRTC ICE connection state to the string contract, including
+        // "failed" for per-peer failure reporting (Requirement 1.5).
+        private static string MapIceState(IceConnectionState s)
+        {
+            switch (s)
+            {
+                case IceConnectionState.New: return "new";
+                case IceConnectionState.Checking: return "checking";
+                case IceConnectionState.Connected: return "connected";
+                case IceConnectionState.Completed: return "completed";
+                // Both Failed and Disconnected are surfaced as "failed" so the
+                // initiating peer reports the connection failure (Requirement 1.5).
+                case IceConnectionState.Failed: return "failed";
+                case IceConnectionState.Disconnected: return "failed";
+                case IceConnectionState.Closed: return "closed";
+                default: return s.ToString().ToLowerInvariant();
+            }
+        }
+
+        private PeerEntry Get(string peerId)
+        {
+            if (peerId == null) return null;
+            lock (_sync)
+            {
+                PeerEntry e;
+                return _peers.TryGetValue(peerId, out e) ? e : null;
+            }
+        }
+
+        public void Dispose()
+        {
+            CloseAll();
+        }
+
+        // --- Lightweight JSON helpers (same style as WebRtcMeshClient) -------
+
+        private static string BuildCandidateJson(string candidate, string sdpMid, int sdpMLineIndex)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append("{\"candidate\":\"");
+            sb.Append(EscapeJson(candidate));
+            sb.Append("\",\"sdpMid\":");
+            if (sdpMid == null) sb.Append("null");
+            else { sb.Append("\""); sb.Append(EscapeJson(sdpMid)); sb.Append("\""); }
+            sb.Append(",\"sdpMLineIndex\":");
+            sb.Append(sdpMLineIndex);
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        private static string EscapeJson(string value)
+        {
+            if (value == null) return "";
+            var sb = new System.Text.StringBuilder();
+            foreach (char c in value)
+            {
+                switch (c)
+                {
+                    case '"': sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default: sb.Append(c); break;
+                }
+            }
+            return sb.ToString();
+        }
+
+        private static string JsonString(string json, string key)
+        {
+            if (json == null) return null;
+            string searchKey = "\"" + key + "\"";
+            int keyIdx = json.IndexOf(searchKey, StringComparison.Ordinal);
+            if (keyIdx < 0) return null;
+            int colonIdx = json.IndexOf(':', keyIdx + searchKey.Length);
+            if (colonIdx < 0) return null;
+
+            int i = colonIdx + 1;
+            while (i < json.Length && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n')) i++;
+            if (i >= json.Length || json[i] != '"') return null;
+
+            int valueStart = i;
+            int valueEnd = valueStart + 1;
+            while (valueEnd < json.Length)
+            {
+                if (json[valueEnd] == '"' && json[valueEnd - 1] != '\\') break;
+                valueEnd++;
+            }
+            if (valueEnd >= json.Length) return null;
+            return json.Substring(valueStart + 1, valueEnd - valueStart - 1)
+                .Replace("\\\"", "\"")
+                .Replace("\\\\", "\\")
+                .Replace("\\n", "\n")
+                .Replace("\\r", "\r")
+                .Replace("\\t", "\t");
+        }
+
+        private static int JsonInt(string json, string key, int fallback)
+        {
+            if (json == null) return fallback;
+            string searchKey = "\"" + key + "\"";
+            int keyIdx = json.IndexOf(searchKey, StringComparison.Ordinal);
+            if (keyIdx < 0) return fallback;
+            int colonIdx = json.IndexOf(':', keyIdx + searchKey.Length);
+            if (colonIdx < 0) return fallback;
+
+            int i = colonIdx + 1;
+            while (i < json.Length && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n')) i++;
+            int start = i;
+            if (i < json.Length && (json[i] == '-' || json[i] == '+')) i++;
+            while (i < json.Length && json[i] >= '0' && json[i] <= '9') i++;
+            if (i == start) return fallback;
+            int result;
+            if (int.TryParse(json.Substring(start, i - start), out result)) return result;
+            return fallback;
+        }
+    }
+}
+#endif
+// =====================  END MR-WEBRTC PRIMARY ADAPTER  =======================
+
+// =============================================================================
+// ==============  SIPSORCERY + CONCENTUS FALLBACK ADAPTER (task 5.3)  =========
+// =============================================================================
+// Everything between this banner and the matching "END SIPSORCERY" banner was
+// added by task 5.3 (the SIPSorcery + Concentus fallback IWebRtcPeer adapter).
+// It is self-contained so it sits alongside the MR-WebRTC primary adapter
+// (task 5.2) without touching it, IWebRtcPeer, WebRtcMeshClient, or NoOpWebRtcPeer.
+//
+// Selection: MixedRealityWebRtcLoader.TryLoad() is the load/bitness check the
+// startup wiring (task 5.4+) runs first. When the native mrwebrtc.dll cannot be
+// loaded for the host process (missing per-arch native binary, bitness mismatch,
+// or codec/init failure), the startup code constructs THIS class instead. This
+// class is the documented load-failure fallback.
+//
+// Unlike the MR-WebRTC adapter, this block is NOT behind a build symbol: SIPSorcery
+// and Concentus are pure-managed packages (referenced unconditionally in
+// PartylinePlugin.csproj) that restore on any OS and add no native DLL/bitness
+// dependency, so the types resolve and the file compiles everywhere.
+// =============================================================================
+
+namespace Partyline.WebRtc
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Net;
+    using Newtonsoft.Json.Linq;
+    using SIPSorcery.Net;
+    using SIPSorceryMedia.Abstractions;
+    using Concentus.Enums;
+    using Concentus.Structs;
+
+    /// <summary>
+    /// Fallback <see cref="IWebRtcPeer"/> implementation over SIPSorcery (a pure
+    /// managed C# WebRTC stack) plus Concentus (a pure managed C# Opus codec).
+    ///
+    /// IMPORTANT — Requirement 5.1 amendment: SIPSorcery is <b>NOT</b> Google
+    /// libwebrtc. Requirement 5.1 mandates a "Google libwebrtc-based" binding,
+    /// which the MR-WebRTC primary adapter (task 5.2) satisfies. Selecting THIS
+    /// adapter at startup (because the native mrwebrtc.dll failed to load) means
+    /// the plugin is running on a non-libwebrtc managed stack, which is the
+    /// documented R5.1 amendment captured in the design's "C# WebRTC Binding
+    /// Recommendation" (SIPSorcery + Concentus fallback). This is a deliberate
+    /// requirements tradeoff, surfaced here rather than taken silently.
+    ///
+    /// Audio is mono Opus on the wire. PCM crosses the IWebRtcPeer boundary as
+    /// PCM16 (short[]). A single shared Concentus encoder turns the BASS main-mix
+    /// tap into 20 ms / 960-sample mono Opus frames at 48 kHz that are sent to
+    /// every connected peer (encode once, send many). Each remote peer owns its
+    /// own Concentus decoder; inbound RTP Opus payloads are decoded to PCM16 and
+    /// raised via OnRemoteAudioFrame for the AudioMixer ingest path.
+    /// </summary>
+    public class SipSorceryWebRtcPeer : IWebRtcPeer, IDisposable
+    {
+        private const int OpusSampleRate = 48000;       // mono Opus capture/transport rate
+        private const int FrameSamples = 960;           // 20 ms @ 48 kHz mono
+        private const int MaxPacketBytes = 4000;        // generous Opus packet ceiling
+        private const int MaxDecodeSamples = 5760;      // 120 ms @ 48 kHz mono (max Opus frame)
+        private const int OpusPayloadId = 111;          // dynamic payload type used by browsers for Opus
+        private const int SdpTimeoutMs = 10000;
+
+        private readonly object _sync = new object();
+        private readonly Dictionary<string, PeerEntry> _peers = new Dictionary<string, PeerEntry>();
+
+        // ICE config applied to every (existing + future) connection.
+        private RTCConfiguration _config = new RTCConfiguration { iceServers = new List<RTCIceServer>() };
+
+        // Single shared outbound encoder (encode once, send to all peers).
+        private readonly object _encLock = new object();
+        private OpusEncoder _encoder;
+        private readonly List<short> _pending = new List<short>(FrameSamples * 4); // mono 48k accumulator
+
+        // --- IWebRtcPeer callbacks (Action delegates for C# 5 parity) --------
+        public Action<string, string> OnLocalIceCandidate { get; set; }
+        public Action<string, short[], int, int> OnRemoteAudioFrame { get; set; }
+        public Action<string, string> OnConnectionStateChanged { get; set; }
+
+        private class PeerEntry
+        {
+            public string PeerId;
+            public RTCPeerConnection Pc;
+            public OpusDecoder Decoder;
+            public readonly object DecodeLock = new object();
+        }
+
+        // --- ICE configuration ----------------------------------------------
+
+        public void SetIceServers(WebRtcIceServer[] iceServers)
+        {
+            var config = new RTCConfiguration();
+            config.iceServers = new List<RTCIceServer>();
+            if (iceServers != null)
+            {
+                for (int i = 0; i < iceServers.Length; i++)
+                {
+                    WebRtcIceServer s = iceServers[i];
+                    if (s == null || s.Urls == null || s.Urls.Length == 0) continue;
+                    var srv = new RTCIceServer();
+                    // SIPSorcery's RTCIceServer.urls is a single (comma-separated) string.
+                    srv.urls = string.Join(",", s.Urls);
+                    if (s.Username != null) srv.username = s.Username;
+                    if (s.Credential != null) srv.credential = s.Credential;
+                    config.iceServers.Add(srv);
+                }
+            }
+
+            List<PeerEntry> existing;
+            lock (_sync)
+            {
+                _config = config;
+                existing = new List<PeerEntry>(_peers.Values);
+            }
+            // Apply to already-open connections so a mid-session re-fetch takes effect.
+            for (int i = 0; i < existing.Count; i++)
+            {
+                try { existing[i].Pc.setConfiguration(config); }
+                catch (Exception ex) { NewPlugin.LogStatic("[SIPSorcery] setConfiguration failed for " + existing[i].PeerId + ": " + ex.Message); }
+            }
+            NewPlugin.LogStatic("[SIPSorcery] Applied " + config.iceServers.Count + " ICE server entries.");
+        }
+
+        // --- Connection lifecycle (one RTCPeerConnection per remote peerId) --
+
+        public void CreatePeerConnection(string peerId)
+        {
+            if (peerId == null) return;
+            RTCConfiguration config;
+            lock (_sync)
+            {
+                if (_peers.ContainsKey(peerId)) return;
+                config = _config;
+            }
+
+            RTCPeerConnection pc;
+            try
+            {
+                pc = new RTCPeerConnection(config);
+            }
+            catch (Exception ex)
+            {
+                NewPlugin.LogStatic("[SIPSorcery] RTCPeerConnection ctor failed for " + peerId + ": " + ex.Message);
+                return;
+            }
+
+            var entry = new PeerEntry();
+            entry.PeerId = peerId;
+            entry.Pc = pc;
+            try { entry.Decoder = OpusDecoder.Create(OpusSampleRate, 1); }
+            catch (Exception ex) { NewPlugin.LogStatic("[SIPSorcery] Opus decoder create failed for " + peerId + ": " + ex.Message); }
+
+            try
+            {
+                // Mono Opus track (sendrecv). RTP rtpmap convention is opus/48000/2;
+                // the actual PCM bridged via Concentus is mono (channels = 1).
+                var opus = new AudioFormat(AudioCodecsEnum.OPUS, OpusPayloadId, OpusSampleRate, 2, null);
+                var track = new MediaStreamTrack(opus, MediaStreamStatusEnum.SendRecv);
+                pc.addTrack(track);
+            }
+            catch (Exception ex)
+            {
+                NewPlugin.LogStatic("[SIPSorcery] track setup failed for " + peerId + ": " + ex.Message);
+            }
+
+            WirePeerEvents(entry);
+
+            lock (_sync)
+            {
+                if (_peers.ContainsKey(peerId))
+                {
+                    // Lost a race; tear down the duplicate.
+                    DisposeEntry(entry);
+                    return;
+                }
+                _peers[peerId] = entry;
+            }
+            NewPlugin.LogStatic("[SIPSorcery] PeerConnection created for " + peerId);
+        }
+
+        public void ClosePeerConnection(string peerId)
+        {
+            PeerEntry e;
+            lock (_sync)
+            {
+                if (peerId == null || !_peers.TryGetValue(peerId, out e)) return;
+                _peers.Remove(peerId);
+            }
+            DisposeEntry(e);
+            NewPlugin.LogStatic("[SIPSorcery] PeerConnection closed for " + peerId);
+        }
+
+        public void CloseAll()
+        {
+            List<PeerEntry> all;
+            lock (_sync)
+            {
+                all = new List<PeerEntry>(_peers.Values);
+                _peers.Clear();
+            }
+            for (int i = 0; i < all.Count; i++) DisposeEntry(all[i]);
+        }
+
+        private void DisposeEntry(PeerEntry e)
+        {
+            if (e == null) return;
+            try { if (e.Pc != null) e.Pc.close(); } catch { }
+            try { if (e.Pc != null) e.Pc.Dispose(); } catch { }
+        }
+
+        // --- SDP negotiation -------------------------------------------------
+
+        public string CreateOffer(string peerId)
+        {
+            PeerEntry e = Get(peerId);
+            if (e == null) return null;
+            try
+            {
+                RTCSessionDescriptionInit offer = e.Pc.createOffer(null);
+                if (offer == null) return null;
+                e.Pc.setLocalDescription(offer).Wait(SdpTimeoutMs);
+                return offer.sdp;
+            }
+            catch (Exception ex)
+            {
+                NewPlugin.LogStatic("[SIPSorcery] CreateOffer failed for " + peerId + ": " + ex.Message);
+                return null;
+            }
+        }
+
+        public string CreateAnswer(string peerId)
+        {
+            PeerEntry e = Get(peerId);
+            if (e == null) return null;
+            try
+            {
+                // Requires the remote offer to have been applied first.
+                RTCSessionDescriptionInit answer = e.Pc.createAnswer(null);
+                if (answer == null) return null;
+                e.Pc.setLocalDescription(answer).Wait(SdpTimeoutMs);
+                return answer.sdp;
+            }
+            catch (Exception ex)
+            {
+                NewPlugin.LogStatic("[SIPSorcery] CreateAnswer failed for " + peerId + ": " + ex.Message);
+                return null;
+            }
+        }
+
+        public void ApplyRemoteDescription(string peerId, string type, string sdp)
+        {
+            PeerEntry e = Get(peerId);
+            if (e == null || sdp == null) return;
+            try
+            {
+                var init = new RTCSessionDescriptionInit();
+                init.type = (type == "offer") ? RTCSdpType.offer : RTCSdpType.answer;
+                init.sdp = sdp;
+                SetDescriptionResultEnum result = e.Pc.setRemoteDescription(init);
+                if (result != SetDescriptionResultEnum.OK)
+                    NewPlugin.LogStatic("[SIPSorcery] setRemoteDescription(" + type + ") for " + peerId + " returned " + result + ".");
+            }
+            catch (Exception ex)
+            {
+                NewPlugin.LogStatic("[SIPSorcery] ApplyRemoteDescription failed for " + peerId + ": " + ex.Message);
+            }
+        }
+
+        // --- Trickle ICE -----------------------------------------------------
+
+        public void AddIceCandidate(string peerId, string candidateJson)
+        {
+            PeerEntry e = Get(peerId);
+            if (e == null || candidateJson == null) return;
+            try
+            {
+                // Parse the RTCIceCandidateInit JSON with Newtonsoft.Json.
+                JObject jo = JObject.Parse(candidateJson);
+                var init = new RTCIceCandidateInit();
+                init.candidate = (string)jo["candidate"];
+
+                JToken mid = jo["sdpMid"];
+                if (mid != null && mid.Type != JTokenType.Null) init.sdpMid = (string)mid;
+
+                JToken idx = jo["sdpMLineIndex"];
+                if (idx != null && idx.Type != JTokenType.Null) init.sdpMLineIndex = (ushort)(int)idx;
+
+                JToken uf = jo["usernameFragment"];
+                if (uf != null && uf.Type != JTokenType.Null) init.usernameFragment = (string)uf;
+
+                e.Pc.addIceCandidate(init);
+            }
+            catch (Exception ex)
+            {
+                NewPlugin.LogStatic("[SIPSorcery] AddIceCandidate failed for " + peerId + ": " + ex.Message);
+            }
+        }
+
+        // --- Outbound audio (BASS main-mix tap -> shared Opus encoder) -------
+
+        public void PushOutboundAudio(short[] pcm, int sampleCount, int sampleRate, int channels)
+        {
+            if (pcm == null || sampleCount <= 0) return;
+            if (sampleRate <= 0) sampleRate = OpusSampleRate;
+            if (channels <= 0) channels = 1;
+
+            // 1. Downmix interleaved input to mono.
+            short[] mono = Downmix(pcm, sampleCount, channels);
+            // 2. Resample to the 48 kHz Opus rate if needed.
+            short[] mono48 = (sampleRate == OpusSampleRate) ? mono : ResampleTo48k(mono, sampleRate);
+
+            // 3. Accumulate and drain whole 20 ms frames, encoding each once.
+            List<byte[]> encodedFrames = null;
+            lock (_encLock)
+            {
+                EnsureEncoder();
+                if (_encoder == null) return;
+
+                for (int i = 0; i < mono48.Length; i++) _pending.Add(mono48[i]);
+
+                while (_pending.Count >= FrameSamples)
+                {
+                    var frame = new short[FrameSamples];
+                    _pending.CopyTo(0, frame, 0, FrameSamples);
+                    _pending.RemoveRange(0, FrameSamples);
+
+                    var outBytes = new byte[MaxPacketBytes];
+                    int len;
+                    try { len = _encoder.Encode(frame, 0, FrameSamples, outBytes, 0, outBytes.Length); }
+                    catch (Exception ex) { NewPlugin.LogStatic("[SIPSorcery] Opus encode failed: " + ex.Message); break; }
+
+                    if (len <= 0) continue;
+                    var packet = new byte[len];
+                    Array.Copy(outBytes, packet, len);
+                    if (encodedFrames == null) encodedFrames = new List<byte[]>(2);
+                    encodedFrames.Add(packet);
+                }
+            }
+
+            if (encodedFrames == null) return;
+
+            // Send outside the encoder lock. Encode once, transmit to every peer.
+            List<PeerEntry> targets;
+            lock (_sync) { targets = new List<PeerEntry>(_peers.Values); }
+            for (int p = 0; p < targets.Count; p++)
+            {
+                for (int f = 0; f < encodedFrames.Count; f++)
+                {
+                    try { targets[p].Pc.SendAudio((uint)FrameSamples, encodedFrames[f]); }
+                    catch { /* a single peer's send failure must not stop the others */ }
+                }
+            }
+        }
+
+        private void EnsureEncoder()
+        {
+            // Caller holds _encLock.
+            if (_encoder != null) return;
+            try
+            {
+                _encoder = OpusEncoder.Create(OpusSampleRate, 1, OpusApplication.OPUS_APPLICATION_VOIP);
+            }
+            catch (Exception ex)
+            {
+                NewPlugin.LogStatic("[SIPSorcery] Opus encoder create failed: " + ex.Message);
+            }
+        }
+
+        // Interleaved multi-channel PCM16 -> mono (averaged). sampleCount is the
+        // per-channel frame count (matches the MR-WebRTC adapter's convention).
+        private static short[] Downmix(short[] pcm, int sampleCount, int channels)
+        {
+            if (channels <= 1)
+            {
+                int n = Math.Min(sampleCount, pcm.Length);
+                var m = new short[n];
+                Array.Copy(pcm, m, n);
+                return m;
+            }
+            var mono = new short[sampleCount];
+            int produced = 0;
+            for (int f = 0; f < sampleCount; f++)
+            {
+                int sum = 0, count = 0;
+                for (int c = 0; c < channels; c++)
+                {
+                    int idx = f * channels + c;
+                    if (idx < pcm.Length) { sum += pcm[idx]; count++; }
+                }
+                if (count == 0) break;
+                mono[produced++] = (short)(sum / count);
+            }
+            if (produced == mono.Length) return mono;
+            var trimmed = new short[produced];
+            Array.Copy(mono, trimmed, produced);
+            return trimmed;
+        }
+
+        // Simple linear resampler to the 48 kHz Opus rate. The BASS pump already
+        // delivers 48 kHz mono frames (task 5.4), so this is a safety path for
+        // off-rate input only.
+        private static short[] ResampleTo48k(short[] mono, int srcRate)
+        {
+            if (mono.Length == 0 || srcRate == OpusSampleRate) return mono;
+            long outLen = (long)mono.Length * OpusSampleRate / srcRate;
+            if (outLen <= 0) return new short[0];
+            var outBuf = new short[outLen];
+            double step = (double)srcRate / OpusSampleRate;
+            double pos = 0;
+            for (int i = 0; i < outBuf.Length; i++)
+            {
+                int idx = (int)pos;
+                if (idx >= mono.Length - 1)
+                {
+                    outBuf[i] = mono[mono.Length - 1];
+                }
+                else
+                {
+                    double frac = pos - idx;
+                    outBuf[i] = (short)(mono[idx] * (1.0 - frac) + mono[idx + 1] * frac);
+                }
+                pos += step;
+            }
+            return outBuf;
+        }
+
+        // --- Event wiring ----------------------------------------------------
+
+        private void WirePeerEvents(PeerEntry e)
+        {
+            string peerId = e.PeerId;
+            RTCPeerConnection pc = e.Pc;
+
+            pc.onicecandidate += (RTCIceCandidate cand) =>
+            {
+                Action<string, string> h = OnLocalIceCandidate;
+                if (h == null || cand == null) return;
+                h(peerId, BuildCandidateJson(cand));
+            };
+
+            pc.onconnectionstatechange += (RTCPeerConnectionState st) =>
+            {
+                Action<string, string> h = OnConnectionStateChanged;
+                if (h != null) h(peerId, MapState(st));
+            };
+
+            // Inbound RTP Opus -> Concentus decode -> PCM16 -> OnRemoteAudioFrame.
+            pc.OnRtpPacketReceived += (IPEndPoint endpoint, SDPMediaTypesEnum media, RTPPacket pkt) =>
+            {
+                if (media != SDPMediaTypesEnum.audio) return;
+                if (pkt == null || pkt.Payload == null || pkt.Payload.Length == 0) return;
+                DecodeRemote(e, pkt.Payload);
+            };
+        }
+
+        private void DecodeRemote(PeerEntry e, byte[] payload)
+        {
+            OpusDecoder decoder = e.Decoder;
+            if (decoder == null) return;
+
+            Action<string, short[], int, int> h = OnRemoteAudioFrame;
+            if (h == null) return;
+
+            var outPcm = new short[MaxDecodeSamples];
+            int decoded;
+            try
+            {
+                lock (e.DecodeLock)
+                {
+                    decoded = decoder.Decode(payload, 0, payload.Length, outPcm, 0, MaxDecodeSamples, false);
+                }
+            }
+            catch (Exception ex)
+            {
+                NewPlugin.LogStatic("[SIPSorcery] Opus decode failed for " + e.PeerId + ": " + ex.Message);
+                return;
+            }
+            if (decoded <= 0) return;
+
+            var frame = new short[decoded];
+            Array.Copy(outPcm, frame, decoded);
+            h(e.PeerId, frame, decoded, OpusSampleRate);
+        }
+
+        // Map SIPSorcery's connection state to the IWebRtcPeer string contract.
+        // Both failed and disconnected surface as "failed" so the initiating peer
+        // reports the connection failure (Requirement 1.5).
+        private static string MapState(RTCPeerConnectionState s)
+        {
+            switch (s)
+            {
+                case RTCPeerConnectionState.@new: return "new";
+                case RTCPeerConnectionState.connecting: return "connecting";
+                case RTCPeerConnectionState.connected: return "connected";
+                case RTCPeerConnectionState.failed: return "failed";
+                case RTCPeerConnectionState.disconnected: return "failed";
+                case RTCPeerConnectionState.closed: return "closed";
+                default: return s.ToString().ToLowerInvariant();
+            }
+        }
+
+        private PeerEntry Get(string peerId)
+        {
+            if (peerId == null) return null;
+            lock (_sync)
+            {
+                PeerEntry e;
+                return _peers.TryGetValue(peerId, out e) ? e : null;
+            }
+        }
+
+        public void Dispose()
+        {
+            CloseAll();
+        }
+
+        // --- Lightweight JSON helper (Newtonsoft, same intent as the MR adapter) --
+
+        private static string BuildCandidateJson(RTCIceCandidate cand)
+        {
+            var jo = new JObject();
+            jo["candidate"] = cand.candidate != null ? cand.candidate : "";
+            jo["sdpMid"] = cand.sdpMid != null ? (JToken)cand.sdpMid : JValue.CreateNull();
+            jo["sdpMLineIndex"] = (int)cand.sdpMLineIndex;
+            return jo.ToString(Newtonsoft.Json.Formatting.None);
+        }
+    }
+}
+// ==================  END SIPSORCERY + CONCENTUS FALLBACK ADAPTER  ============
