@@ -142,14 +142,7 @@ public class NewPlugin
 
     // DIAGNOSTIC: capture-rate measurement (samples/sec produced by the mixer DSP).
     private long _dspMonoSamplesSinceLog;
-    private long _dspFloatsSinceLog;
     private System.Diagnostics.Stopwatch _dspRateClock;
-    // Effective channel count of the DSP float buffer, detected from actual
-    // throughput. BASS_ChannelGetInfo can report 2 channels while the tap actually
-    // delivers a MONO float stream; trusting the reported count made the downmix
-    // average adjacent mono samples (heavy distortion + half rate). 0 = not yet
-    // detected (use the reported count until the first measurement).
-    private volatile int _dspChannels;
     // Measured actual capture rate (mono samples/sec of wall clock). The mixer DSP
     // tap can deliver at a rate that does NOT match BASS_ChannelGetInfo's reported
     // freq (observed ~22050 against a reported 44100), which made the outbound
@@ -163,6 +156,9 @@ public class NewPlugin
     // We derive the real count from floats/sec vs the reported mixer freq.
     private volatile int _captureChannels;
     private long _dspFloatsSinceLog;
+    // DIAGNOSTIC: stereo-separation probe — sum|L-R| vs sum|L|+|R| over the window.
+    private double _dspSumLRDiff;
+    private double _dspSumAbs;
     // DIAGNOSTIC: outbound pump push-rate measurement.
     private long _pumpFramesSinceLog;
     private System.Diagnostics.Stopwatch _pumpRateClock;
@@ -579,6 +575,18 @@ public class NewPlugin
             float[] floatData = new float[floatSamples];
             Marshal.Copy(buffer, floatData, 0, floatSamples);
 
+            // DIAGNOSTIC: probe interleaved stereo separation (treat as 2ch regardless
+            // of the downmix decision). If the two interleaved lanes carry different
+            // audio, sum|a-b| is a real fraction of sum|a|+|b|; if they are identical
+            // (true mono, or dual-mono) the ratio is ~0.
+            for (int p = 0; p + 1 < floatSamples; p += 2)
+            {
+                float a = floatData[p];
+                float b = floatData[p + 1];
+                _dspSumLRDiff += Math.Abs(a - b);
+                _dspSumAbs += Math.Abs(a) + Math.Abs(b);
+            }
+
             // Convert to PCM16 mono
             byte[] pcm16 = new byte[monoSamples * 2];
             for (int i = 0; i < monoSamples; i++)
@@ -650,11 +658,18 @@ public class NewPlugin
                 }
                 int backlog;
                 lock (_returnLock) { backlog = _returnAvailable; }
+                int sepPct = _dspSumAbs > 0 ? (int)(100.0 * _dspSumLRDiff / _dspSumAbs) : 0;
+                BASS_CHANNELINFO ci = new BASS_CHANNELINFO();
+                string ciStr = BASS_ChannelGetInfo(_mixerHandle, ref ci)
+                    ? ("freq=" + ci.freq + " chans=" + ci.chans) : "n/a";
                 Log("DIAG capture rate=" + rate + " samples/sec (reported mixer ~" + _mixerFreq
                     + ", using " + _captureRateHz + "); bufChannels reported=" + _mixerChannels
-                    + " derived=" + derivedCh + "; ring backlog=" + backlog + " bytes");
+                    + " derived=" + derivedCh + "; lane-separation=" + sepPct + "% (0%=mono/dual-mono); "
+                    + "info[" + ciStr + "]; ring backlog=" + backlog + " bytes");
                 _dspMonoSamplesSinceLog = 0;
                 _dspFloatsSinceLog = 0;
+                _dspSumLRDiff = 0;
+                _dspSumAbs = 0;
                 _dspRateClock.Restart();
             }
         }
