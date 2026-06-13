@@ -86,8 +86,13 @@ namespace Partyline.WebRtcHost
                         if (isTurn) { if (turnKept >= MaxTurn) continue; turnKept++; }
                         else { if (stunKept >= MaxStun) continue; stunKept++; }
 
+                        // Resolve the STUN/TURN hostname to an IP ourselves (OS resolver)
+                        // so SIPSorcery never relies on its DnsClient auto-detection, which
+                        // often fails on Windows and leaves it gathering ONLY host candidates.
+                        string resolved = ResolveIceHostToIp(url);
+
                         var srv = new RTCIceServer();
-                        srv.urls = url;
+                        srv.urls = resolved;
                         if (s.Username != null) srv.username = s.Username;
                         if (s.Credential != null) srv.credential = s.Credential;
                         config.iceServers.Add(srv);
@@ -125,6 +130,50 @@ namespace Partyline.WebRtcHost
                 catch { }
             }
             return new RTCPeerConnection(config);
+        }
+
+        // Resolve a STUN/TURN URL's hostname to an IP using the OS resolver, returning
+        // a URL with the IP in place of the host (scheme/port/?transport preserved).
+        // SIPSorcery then treats it as an explicit endpoint and skips its DnsClient
+        // path (whose name-server auto-detection often fails on Windows, leaving it
+        // gathering only host candidates). Returns the original URL on any failure.
+        private static string ResolveIceHostToIp(string url)
+        {
+            try
+            {
+                int schemeIdx = url.IndexOf(':');
+                if (schemeIdx <= 0) return url;
+                string scheme = url.Substring(0, schemeIdx);
+                string rest = url.Substring(schemeIdx + 1);
+
+                string query = "";
+                int q = rest.IndexOf('?');
+                if (q >= 0) { query = rest.Substring(q); rest = rest.Substring(0, q); }
+
+                string host, portPart = "";
+                int colon = rest.LastIndexOf(':');
+                if (colon >= 0) { host = rest.Substring(0, colon); portPart = rest.Substring(colon); }
+                else { host = rest; }
+
+                System.Net.IPAddress already;
+                if (System.Net.IPAddress.TryParse(host, out already)) return url; // already an IP
+
+                System.Net.IPAddress[] addrs = System.Net.Dns.GetHostAddresses(host);
+                System.Net.IPAddress chosen = null;
+                for (int i = 0; i < addrs.Length; i++)
+                    if (addrs[i].AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork) { chosen = addrs[i]; break; }
+                if (chosen == null && addrs.Length > 0) chosen = addrs[0];
+                if (chosen == null) { HostLog.Write("[SIPSorcery] DNS: no address for " + host); return url; }
+
+                string outUrl = scheme + ":" + chosen.ToString() + portPart + query;
+                HostLog.Write("[SIPSorcery] resolved " + host + " -> " + chosen + " (" + outUrl + ")");
+                return outUrl;
+            }
+            catch (Exception ex)
+            {
+                HostLog.Write("[SIPSorcery] DNS resolve failed for '" + url + "': " + ex.Message);
+                return url;
+            }
         }
 
         public void CreatePeerConnection(string peerId)
@@ -407,6 +456,15 @@ namespace Partyline.WebRtcHost
                 };
             }
             catch (Exception ex) { HostLog.Write("[SIPSorcery] oniceconnectionstatechange unavailable: " + ex.Message); }
+
+            try
+            {
+                pc.onicegatheringstatechange += (RTCIceGatheringState gs) =>
+                {
+                    HostLog.Write("[SIPSorcery] ICE gathering [" + peerId + "]: " + gs);
+                };
+            }
+            catch (Exception ex) { HostLog.Write("[SIPSorcery] onicegatheringstatechange unavailable: " + ex.Message); }
 
             pc.onconnectionstatechange += (RTCPeerConnectionState st) =>
             {
