@@ -2117,70 +2117,70 @@ public class PartylineConfigForm : Form
     private void InitializeFormComponents()
     {
         Text = "Partyline Co-Host Configuration";
-        Width = 550;
-        Height = 720;
+        Width = 564;
+        Height = 500;
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
 
-        // Display metadata shown to co-hosts on their screen. These are labels only
-        // (the room id stays auto-generated); the plugin publishes them to the
-        // signaling server so the co-host page can render them.
+        // Display metadata shown to co-hosts — three fields side by side.
+        int fy = 10, by = 30, fw = 168;
         Label lblStationName = new Label();
         lblStationName.Text = "Station Name:";
-        lblStationName.Location = new System.Drawing.Point(12, 15);
+        lblStationName.Location = new System.Drawing.Point(12, fy);
         lblStationName.AutoSize = true;
-        lblStationName.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+        lblStationName.Font = new System.Drawing.Font("Segoe UI", 8.5f, System.Drawing.FontStyle.Bold);
         Controls.Add(lblStationName);
         _txtStationName = new TextBox();
-        _txtStationName.Location = new System.Drawing.Point(130, 12);
-        _txtStationName.Size = new System.Drawing.Size(390, 22);
+        _txtStationName.Location = new System.Drawing.Point(12, by);
+        _txtStationName.Size = new System.Drawing.Size(fw, 22);
         _txtStationName.Text = _stationName;
         Controls.Add(_txtStationName);
 
         Label lblRoomName = new Label();
         lblRoomName.Text = "Room Name:";
-        lblRoomName.Location = new System.Drawing.Point(12, 45);
+        lblRoomName.Location = new System.Drawing.Point(190, fy);
         lblRoomName.AutoSize = true;
-        lblRoomName.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+        lblRoomName.Font = new System.Drawing.Font("Segoe UI", 8.5f, System.Drawing.FontStyle.Bold);
         Controls.Add(lblRoomName);
         _txtRoomName = new TextBox();
-        _txtRoomName.Location = new System.Drawing.Point(130, 42);
-        _txtRoomName.Size = new System.Drawing.Size(390, 22);
+        _txtRoomName.Location = new System.Drawing.Point(190, by);
+        _txtRoomName.Size = new System.Drawing.Size(fw, 22);
         _txtRoomName.Text = _roomName;
         Controls.Add(_txtRoomName);
 
         Label lblDjName = new Label();
         lblDjName.Text = "DJ Name:";
-        lblDjName.Location = new System.Drawing.Point(12, 75);
+        lblDjName.Location = new System.Drawing.Point(368, fy);
         lblDjName.AutoSize = true;
-        lblDjName.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+        lblDjName.Font = new System.Drawing.Font("Segoe UI", 8.5f, System.Drawing.FontStyle.Bold);
         Controls.Add(lblDjName);
         _txtDjName = new TextBox();
-        _txtDjName.Location = new System.Drawing.Point(130, 72);
-        _txtDjName.Size = new System.Drawing.Size(390, 22);
+        _txtDjName.Location = new System.Drawing.Point(368, by);
+        _txtDjName.Size = new System.Drawing.Size(fw, 22);
         _txtDjName.Text = _djName;
         Controls.Add(_txtDjName);
 
-        Label lblIntro = new Label();
-        lblIntro.Text = "Add a co-host below and set their password. Use the Copy button to send each co-host their personal join link.";
-        lblIntro.Location = new System.Drawing.Point(12, 104);
-        lblIntro.Size = new System.Drawing.Size(510, 32);
-        lblIntro.ForeColor = System.Drawing.SystemColors.GrayText;
-        Controls.Add(lblIntro);
-
         Label lblTitle = new Label();
         lblTitle.Text = "Co-Host Accounts:";
-        lblTitle.Location = new System.Drawing.Point(12, 140);
+        lblTitle.Location = new System.Drawing.Point(12, 64);
         lblTitle.AutoSize = true;
         lblTitle.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
         Controls.Add(lblTitle);
 
+        // Add button sits on the title row (was previously clipped under the grid).
+        _btnAdd = new Button();
+        _btnAdd.Text = "+ Add Co-Host";
+        _btnAdd.Location = new System.Drawing.Point(412, 60);
+        _btnAdd.Size = new System.Drawing.Size(124, 26);
+        _btnAdd.Click += OnAddClick;
+        Controls.Add(_btnAdd);
+
         // DataGridView for account list
         _grid = new DataGridView();
-        _grid.Location = new System.Drawing.Point(12, 162);
-        _grid.Size = new System.Drawing.Size(510, 200);
+        _grid.Location = new System.Drawing.Point(12, 92);
+        _grid.Size = new System.Drawing.Size(524, 170);
         _grid.AllowUserToAddRows = false;
         _grid.AllowUserToDeleteRows = false;
         _grid.AllowUserToResizeRows = false;
@@ -2200,21 +2200,16 @@ public class PartylineConfigForm : Form
         DataGridViewTextBoxColumn colDisplay = new DataGridViewTextBoxColumn();
         colDisplay.Name = "DisplayName";
         colDisplay.HeaderText = "Display Name";
-        colDisplay.FillWeight = 20;
+        colDisplay.FillWeight = 30;
         _grid.Columns.Add(colDisplay);
 
-        DataGridViewTextBoxColumn colJoinUrl = new DataGridViewTextBoxColumn();
-        colJoinUrl.Name = "JoinUrl";
-        colJoinUrl.HeaderText = "Join URL";
-        colJoinUrl.FillWeight = 26;
-        _grid.Columns.Add(colJoinUrl);
-
+        // Join URL is intentionally NOT shown — the Invite button copies it.
         DataGridViewButtonColumn colCopy = new DataGridViewButtonColumn();
         colCopy.Name = "Copy";
         colCopy.HeaderText = "";
-        colCopy.Text = "Copy";
+        colCopy.Text = "Invite";
         colCopy.UseColumnTextForButtonValue = true;
-        colCopy.FillWeight = 9;
+        colCopy.FillWeight = 14;
         _grid.Columns.Add(colCopy);
 
         DataGridViewButtonColumn colEdit = new DataGridViewButtonColumn();
@@ -2236,18 +2231,10 @@ public class PartylineConfigForm : Form
         _grid.CellContentClick += OnGridCellContentClick;
         Controls.Add(_grid);
 
-        // Add button
-        _btnAdd = new Button();
-        _btnAdd.Text = "+ Add Co-Host";
-        _btnAdd.Location = new System.Drawing.Point(12, 354);
-        _btnAdd.Size = new System.Drawing.Size(120, 28);
-        _btnAdd.Click += OnAddClick;
-        Controls.Add(_btnAdd);
-
-        // Edit panel
+        // Edit panel (toggled by Add/Edit), sits just below the grid.
         _editPanel = new Panel();
-        _editPanel.Location = new System.Drawing.Point(12, 390);
-        _editPanel.Size = new System.Drawing.Size(510, 150);
+        _editPanel.Location = new System.Drawing.Point(12, 272);
+        _editPanel.Size = new System.Drawing.Size(524, 150);
         _editPanel.Visible = false;
 
         Label lblSep = new Label();
@@ -2366,8 +2353,8 @@ public class PartylineConfigForm : Form
         for (int i = 0; i < _accounts.Count; i++)
         {
             CoHostAccount acct = _accounts[i];
-            string joinUrl = BuildJoinUrl(acct);
-            _grid.Rows.Add(acct.Username, acct.DisplayName, joinUrl);
+            // Join URL is not displayed; the Invite button copies it.
+            _grid.Rows.Add(acct.Username, acct.DisplayName);
         }
     }
 
