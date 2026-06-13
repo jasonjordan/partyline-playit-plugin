@@ -6157,14 +6157,6 @@ namespace Partyline.WebRtc
         private static string ExtractHost()
         {
             var self = typeof(OutOfProcessWebRtcPeer).Assembly;
-            string ver = self.GetName().Version != null ? self.GetName().Version.ToString() : "0";
-            string baseDir = Path.Combine(Path.Combine(Path.GetTempPath(), "Partyline.webrtchost"), ver);
-            string exePath = Path.Combine(baseDir, "PartylineWebRtcHost.exe");
-            if (File.Exists(exePath)) return exePath;
-
-            // Fresh extract (clear any partial leftovers).
-            try { if (Directory.Exists(baseDir)) Directory.Delete(baseDir, true); } catch { }
-            Directory.CreateDirectory(baseDir);
 
             string resName = null;
             foreach (var n in self.GetManifestResourceNames())
@@ -6172,17 +6164,36 @@ namespace Partyline.WebRtc
                 { resName = n; break; }
             if (resName == null) throw new InvalidOperationException("embedded webrtchost.zip not found (build the plugin so the host is bundled).");
 
-            string zipPath = Path.Combine(baseDir, "host.zip");
+            // Read the embedded zip bytes and key the extraction dir on their hash, so
+            // a rebuilt helper ALWAYS re-extracts. (The assembly version is constant at
+            // 1.0.0.0, so versioning the dir left stale helpers running after rebuilds.)
+            byte[] zipBytes;
             using (var rs = self.GetManifestResourceStream(resName))
-            using (var fs = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            using (var ms = new MemoryStream())
             {
                 if (rs == null) throw new InvalidOperationException("webrtchost.zip resource stream null.");
-                rs.CopyTo(fs);
+                rs.CopyTo(ms);
+                zipBytes = ms.ToArray();
             }
+            string hash;
+            using (var md5 = System.Security.Cryptography.MD5.Create())
+                hash = BitConverter.ToString(md5.ComputeHash(zipBytes), 0, 6).Replace("-", "").ToLowerInvariant();
+
+            string baseDir = Path.Combine(Path.Combine(Path.GetTempPath(), "Partyline.webrtchost"), hash);
+            string exePath = Path.Combine(baseDir, "PartylineWebRtcHost.exe");
+            if (File.Exists(exePath)) return exePath; // this exact build already extracted
+
+            // Fresh extract (clear any partial leftovers for this hash).
+            try { if (Directory.Exists(baseDir)) Directory.Delete(baseDir, true); } catch { }
+            Directory.CreateDirectory(baseDir);
+
+            string zipPath = Path.Combine(baseDir, "host.zip");
+            File.WriteAllBytes(zipPath, zipBytes);
             ZipFile.ExtractToDirectory(zipPath, baseDir);
             try { File.Delete(zipPath); } catch { }
 
             if (!File.Exists(exePath)) throw new InvalidOperationException("host exe missing after extract: " + exePath);
+            NewPlugin.LogStatic("[OutOfProc] extracted helper build " + hash + " to " + baseDir);
             return exePath;
         }
 
