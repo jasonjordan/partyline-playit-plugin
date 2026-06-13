@@ -163,6 +163,10 @@ public class NewPlugin
     // whether overmodulation is hot source material being hard-clamped at capture.
     private float _dspPeakSrc;
     private float _dspPeakOut;
+    // DIAGNOSTIC: count of non-finite/absurd source samples sanitized, and the peak
+    // of the CLEAN (sanitized) signal, per window.
+    private long _dspSanitizedSinceLog;
+    private float _dspCleanPeak;
     // DIAGNOSTIC: outbound pump push-rate measurement.
     private long _pumpFramesSinceLog;
     private System.Diagnostics.Stopwatch _pumpRateClock;
@@ -609,10 +613,21 @@ public class NewPlugin
                     int idx = i * channels + ch;
                     if (idx < floatSamples)
                     {
-                        sum += floatData[idx];
+                        // Sanitize: the tap occasionally contains non-finite/garbage
+                        // floats (observed up to float.MaxValue) that, once clamped to
+                        // full scale, pin the meter and overmodulate. Drop them.
+                        float v = floatData[idx];
+                        if (float.IsNaN(v) || float.IsInfinity(v) || v > 2f || v < -2f)
+                        {
+                            v = 0f;
+                            _dspSanitizedSinceLog++;
+                        }
+                        sum += v;
                     }
                 }
                 float mono = sum / channels;
+                float cAbs = mono < 0 ? -mono : mono;
+                if (cAbs > _dspCleanPeak) _dspCleanPeak = cAbs;
                 // Reduce level by 6dB to prevent clipping
                 mono = mono * 0.5f;
                 float mAbs = mono < 0 ? -mono : mono;
@@ -680,13 +695,17 @@ public class NewPlugin
                     + ", using " + _captureRateHz + "); bufChannels reported=" + _mixerChannels
                     + " derived=" + derivedCh + "; lane-separation=" + sepPct + "% (0%=mono/dual-mono); "
                     + "peakSrc=" + _dspPeakSrc.ToString("0.00") + " peakOut=" + _dspPeakOut.ToString("0.00")
-                    + " (>1.00=clipping); info[" + ciStr + "]; ring backlog=" + backlog + " bytes");
+                    + " (>1.00=clipping); cleanPeak=" + _dspCleanPeak.ToString("0.00")
+                    + " sanitized=" + _dspSanitizedSinceLog
+                    + "; info[" + ciStr + "]; ring backlog=" + backlog + " bytes");
                 _dspMonoSamplesSinceLog = 0;
                 _dspFloatsSinceLog = 0;
                 _dspSumLRDiff = 0;
                 _dspSumAbs = 0;
                 _dspPeakSrc = 0;
                 _dspPeakOut = 0;
+                _dspSanitizedSinceLog = 0;
+                _dspCleanPeak = 0;
                 _dspRateClock.Restart();
             }
         }
