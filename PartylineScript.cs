@@ -187,6 +187,87 @@ public class NewPlugin
         Log(message);
     }
 
+    // Guards one-time SIPSorcery preload.
+    private static bool _sipPreloadDone;
+
+    /// <summary>
+    /// Eagerly loads the Costura-embedded SIPSorcery 6.2.4 assembly into the
+    /// process before any SIPSorcery type is referenced, so it wins simple-name
+    /// binding over a host-shipped older copy (Task 9). Also logs any SIPSorcery
+    /// DLLs found in the host app directory for diagnostics. Best-effort: any
+    /// failure is logged and ignored (we still fall through to whatever binds).
+    /// </summary>
+    internal static void PreloadBundledSipSorcery()
+    {
+        if (_sipPreloadDone) return;
+        _sipPreloadDone = true;
+
+        // Diagnostic: report any SIPSorcery copies sitting in the host directory.
+        try
+        {
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory ?? "";
+            if (baseDir.Length > 0 && Directory.Exists(baseDir))
+            {
+                foreach (var f in Directory.GetFiles(baseDir, "SIPSorcery*.dll", SearchOption.TopDirectoryOnly))
+                {
+                    string ver = "?";
+                    try { ver = System.Diagnostics.FileVersionInfo.GetVersionInfo(f).FileVersion; } catch { }
+                    LogStatic("[SIPSorcery] host dir copy: " + f + " (v" + ver + ")");
+                }
+            }
+        }
+        catch { }
+
+        try
+        {
+            var self = typeof(NewPlugin).Assembly;
+
+            // Costura embeds managed deps as resources named
+            // "costura.<simplename>.dll" or ".dll.compressed" (gzip), lowercased.
+            string resName = null;
+            bool compressed = false;
+            foreach (var n in self.GetManifestResourceNames())
+            {
+                if (n.IndexOf("sipsorcery", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                if (n.EndsWith(".dll.compressed", StringComparison.OrdinalIgnoreCase)) { resName = n; compressed = true; break; }
+                if (n.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)) { resName = n; compressed = false; break; }
+            }
+
+            if (resName == null)
+            {
+                LogStatic("[SIPSorcery] preload: no embedded SIPSorcery resource (Costura); relying on probing.");
+                return;
+            }
+
+            byte[] raw;
+            using (var rs = self.GetManifestResourceStream(resName))
+            {
+                if (rs == null) { LogStatic("[SIPSorcery] preload: resource stream null for " + resName); return; }
+                using (var ms = new MemoryStream())
+                {
+                    if (compressed)
+                    {
+                        using (var gz = new System.IO.Compression.GZipStream(rs, System.IO.Compression.CompressionMode.Decompress))
+                            gz.CopyTo(ms);
+                    }
+                    else
+                    {
+                        rs.CopyTo(ms);
+                    }
+                    raw = ms.ToArray();
+                }
+            }
+
+            var asm = System.Reflection.Assembly.Load(raw);
+            var an = asm.GetName();
+            LogStatic("[SIPSorcery] preload: loaded embedded " + an.Name + " " + an.Version + " into process.");
+        }
+        catch (Exception ex)
+        {
+            LogStatic("[SIPSorcery] preload failed: " + ex.Message);
+        }
+    }
+
     /// <summary>
     /// The short (<=6 char) invite code for a co-host account, derived from its
     /// stable hash. This is the ONLY token in the co-host URL
@@ -206,6 +287,16 @@ public class NewPlugin
             _cts = new CancellationTokenSource();
             _app = app;
             Log("Plugin starting...");
+
+            // --- SIPSorcery version pinning (Task 9 root-cause fix) -------------
+            // PlayIt Live ships its OWN SIPSorcery (observed: 5.2.3.0) in its app
+            // directory. Default CLR probing finds that copy by simple name BEFORE
+            // Costura's AssemblyResolve fallback can hand over our bundled 6.2.4,
+            // so the wrong (TURN-weak) version binds and ICE fails on CGNAT/Starlink.
+            // We pre-load the embedded 6.2.4 bytes into the process here, before any
+            // SIPSorcery type is touched. Because the assembly is unsigned, later
+            // references bind by simple name to this already-loaded 6.2.4.
+            PreloadBundledSipSorcery();
 
             // Load settings and initialize subsystems
             List<CoHostAccount> accounts = _settingsManager.Load();
