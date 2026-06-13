@@ -5086,6 +5086,54 @@ namespace Partyline.WebRtc
 
         // --- Connection lifecycle (one RTCPeerConnection per remote peerId) --
 
+        // Constructs an RTCPeerConnection tolerant of SIPSorcery version differences.
+        // The compiled `new RTCPeerConnection(config)` call binds to a specific ctor
+        // overload (with that version's optional params); if a different SIPSorcery
+        // assembly is loaded at runtime (e.g. one shipped by the PlayIt Live host),
+        // that exact ctor may not exist -> MethodNotFound. We instead pick whatever
+        // ctor the loaded assembly exposes whose first parameter is RTCConfiguration,
+        // and fill the remaining params with their defaults.
+        private static bool _versionLogged;
+        private static RTCPeerConnection NewRTCPeerConnection(RTCConfiguration config)
+        {
+            if (!_versionLogged)
+            {
+                _versionLogged = true;
+                try
+                {
+                    var asm = typeof(RTCPeerConnection).Assembly.GetName();
+                    NewPlugin.LogStatic("[SIPSorcery] loaded assembly: " + asm.Name + " " + asm.Version);
+                }
+                catch { }
+            }
+
+            System.Reflection.ConstructorInfo chosen = null;
+            foreach (var ci in typeof(RTCPeerConnection).GetConstructors())
+            {
+                var ps = ci.GetParameters();
+                if (ps.Length >= 1 && ps[0].ParameterType == typeof(RTCConfiguration))
+                {
+                    if (chosen == null || ps.Length < chosen.GetParameters().Length) chosen = ci;
+                }
+            }
+            if (chosen == null)
+            {
+                // Last resort: let Activator bind a single-arg ctor.
+                return (RTCPeerConnection)Activator.CreateInstance(typeof(RTCPeerConnection), new object[] { config });
+            }
+
+            var pars = chosen.GetParameters();
+            object[] args = new object[pars.Length];
+            args[0] = config;
+            for (int i = 1; i < pars.Length; i++)
+            {
+                if (pars[i].HasDefaultValue) args[i] = pars[i].DefaultValue;
+                else if (pars[i].ParameterType.IsValueType) args[i] = Activator.CreateInstance(pars[i].ParameterType);
+                else args[i] = null;
+            }
+            return (RTCPeerConnection)chosen.Invoke(args);
+        }
+
         public void CreatePeerConnection(string peerId)
         {
             if (peerId == null) return;
@@ -5099,11 +5147,12 @@ namespace Partyline.WebRtc
             RTCPeerConnection pc;
             try
             {
-                pc = new RTCPeerConnection(config);
+                pc = NewRTCPeerConnection(config);
             }
             catch (Exception ex)
             {
-                NewPlugin.LogStatic("[SIPSorcery] RTCPeerConnection ctor failed for " + peerId + ": " + ex.Message);
+                Exception inner = (ex is System.Reflection.TargetInvocationException && ex.InnerException != null) ? ex.InnerException : ex;
+                NewPlugin.LogStatic("[SIPSorcery] RTCPeerConnection ctor failed for " + peerId + ": " + inner.Message);
                 return;
             }
 
