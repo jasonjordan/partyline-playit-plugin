@@ -140,6 +140,13 @@ public class NewPlugin
     private Thread _captureThread;
     private volatile bool _captureRunning;
 
+    // DIAGNOSTIC: capture-rate measurement (samples/sec produced by the mixer DSP).
+    private long _dspMonoSamplesSinceLog;
+    private System.Diagnostics.Stopwatch _dspRateClock;
+    // DIAGNOSTIC: outbound pump push-rate measurement.
+    private long _pumpFramesSinceLog;
+    private System.Diagnostics.Stopwatch _pumpRateClock;
+
     [StructLayout(LayoutKind.Sequential)]
     private struct BASS_CHANNELINFO
     {
@@ -583,6 +590,23 @@ public class NewPlugin
                     }
                 }
             }
+
+            // DIAGNOSTIC: measure the actual capture rate. For a real-time mixer this
+            // should report ~_mixerFreq samples/sec. A much higher number means the
+            // mixer is being pulled faster than real time (the real chipmunk cause).
+            _dspMonoSamplesSinceLog += monoSamples;
+            if (_dspRateClock == null) _dspRateClock = System.Diagnostics.Stopwatch.StartNew();
+            long dspMs = _dspRateClock.ElapsedMilliseconds;
+            if (dspMs >= 5000)
+            {
+                long rate = _dspMonoSamplesSinceLog * 1000L / dspMs;
+                int backlog;
+                lock (_returnLock) { backlog = _returnAvailable; }
+                Log("DIAG capture rate=" + rate + " samples/sec (expected ~" + _mixerFreq
+                    + "); ring backlog=" + backlog + " bytes (" + (backlog / 2 * 1000 / Math.Max(1, _mixerFreq)) + " ms)");
+                _dspMonoSamplesSinceLog = 0;
+                _dspRateClock.Restart();
+            }
         }
         catch { }
     }
@@ -949,7 +973,7 @@ public class NewPlugin
         const int frameSamples = 960; // 20 ms @ 48 kHz mono
         const int frameMs = 20;
         const int maxCatchupFrames = 4;   // bound any burst if we briefly fall behind
-        const int backlogMs = 200;        // safety cap on buffered outbound latency
+        const int backlogMs = 1000;       // generous safety cap during diagnosis (was 200)
         short[] frame = new short[frameSamples];
         bool firstPushLogged = false;
 
@@ -997,11 +1021,24 @@ public class NewPlugin
                     if (!TryReadMainMixFrame(frame)) break;
                     peer.PushOutboundAudio(frame, frameSamples, 48000, 1);
                     framesSent++;
+                    _pumpFramesSinceLog++;
                     if (!firstPushLogged)
                     {
                         firstPushLogged = true;
                         Log("AudioPumpLoop: first outbound frame pushed (" + frameSamples + " samples @ 48kHz mono).");
                     }
+                }
+
+                // DIAGNOSTIC: report the real outbound push rate. ~50 frames/sec is
+                // correct real-time (one 20 ms frame per 20 ms).
+                if (_pumpRateClock == null) _pumpRateClock = System.Diagnostics.Stopwatch.StartNew();
+                long pumpMs = _pumpRateClock.ElapsedMilliseconds;
+                if (pumpMs >= 5000)
+                {
+                    long fps = _pumpFramesSinceLog * 1000L / pumpMs;
+                    Log("DIAG pump push rate=" + fps + " frames/sec (expected ~50)");
+                    _pumpFramesSinceLog = 0;
+                    _pumpRateClock.Restart();
                 }
             }
             catch (Exception ex)
