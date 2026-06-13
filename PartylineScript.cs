@@ -59,6 +59,10 @@ public class NewPlugin
     // the former relay-status accessors at the WebRTC mesh transport.
     private static WebRtcMeshClient _staticWebRtcMesh;
 
+    /// <summary>The running mesh client (null before Run/after stop). Used by the
+    /// Configure dialog to publish a Room ID change immediately.</summary>
+    public static WebRtcMeshClient ActiveMesh { get { return _staticWebRtcMesh; } }
+
     /// <summary>True while the WebRTC mesh signaling client reports a live connection.</summary>
     public static bool IsMeshConnected
     {
@@ -661,7 +665,7 @@ public class NewPlugin
 
     public void Configure()
     {
-        var form = new PartylineConfigForm(_settingsManager);
+        var form = new PartylineConfigForm(_settingsManager, _webRtcMesh);
         if (form.ShowDialog() == DialogResult.OK)
         {
             // Push saved co-host accounts + display names to the running mesh so
@@ -2197,6 +2201,7 @@ public class SettingsManager
 public class PartylineConfigForm : Form
 {
     private SettingsManager _settingsManager;
+    private WebRtcMeshClient _mesh;   // running mesh (may be null if not started)
     private List<CoHostAccount> _accounts;
     private string _stationName;
     private string _relayUrl;
@@ -2221,8 +2226,14 @@ public class PartylineConfigForm : Form
     private int _editingIndex;
 
     public PartylineConfigForm(SettingsManager settingsManager)
+        : this(settingsManager, null)
+    {
+    }
+
+    public PartylineConfigForm(SettingsManager settingsManager, WebRtcMeshClient mesh)
     {
         _settingsManager = settingsManager;
+        _mesh = mesh;
         _accounts = _settingsManager.Load();
         string[] meta = _settingsManager.LoadMeta();
         _roomName = meta[0];
@@ -2300,9 +2311,18 @@ public class PartylineConfigForm : Form
         _txtRoomCode.Text = _roomCode;
         Controls.Add(_txtRoomCode);
 
+        // Dedicated Save button so the DJ can save + verify the Room ID (and push
+        // it live to the server) without closing the whole dialog.
+        Button btnSaveRoomCode = new Button();
+        btnSaveRoomCode.Text = "Save";
+        btnSaveRoomCode.Location = new System.Drawing.Point(218, 77);
+        btnSaveRoomCode.Size = new System.Drawing.Size(70, 24);
+        btnSaveRoomCode.Click += OnSaveRoomCodeClick;
+        Controls.Add(btnSaveRoomCode);
+
         Label lblRoomCodeHint = new Label();
-        lblRoomCodeHint.Text = "Up to 24 characters: letters, numbers, - and _ (no spaces). Leave blank for an auto code.";
-        lblRoomCodeHint.Location = new System.Drawing.Point(220, 81);
+        lblRoomCodeHint.Text = "1-24 chars: a-z 0-9 - _  (no spaces).";
+        lblRoomCodeHint.Location = new System.Drawing.Point(296, 81);
         lblRoomCodeHint.AutoSize = true;
         lblRoomCodeHint.ForeColor = System.Drawing.SystemColors.GrayText;
         Controls.Add(lblRoomCodeHint);
@@ -2498,6 +2518,75 @@ public class PartylineConfigForm : Form
     {
         DialogResult = DialogResult.Cancel;
         Close();
+    }
+
+    // Save + verify just the Room ID, and push it live to the server immediately.
+    // Confirms (a) it passes validation, (b) it round-trips to disk, and (c) the
+    // server accepted it (or reports a conflict / that it'll publish on connect).
+    private void OnSaveRoomCodeClick(object sender, EventArgs e)
+    {
+        string rawCode = _txtRoomCode.Text.Trim();
+        string sanitized = "";
+        if (rawCode.Length > 0)
+        {
+            sanitized = SettingsManager.SanitizeRoomCode(rawCode);
+            if (sanitized.Length == 0)
+            {
+                MessageBox.Show(
+                    "Room ID must be 1-24 characters and may contain only letters, numbers, hyphens and underscores (no spaces).",
+                    "Invalid Room ID", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                _txtRoomCode.Focus();
+                _txtRoomCode.SelectAll();
+                return;
+            }
+        }
+        _roomCode = sanitized;
+        _txtRoomCode.Text = sanitized; // reflect the normalised (lowercased) value
+
+        // Persist alongside the current display-name fields so nothing is lost.
+        string sn = _txtStationName.Text.Trim();
+        string rn = _txtRoomName.Text.Trim();
+        string dj = _txtDjName.Text.Trim();
+        _settingsManager.SaveMeta(rn, sn, dj, _roomCode);
+
+        // Verify the value actually round-tripped to disk.
+        string saved = _settingsManager.LoadRoomCode();
+        if (saved != _roomCode)
+        {
+            MessageBox.Show(
+                "Save verification FAILED: the Room ID on disk ('" + saved + "') does not match what was entered ('" + _roomCode + "'). Check folder permissions for meta.json.",
+                "Partyline", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        string url = string.IsNullOrEmpty(_roomCode)
+            ? "(auto-generated link)"
+            : "https://partyline.compressed.stream/" + _roomCode;
+
+        // Push it to the server now if the mesh is running, so the link goes live
+        // without waiting for the next reconnect.
+        string status;
+        if (_mesh != null)
+        {
+            bool conflict;
+            string err;
+            bool ok = _mesh.TryPublishRoomCode(_roomCode, out conflict, out err);
+            if (!ok)
+                status = "\n\nSaved on disk, but the server could not be reached yet (" + err + ").\nIt will publish automatically when the plugin next connects.";
+            else if (conflict)
+                status = "\n\nWARNING: this Room ID is already in use by another room.\nCo-hosts must use the auto-generated link until you choose a different Room ID.";
+            else
+                status = "\n\nPublished to the server - the link is live now.";
+        }
+        else
+        {
+            status = "\n\nSaved. It will publish to the server when the plugin is running and connected.";
+        }
+
+        MessageBox.Show(
+            "Room ID saved: " + (string.IsNullOrEmpty(_roomCode) ? "(blank - auto code)" : _roomCode)
+                + "\nCo-host link: " + url + status,
+            "Partyline", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     // Builds the co-host join URL for the new Cloudflare room console:
@@ -2970,7 +3059,7 @@ public class PartylineControlPanel : UserControl
 
     private void OnConfigureClick(object sender, EventArgs e)
     {
-        var form = new PartylineConfigForm(_settingsManager);
+        var form = new PartylineConfigForm(_settingsManager, NewPlugin.ActiveMesh);
         form.ShowDialog();
     }
 
@@ -3629,6 +3718,44 @@ public class WebRtcMeshClient
     }
 
     // --- DJ authentication + invite publishing ------------------------------
+
+    /// <summary>
+    /// Immediately (re)publishes the DJ's custom Room ID to the server using the
+    /// stored slug + djKey, without waiting for the next reconnect. Used by the
+    /// Configure dialog's Save button so the co-host link goes live at once.
+    /// Returns false (with <paramref name="error"/>) if the server can't be
+    /// reached; sets <paramref name="conflict"/> when the code is owned by another
+    /// room. Safe to call on a running client (idempotent provision).
+    /// </summary>
+    public bool TryPublishRoomCode(string roomCode, out bool conflict, out string error)
+    {
+        conflict = false;
+        error = null;
+        try
+        {
+            _metaRoomCode = roomCode != null ? roomCode : "";
+            if (string.IsNullOrEmpty(_baseUrl) || string.IsNullOrEmpty(_slug))
+            {
+                error = "no signaling URL/room configured";
+                return false;
+            }
+            EnsureClients();
+            string url = _baseUrl.TrimEnd('/') + "/api/plugin/provision/" + Uri.EscapeDataString(_slug);
+            string body = "{\"djKey\":\"" + EscapeJson(_password) + "\""
+                + (string.IsNullOrEmpty(_metaRoomCode) ? "" : ",\"roomCode\":\"" + EscapeJson(_metaRoomCode) + "\"")
+                + "}";
+            string resp = HttpPost(url, body);
+            if (resp == null) { error = "no response"; return false; }
+            if (resp.IndexOf("\"roomCodeConflict\":true", StringComparison.OrdinalIgnoreCase) >= 0)
+                conflict = true;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
 
     /// <summary>
     /// Claims/refreshes this plugin's room on the signaling server using the
