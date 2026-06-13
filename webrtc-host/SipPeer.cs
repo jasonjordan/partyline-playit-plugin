@@ -61,6 +61,7 @@ namespace Partyline.WebRtcHost
             public long RtpReceived;
             public bool FirstSendLogged;
             public bool FirstSendErrorLogged;
+            public volatile bool Connected;
         }
 
         // --- ICE configuration ----------------------------------------------
@@ -352,6 +353,10 @@ namespace Partyline.WebRtcHost
             lock (_sync) { targets = new List<PeerEntry>(_peers.Values); }
             for (int p = 0; p < targets.Count; p++)
             {
+                // Don't send RTP before the DTLS/SRTP handshake completes; SIPSorcery
+                // rejects it ("cannot be called on a secure session before calling
+                // SetSecurityContext"). Only transmit once the peer is connected.
+                if (!targets[p].Connected) continue;
                 for (int f = 0; f < encodedFrames.Count; f++)
                 {
                     try
@@ -468,6 +473,7 @@ namespace Partyline.WebRtcHost
 
             pc.onconnectionstatechange += (RTCPeerConnectionState st) =>
             {
+                e.Connected = (st == RTCPeerConnectionState.connected);
                 Action<string, string> h = OnConnectionStateChanged;
                 if (h != null) h(peerId, MapState(st));
             };
