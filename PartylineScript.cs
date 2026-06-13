@@ -187,6 +187,18 @@ public class NewPlugin
         Log(message);
     }
 
+    /// <summary>
+    /// The short (<=6 char) invite code for a co-host account, derived from its
+    /// stable hash. This is the ONLY token in the co-host URL
+    /// (https://partyline.compressed.stream/&lt;code&gt;) and doubles as the invite id.
+    /// </summary>
+    public static string CohostCode(string hash)
+    {
+        if (string.IsNullOrEmpty(hash)) return "";
+        string h = hash.Trim().ToLowerInvariant();
+        return h.Length > 6 ? h.Substring(0, 6) : h;
+    }
+
     public void Run(IPlayItLiveApp app)
     {
         try
@@ -2341,16 +2353,11 @@ public class PartylineConfigForm : Form
     // than a broken link.
     private string BuildJoinUrl(CoHostAccount acct)
     {
-        string origin = "https://signalling.compressed.stream";
-        string slug = _settingsManager.LoadRoomId();
-        if (string.IsNullOrEmpty(slug)) return "";
-
-        string url = origin + "/room/" + slug;
-        if (acct != null && !string.IsNullOrEmpty(acct.Hash))
-        {
-            url += "?invite=" + acct.Hash;
-        }
-        return url;
+        if (acct == null || string.IsNullOrEmpty(acct.Hash)) return "";
+        string code = NewPlugin.CohostCode(acct.Hash);
+        if (string.IsNullOrEmpty(code)) return "";
+        // Minimal co-host URL: just the short code on the co-host domain.
+        return "https://partyline.compressed.stream/" + code;
     }
 
     private void LoadGrid()
@@ -3513,8 +3520,10 @@ public class WebRtcMeshClient
             if (a == null || string.IsNullOrEmpty(a.Hash) || string.IsNullOrEmpty(a.Password)) continue;
             string name = !string.IsNullOrEmpty(a.DisplayName) ? a.DisplayName : a.Username;
             if (string.IsNullOrEmpty(name)) name = a.Hash;
+            // The invite id IS the short 6-char code used in the co-host URL.
+            string code = NewPlugin.CohostCode(a.Hash);
             if (n > 0) sb.Append(",");
-            sb.Append("{\"inviteId\":\"").Append(EscapeJson(a.Hash)).Append("\",");
+            sb.Append("{\"inviteId\":\"").Append(EscapeJson(code)).Append("\",");
             sb.Append("\"name\":\"").Append(EscapeJson(name)).Append("\",");
             sb.Append("\"password\":\"").Append(EscapeJson(a.Password)).Append("\"}");
             n++;
