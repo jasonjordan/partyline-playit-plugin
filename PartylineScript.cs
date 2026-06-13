@@ -4071,11 +4071,11 @@ public class WebRtcMeshClient
         {
             string pid = ExtractJsonValue(peerObjs[i], "peerId");
             if (pid == null || pid == _peerId) continue;
-            // Offer only to peers we have not seen before, so the periodic join
-            // heartbeat refreshes presence without re-offering to connected peers.
-            bool isNew = !_knownPeers.ContainsKey(pid);
             _knownPeers[pid] = 1;
-            if (isNew && IsInitiator(pid)) InitiateOffer(pid);
+            // Re-offer to any present co-host we are not currently connected to (e.g.
+            // after this DJ left and rejoined). MaybeOffer skips already-connected
+            // peers and throttles, so the heartbeat does not churn live links.
+            MaybeOffer(pid);
         }
     }
 
@@ -4084,6 +4084,36 @@ public class WebRtcMeshClient
     private bool IsInitiator(string remotePeerId)
     {
         return string.CompareOrdinal(_peerId, remotePeerId) < 0;
+    }
+
+    // Re-offer throttle so the 5 s join heartbeat doesn't spam offers at a peer
+    // that is mid-negotiation.
+    private const int OfferCooldownMs = 8000;
+    private readonly ConcurrentDictionary<string, int> _lastOfferAt = new ConcurrentDictionary<string, int>();
+
+    /// <summary>
+    /// Offer to a roster peer when we are its initiator and we are NOT already
+    /// connected to it. This both makes the first connection AND re-establishes one
+    /// after the DJ (plugin) left and returned: on rejoin the roster still lists any
+    /// co-hosts present in the room, and any whose WebRTC link is down get a fresh
+    /// offer. Connected peers are skipped (no churn) and a short cooldown avoids
+    /// re-offering while a negotiation is still in flight.
+    /// </summary>
+    private void MaybeOffer(string pid)
+    {
+        if (pid == null || pid == _peerId) return;
+        if (!IsInitiator(pid)) return;
+        if (NewPlugin.IsPeerConnected(pid)) return; // already connected — leave it alone
+        int now = Environment.TickCount;
+        int last;
+        if (_lastOfferAt.TryGetValue(pid, out last))
+        {
+            int elapsed = now - last;
+            if (elapsed >= 0 && elapsed < OfferCooldownMs) return;
+        }
+        _lastOfferAt[pid] = now;
+        Log("Offering to present, unconnected peer: " + pid);
+        InitiateOffer(pid);
     }
 
     private void InitiateOffer(string remotePeerId)
@@ -4217,6 +4247,12 @@ public class WebRtcMeshClient
             string sdp = ExtractJsonValue(payload, "sdp");
             if (from == null || sdp == null) return;
             _knownPeers[from] = 1;
+            // A fresh offer means the remote wants a new session. If we are holding a
+            // stale (failed/old) peer connection for them — e.g. this DJ just rejoined
+            // and the co-host is re-offering — tear it down first so we answer on a
+            // clean connection instead of a dead one (CreatePeerConnection no-ops if a
+            // connection already exists).
+            if (!NewPlugin.IsPeerConnected(from)) _peer.ClosePeerConnection(from);
             _peer.CreatePeerConnection(from);
             _peer.ApplyRemoteDescription(from, "offer", sdp);
             string answer = _peer.CreateAnswer(from);
@@ -4240,16 +4276,19 @@ public class WebRtcMeshClient
         }
         else if (type == "join")
         {
-            // A new peer announced itself; offer if we are the initiator.
+            // A peer announced itself (new, or re-announcing after we rejoined);
+            // offer if we are the initiator and not already connected to it.
             if (from == null) return;
             _knownPeers[from] = 1;
-            if (IsInitiator(from)) InitiateOffer(from);
+            MaybeOffer(from);
         }
         else if (type == "leave")
         {
             if (from == null) return;
             byte ignored;
             _knownPeers.TryRemove(from, out ignored);
+            int lastIgnored;
+            _lastOfferAt.TryRemove(from, out lastIgnored);
             _peer.ClosePeerConnection(from);
             Log("Peer left: " + from);
         }
