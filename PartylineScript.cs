@@ -247,8 +247,10 @@ public class NewPlugin
                 {
                     if (compressed)
                     {
-                        using (var gz = new System.IO.Compression.GZipStream(rs, System.IO.Compression.CompressionMode.Decompress))
-                            gz.CopyTo(ms);
+                        // Costura.Fody compresses embedded assemblies with Deflate
+                        // (NOT GZip). Use DeflateStream to decompress the resource.
+                        using (var ds = new System.IO.Compression.DeflateStream(rs, System.IO.Compression.CompressionMode.Decompress))
+                            ds.CopyTo(ms);
                     }
                     else
                     {
@@ -261,6 +263,20 @@ public class NewPlugin
             var asm = System.Reflection.Assembly.Load(raw);
             var an = asm.GetName();
             LogStatic("[SIPSorcery] preload: loaded embedded " + an.Name + " " + an.Version + " into process.");
+
+            // Belt-and-suspenders: if anything later asks for "SIPSorcery" and the
+            // loader would otherwise resolve the host's older copy, hand back the
+            // version we just loaded.
+            AppDomain.CurrentDomain.AssemblyResolve += (s, e) =>
+            {
+                try
+                {
+                    var reqName = new System.Reflection.AssemblyName(e.Name).Name;
+                    if (string.Equals(reqName, an.Name, StringComparison.OrdinalIgnoreCase)) return asm;
+                }
+                catch { }
+                return null;
+            };
         }
         catch (Exception ex)
         {
@@ -4413,6 +4429,25 @@ public static class MixedRealityWebRtcLoader
             candidates.Add(Path.Combine(nativeDir, dllName));
             candidates.Add(Path.Combine(Path.Combine(nativeDir, arch), dllName));
         }
+
+        // The plugin's own directory (the PlayIt Live Plugins folder where
+        // PartylinePlugin.dll lives) is the most natural drop spot for the native
+        // DLL, but it is NOT the AppDomain base dir (that's the host exe folder),
+        // so probe it explicitly first.
+        string pluginDir = null;
+        try
+        {
+            string loc = typeof(MixedRealityWebRtcLoader).Assembly.Location;
+            if (!string.IsNullOrEmpty(loc)) pluginDir = Path.GetDirectoryName(loc);
+        }
+        catch { }
+        if (!string.IsNullOrEmpty(pluginDir))
+        {
+            candidates.Add(Path.Combine(pluginDir, dllName));
+            candidates.Add(Path.Combine(Path.Combine(pluginDir, arch), dllName));
+            candidates.Add(Path.Combine(pluginDir, Path.Combine("runtimes", Path.Combine("win-" + arch, Path.Combine("native", dllName)))));
+        }
+
         candidates.Add(Path.Combine(baseDir, dllName));
         candidates.Add(Path.Combine(Path.Combine(baseDir, arch), dllName));
         // NuGet runtimes layout: runtimes/win-x64/native/mrwebrtc.dll
@@ -4422,7 +4457,7 @@ public static class MixedRealityWebRtcLoader
         {
             try
             {
-                if (File.Exists(candidates[i])) return candidates[i];
+                if (File.Exists(candidates[i])) { NewPlugin.LogStatic("[MRWebRTC] found native engine at " + candidates[i]); return candidates[i]; }
             }
             catch { }
         }
