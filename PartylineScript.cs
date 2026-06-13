@@ -298,19 +298,29 @@ public class NewPlugin
 #endif
             if (peer == null)
             {
-                // Default path: run SIPSorcery 6.2.4 in an isolated child AppDomain
-                // so the host's shadowing 5.2.3 is never probed (Task 9). Falls back
-                // to the in-process adapter only if the child domain can't be created.
+                // Default path: run SIPSorcery 6.2.4 in a SEPARATE 64-bit process
+                // (clean address space, normal thread stacks) — sidesteps the host's
+                // 5.2.3 conflict AND the 32-bit crash. Falls back to the isolated
+                // AppDomain, then in-process, only if the helper can't be launched.
                 try
                 {
-                    peer = new Partyline.WebRtc.IsolatedSipSorceryPeer();
-                    Log("WebRTC binding: SIPSorcery 6.2.4 (isolated AppDomain).");
+                    peer = new Partyline.WebRtc.OutOfProcessWebRtcPeer();
+                    Log("WebRTC binding: SIPSorcery 6.2.4 (out-of-process host).");
                 }
                 catch (Exception ex)
                 {
-                    Log("Isolated SIPSorcery domain failed (" + ex.Message + "); using in-process SIPSorcery.");
-                    peer = new Partyline.WebRtc.SipSorceryWebRtcPeer();
-                    Log("WebRTC binding: SIPSorcery + Concentus (in-process fallback).");
+                    Log("Out-of-process host failed (" + ex.Message + "); trying isolated AppDomain.");
+                    try
+                    {
+                        peer = new Partyline.WebRtc.IsolatedSipSorceryPeer();
+                        Log("WebRTC binding: SIPSorcery 6.2.4 (isolated AppDomain).");
+                    }
+                    catch (Exception ex2)
+                    {
+                        Log("Isolated SIPSorcery domain failed (" + ex2.Message + "); using in-process SIPSorcery.");
+                        peer = new Partyline.WebRtc.SipSorceryWebRtcPeer();
+                        Log("WebRTC binding: SIPSorcery + Concentus (in-process fallback).");
+                    }
                 }
             }
 
@@ -6024,3 +6034,340 @@ namespace Partyline.WebRtc
     }
 }
 // =========  END ISOLATED SIPSORCERY 6.2.4 (child AppDomain)  =================
+
+
+// =============================================================================
+// =========  OUT-OF-PROCESS WEBRTC HOST CLIENT (Task 9)  ======================
+// =============================================================================
+// Runs SIPSorcery 6.2.4 in a separate 64-bit process (PartylineWebRtcHost.exe),
+// embedded as a zip resource and extracted at runtime. This sidesteps BOTH the
+// host's shadowing SIPSorcery 5.2.3 AND the 32-bit address-space/stack limits
+// that crashed PlayItLive when 6.2.4 ran in-process or in a child AppDomain. If
+// the helper crashes, only the helper dies — PlayIt Live keeps running.
+namespace Partyline.WebRtc
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Diagnostics;
+    using System.IO;
+    using System.IO.Compression;
+    using System.Text;
+    using System.Threading;
+    using Newtonsoft.Json.Linq;
+
+    public sealed class OutOfProcessWebRtcPeer : IWebRtcPeer, IDisposable
+    {
+        private Process _proc;
+        private Stream _stdin;
+        private Stream _stdout;
+        private Thread _reader;
+        private volatile bool _running;
+        private readonly object _writeLock = new object();
+
+        // Pending CreateOffer/CreateAnswer awaiters, keyed by peerId.
+        private readonly object _pendLock = new object();
+        private readonly Dictionary<string, SdpWaiter> _offerWaiters = new Dictionary<string, SdpWaiter>();
+        private readonly Dictionary<string, SdpWaiter> _answerWaiters = new Dictionary<string, SdpWaiter>();
+
+        public Action<string, string> OnLocalIceCandidate { get; set; }
+        public Action<string, short[], int, int> OnRemoteAudioFrame { get; set; }
+        public Action<string, string> OnConnectionStateChanged { get; set; }
+
+        private sealed class SdpWaiter
+        {
+            public readonly ManualResetEventSlim Done = new ManualResetEventSlim(false);
+            public string Sdp;
+        }
+
+        public OutOfProcessWebRtcPeer()
+        {
+            string exePath = ExtractHost();
+            var psi = new ProcessStartInfo(exePath);
+            psi.UseShellExecute = false;
+            psi.RedirectStandardInput = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.CreateNoWindow = true;
+            psi.WorkingDirectory = Path.GetDirectoryName(exePath);
+
+            _proc = Process.Start(psi);
+            _stdin = _proc.StandardInput.BaseStream;
+            _stdout = _proc.StandardOutput.BaseStream;
+
+            _running = true;
+            _reader = new Thread(ReaderLoop) { IsBackground = true, Name = "WebRtcHostReader" };
+            _reader.Start();
+
+            var errThread = new Thread(() =>
+            {
+                try
+                {
+                    string line;
+                    while ((line = _proc.StandardError.ReadLine()) != null)
+                        NewPlugin.LogStatic("[host:stderr] " + line);
+                }
+                catch { }
+            }) { IsBackground = true, Name = "WebRtcHostStderr" };
+            errThread.Start();
+
+            NewPlugin.LogStatic("[OutOfProc] WebRTC host launched: " + exePath + " (pid " + _proc.Id + ").");
+        }
+
+        // Extract the embedded webrtchost.zip to a stable temp dir; returns the exe path.
+        private static string ExtractHost()
+        {
+            var self = typeof(OutOfProcessWebRtcPeer).Assembly;
+            string ver = self.GetName().Version != null ? self.GetName().Version.ToString() : "0";
+            string baseDir = Path.Combine(Path.Combine(Path.GetTempPath(), "Partyline.webrtchost"), ver);
+            string exePath = Path.Combine(baseDir, "PartylineWebRtcHost.exe");
+            if (File.Exists(exePath)) return exePath;
+
+            // Fresh extract (clear any partial leftovers).
+            try { if (Directory.Exists(baseDir)) Directory.Delete(baseDir, true); } catch { }
+            Directory.CreateDirectory(baseDir);
+
+            string resName = null;
+            foreach (var n in self.GetManifestResourceNames())
+                if (n.IndexOf("webrtchost", StringComparison.OrdinalIgnoreCase) >= 0 && n.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                { resName = n; break; }
+            if (resName == null) throw new InvalidOperationException("embedded webrtchost.zip not found (build the plugin so the host is bundled).");
+
+            string zipPath = Path.Combine(baseDir, "host.zip");
+            using (var rs = self.GetManifestResourceStream(resName))
+            using (var fs = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                if (rs == null) throw new InvalidOperationException("webrtchost.zip resource stream null.");
+                rs.CopyTo(fs);
+            }
+            ZipFile.ExtractToDirectory(zipPath, baseDir);
+            try { File.Delete(zipPath); } catch { }
+
+            if (!File.Exists(exePath)) throw new InvalidOperationException("host exe missing after extract: " + exePath);
+            return exePath;
+        }
+
+        // --- IWebRtcPeer (encode command -> send frame) ----------------------
+
+        public void SetIceServers(WebRtcIceServer[] iceServers)
+        {
+            var arr = new JArray();
+            if (iceServers != null)
+            {
+                foreach (var s in iceServers)
+                {
+                    if (s == null) continue;
+                    var jo = new JObject();
+                    var urls = new JArray();
+                    if (s.Urls != null) foreach (var u in s.Urls) urls.Add(u);
+                    jo["urls"] = urls;
+                    if (s.Username != null) jo["username"] = s.Username;
+                    if (s.Credential != null) jo["credential"] = s.Credential;
+                    arr.Add(jo);
+                }
+            }
+            SendText(1, arr.ToString(Newtonsoft.Json.Formatting.None));
+        }
+
+        public void CreatePeerConnection(string peerId) { SendText(2, peerId); }
+        public void ClosePeerConnection(string peerId) { SendText(3, peerId); }
+        public void CloseAll() { try { SendText(4, ""); } catch { } }
+
+        public string CreateOffer(string peerId) { return AwaitSdp(5, peerId, _offerWaiters); }
+        public string CreateAnswer(string peerId) { return AwaitSdp(6, peerId, _answerWaiters); }
+
+        private string AwaitSdp(byte cmd, string peerId, Dictionary<string, SdpWaiter> waiters)
+        {
+            var w = new SdpWaiter();
+            lock (_pendLock) { waiters[peerId] = w; }
+            SendText(cmd, peerId);
+            if (!w.Done.Wait(12000))
+            {
+                lock (_pendLock) { waiters.Remove(peerId); }
+                NewPlugin.LogStatic("[OutOfProc] SDP wait timed out for " + peerId);
+                return null;
+            }
+            return w.Sdp;
+        }
+
+        public void ApplyRemoteDescription(string peerId, string type, string sdp)
+        {
+            var jo = new JObject();
+            jo["peerId"] = peerId; jo["type"] = type; jo["sdp"] = sdp;
+            SendText(7, jo.ToString(Newtonsoft.Json.Formatting.None));
+        }
+
+        public void AddIceCandidate(string peerId, string candidateJson)
+        {
+            try
+            {
+                var jo = new JObject();
+                jo["peerId"] = peerId;
+                jo["candidate"] = candidateJson != null ? JToken.Parse(candidateJson) : JValue.CreateNull();
+                SendText(8, jo.ToString(Newtonsoft.Json.Formatting.None));
+            }
+            catch (Exception ex) { NewPlugin.LogStatic("[OutOfProc] AddIceCandidate encode failed: " + ex.Message); }
+        }
+
+        public void PushOutboundAudio(short[] pcm, int sampleCount, int sampleRate, int channels)
+        {
+            if (pcm == null || sampleCount <= 0) return;
+            int n = Math.Min(sampleCount, pcm.Length);
+            byte[] payload = new byte[1 + 12 + n * 2];
+            payload[0] = 9;
+            WriteIntLE(payload, 1, n);
+            WriteIntLE(payload, 5, sampleRate);
+            WriteIntLE(payload, 9, channels);
+            int off = 13;
+            for (int i = 0; i < n; i++)
+            {
+                payload[off++] = (byte)(pcm[i] & 0xFF);
+                payload[off++] = (byte)((pcm[i] >> 8) & 0xFF);
+            }
+            SendRaw(payload);
+        }
+
+        // --- frame IO --------------------------------------------------------
+
+        private void SendText(byte type, string text)
+        {
+            byte[] body = text != null ? Encoding.UTF8.GetBytes(text) : new byte[0];
+            byte[] payload = new byte[1 + body.Length];
+            payload[0] = type;
+            Array.Copy(body, 0, payload, 1, body.Length);
+            SendRaw(payload);
+        }
+
+        // payload already includes the leading type byte.
+        private void SendRaw(byte[] payload)
+        {
+            if (!_running) return;
+            byte[] frame = new byte[4 + payload.Length];
+            int len = payload.Length;
+            frame[0] = (byte)(len & 0xFF);
+            frame[1] = (byte)((len >> 8) & 0xFF);
+            frame[2] = (byte)((len >> 16) & 0xFF);
+            frame[3] = (byte)((len >> 24) & 0xFF);
+            Array.Copy(payload, 0, frame, 4, payload.Length);
+            try
+            {
+                lock (_writeLock) { _stdin.Write(frame, 0, frame.Length); _stdin.Flush(); }
+            }
+            catch (Exception ex) { NewPlugin.LogStatic("[OutOfProc] write failed: " + ex.Message); }
+        }
+
+        private static void WriteIntLE(byte[] b, int off, int v)
+        {
+            b[off] = (byte)(v & 0xFF);
+            b[off + 1] = (byte)((v >> 8) & 0xFF);
+            b[off + 2] = (byte)((v >> 16) & 0xFF);
+            b[off + 3] = (byte)((v >> 24) & 0xFF);
+        }
+
+        private void ReaderLoop()
+        {
+            try
+            {
+                while (_running)
+                {
+                    byte[] lenB = ReadFull(4);
+                    if (lenB == null) break;
+                    int len = lenB[0] | (lenB[1] << 8) | (lenB[2] << 16) | (lenB[3] << 24);
+                    if (len <= 0) continue;
+                    byte[] payload = ReadFull(len);
+                    if (payload == null) break;
+                    HandleEvent(payload);
+                }
+            }
+            catch (Exception ex) { NewPlugin.LogStatic("[OutOfProc] reader error: " + ex.Message); }
+            if (_running) NewPlugin.LogStatic("[OutOfProc] WebRTC host stream ended (process exited?).");
+        }
+
+        private void HandleEvent(byte[] payload)
+        {
+            byte type = payload[0];
+            int dlen = payload.Length - 1;
+            switch (type)
+            {
+                case 100: // LocalIce {peerId, candidate}
+                {
+                    JObject jo = JObject.Parse(Encoding.UTF8.GetString(payload, 1, dlen));
+                    var h = OnLocalIceCandidate;
+                    if (h != null) h((string)jo["peerId"], (string)jo["candidate"]);
+                    break;
+                }
+                case 101: // RemoteAudio [pidLen][pid][count][rate][int16*]
+                {
+                    int o = 1;
+                    int pidLen = ReadIntLE(payload, o); o += 4;
+                    string peerId = Encoding.UTF8.GetString(payload, o, pidLen); o += pidLen;
+                    int count = ReadIntLE(payload, o); o += 4;
+                    int rate = ReadIntLE(payload, o); o += 4;
+                    short[] pcm = new short[count];
+                    for (int i = 0; i < count; i++) { pcm[i] = (short)(payload[o] | (payload[o + 1] << 8)); o += 2; }
+                    var h = OnRemoteAudioFrame;
+                    if (h != null) h(peerId, pcm, count, rate);
+                    break;
+                }
+                case 102: // State {peerId,state}
+                {
+                    JObject jo = JObject.Parse(Encoding.UTF8.GetString(payload, 1, dlen));
+                    var h = OnConnectionStateChanged;
+                    if (h != null) h((string)jo["peerId"], (string)jo["state"]);
+                    break;
+                }
+                case 103: CompleteSdp(_offerWaiters, payload, dlen); break;
+                case 104: CompleteSdp(_answerWaiters, payload, dlen); break;
+                case 105: // Log
+                    NewPlugin.LogStatic(Encoding.UTF8.GetString(payload, 1, dlen));
+                    break;
+                default:
+                    NewPlugin.LogStatic("[OutOfProc] unknown event type " + type);
+                    break;
+            }
+        }
+
+        private void CompleteSdp(Dictionary<string, SdpWaiter> waiters, byte[] payload, int dlen)
+        {
+            JObject jo = JObject.Parse(Encoding.UTF8.GetString(payload, 1, dlen));
+            string peerId = (string)jo["peerId"];
+            string sdp = (string)jo["sdp"];
+            SdpWaiter w = null;
+            lock (_pendLock) { if (waiters.TryGetValue(peerId, out w)) waiters.Remove(peerId); }
+            if (w != null) { w.Sdp = sdp; w.Done.Set(); }
+        }
+
+        private static int ReadIntLE(byte[] b, int off)
+        {
+            return b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24);
+        }
+
+        private byte[] ReadFull(int n)
+        {
+            byte[] buf = new byte[n];
+            int off = 0;
+            while (off < n)
+            {
+                int r;
+                try { r = _stdout.Read(buf, off, n - off); }
+                catch { return null; }
+                if (r <= 0) return null;
+                off += r;
+            }
+            return buf;
+        }
+
+        public void Dispose()
+        {
+            _running = false;
+            try { CloseAll(); } catch { }
+            try { if (_stdin != null) _stdin.Close(); } catch { }
+            try
+            {
+                if (_proc != null && !_proc.WaitForExit(1500)) _proc.Kill();
+            }
+            catch { }
+            try { if (_reader != null) _reader.Join(1000); } catch { }
+        }
+    }
+}
+// =========  END OUT-OF-PROCESS WEBRTC HOST CLIENT  ===========================

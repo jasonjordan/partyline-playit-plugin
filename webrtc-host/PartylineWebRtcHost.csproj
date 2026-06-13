@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Partyline WebRTC host (Task 9). A standalone 64-bit console process that runs
+    SIPSorcery 6.2.4 in its OWN clean address space. The PlayIt Live plugin
+    (PartylinePlugin.dll) launches this exe and talks to it over a length-prefixed
+    binary protocol on stdin/stdout. Running WebRTC out-of-process sidesteps both
+    the host's shadowing SIPSorcery 5.2.3 AND the 32-bit address-space/stack limits
+    that crashed PlayItLive ("guard page cannot be created") when 6.2.4 ran in-proc
+    or in a child AppDomain.
+
+    Built x64 so it always gets a large address space (SIPSorcery's ICE/DTLS threads
+    then have room for normal 1 MB stacks, exactly as in any standalone 64-bit app).
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>PartylineWebRtcHost</AssemblyName>
+    <RootNamespace>Partyline.WebRtcHost</RootNamespace>
+    <LangVersion>9.0</LangVersion>
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <!-- Exclude from the parent plugin's default glob if ever built together. -->
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SIPSorcery" Version="6.2.4" />
+    <PackageReference Include="Concentus" Version="1.1.7" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+</Project>

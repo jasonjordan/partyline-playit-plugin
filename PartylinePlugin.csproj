@@ -29,6 +29,11 @@
   <ItemGroup>
     <Compile Remove="Tests/**/*.cs" />
     <None Remove="Tests/**/*" />
+    <!-- The webrtc-host/ folder is a separate net48 x64 console exe (the
+         out-of-process SIPSorcery 6.2.4 host). Keep its sources out of the
+         plugin assembly. -->
+    <Compile Remove="webrtc-host/**/*.cs" />
+    <None Remove="webrtc-host/**/*" />
   </ItemGroup>
 
   <!--
@@ -115,6 +120,44 @@
     </Reference>
     <Reference Include="System.Windows.Forms" />
     <Reference Include="System.Net.Http" />
+    <!-- ZipFile (extract the embedded WebRTC host) lives in these framework assemblies. -->
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
   </ItemGroup>
+
+  <!--
+    Out-of-process WebRTC host (Task 9). The plugin builds the PartylineWebRtcHost
+    console exe, zips its entire output folder, and embeds that single zip as a
+    manifest resource. At runtime the plugin extracts the zip to a temp folder and
+    launches the exe (OutOfProcessWebRtcPeer), keeping single-DLL deployment.
+    ReferenceOutputAssembly=false: we launch it as a process, never reference its
+    assembly.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="webrtc-host/PartylineWebRtcHost.csproj">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <Private>false</Private>
+      <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>
+    </ProjectReference>
+  </ItemGroup>
+
+  <Target Name="ZipAndEmbedWebRtcHost"
+          BeforeTargets="CoreCompile"
+          DependsOnTargets="ResolveProjectReferences">
+    <PropertyGroup>
+      <WebRtcHostOutDir>$(MSBuildProjectDirectory)/webrtc-host/bin/$(Configuration)/net48</WebRtcHostOutDir>
+      <WebRtcHostZip>$(IntermediateOutputPath)webrtchost.zip</WebRtcHostZip>
+    </PropertyGroup>
+    <ZipDirectory SourceDirectory="$(WebRtcHostOutDir)"
+                  DestinationFile="$(WebRtcHostZip)"
+                  Overwrite="true"
+                  Condition="Exists('$(WebRtcHostOutDir)')" />
+    <ItemGroup>
+      <EmbeddedResource Include="$(WebRtcHostZip)" Condition="Exists('$(WebRtcHostZip)')">
+        <LogicalName>Partyline.webrtchost.zip</LogicalName>
+        <Visible>false</Visible>
+      </EmbeddedResource>
+    </ItemGroup>
+  </Target>
 
 </Project>
