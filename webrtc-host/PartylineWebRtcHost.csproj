@@ -34,4 +34,30 @@
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
   </ItemGroup>
 
+  <!--
+    SIPSorcery 6.2.4 ships a crash bug in STUNErrorCodeAttribute: it parses the
+    ERROR-CODE class/number with BitConverter.ToChar(attributeValue, 2/3), which
+    reads TWO bytes and walks off the end of a minimal (4-byte, empty reason
+    phrase) ERROR-CODE attribute. Cloudflare's TURN Allocate 401 challenge carries
+    exactly such an attribute, so the very first TURN response throws
+    ArgumentException inside UdpReceiver.EndReceiveFrom, the ICE RTP receive socket
+    is torn down, and gathering collapses back to host-only candidates (ICE fails).
+
+    Moving to SIPSorcery 8.x fixes the parser but forces Concentus 2.x, whose Opus
+    API is incompatible with this host's encoder/decoder usage. Instead we keep the
+    6.2.4 NuGet package (so all transitive dependencies restore normally and the
+    code compiles against the unchanged public API) and overwrite just the
+    SIPSorcery.dll in the build output with a locally rebuilt 6.2.4 assembly that
+    has the two-line STUNErrorCodeAttribute fix (attributeValue[2]/[3]). SIPSorcery
+    is not strong-named, so the patched DLL keeps the same assembly identity and
+    loads transparently. The swapped DLL is what gets embedded into webrtchost.zip.
+  -->
+  <Target Name="ApplyPatchedSIPSorcery" AfterTargets="Build">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)/libs/SIPSorcery.dll"
+          DestinationFiles="$(OutDir)SIPSorcery.dll"
+          OverwriteReadOnlyFiles="true"
+          SkipUnchangedFiles="false" />
+    <Message Importance="high" Text="Partyline WebRTC host: applied patched SIPSorcery 6.2.4 (STUNErrorCodeAttribute fix) -> $(OutDir)SIPSorcery.dll" />
+  </Target>
+
 </Project>
