@@ -607,6 +607,13 @@ public class NewPlugin
         }
     }
 
+    /// <summary>Bytes of captured main-mix audio currently buffered (for the pump's
+    /// full-frame drain guard).</summary>
+    internal int ReturnAudioAvailableBytes()
+    {
+        lock (_returnLock) { return _returnAvailable; }
+    }
+
     public void MuteAll() { foreach (var c in _cohosts.Values) c.IsMuted = true; }
     public void UnmuteAll() { foreach (var c in _cohosts.Values) c.IsMuted = false; }
     public void KickAll() { _cohosts.Clear(); }
@@ -924,6 +931,7 @@ public class NewPlugin
     {
         Log("AudioPumpLoop started.");
         const int frameSamples = 960; // 20 ms @ 48 kHz mono
+        const int maxFramesPerTick = 8; // ~160 ms catch-up cap so we never spin
         short[] frame = new short[frameSamples];
         bool firstPushLogged = false;
 
@@ -931,16 +939,29 @@ public class NewPlugin
         {
             try
             {
-                // Always drain a frame so the ring buffer does not accumulate latency.
-                bool haveFrame = TryReadMainMixFrame(frame);
-
-                // Co-hosts always hear the program: the captured main mix is sent to
-                // every connected peer unconditionally (no mic-toggle gating). Snapshot
-                // the field so a concurrent peer swap is safe.
                 IWebRtcPeer peer = _webRtcPeer;
-                if (haveFrame && peer != null)
+
+                // Drain EVERY complete 20 ms frame the capture DSP has buffered, not
+                // just one per wake. The DSP fills the return ring at real time (mixer
+                // rate), but Thread.Sleep wakes ~15-31 ms apart on Windows; pushing a
+                // single fixed frame per wake drained the ring slower than real time,
+                // so the overflow guard discarded audio and the surviving frames played
+                // back-to-back in the browser — time-compressed (chipmunk) with periodic
+                // gaps. Draining all complete frames each tick tracks real time and keeps
+                // latency bounded. The availability guard also avoids emitting a frame
+                // built from a partial (sub-20 ms) chunk.
+                int srcFreq = _mixerFreq > 0 ? _mixerFreq : 44100;
+                int inputBytesPerFrame = ((int)((long)frameSamples * srcFreq / 48000)) * 2;
+                if (inputBytesPerFrame < 2) inputBytesPerFrame = 2;
+
+                int pushed = 0;
+                while (peer != null
+                       && pushed < maxFramesPerTick
+                       && ReturnAudioAvailableBytes() >= inputBytesPerFrame
+                       && TryReadMainMixFrame(frame))
                 {
                     peer.PushOutboundAudio(frame, frameSamples, 48000, 1);
+                    pushed++;
                     if (!firstPushLogged)
                     {
                         firstPushLogged = true;
@@ -952,7 +973,7 @@ public class NewPlugin
             {
                 Log("AudioPumpLoop error: " + ex.Message);
             }
-            Thread.Sleep(20);
+            Thread.Sleep(10);
         }
         Log("AudioPumpLoop exited.");
     }
