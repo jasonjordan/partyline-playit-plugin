@@ -633,6 +633,40 @@ public class NewPlugin
     private void OnWebRtcConnectionStateChanged(string peerId, string state)
     {
         Log("WebRTC connection state [" + (peerId ?? "?") + "]: " + (state ?? "?"));
+        if (string.IsNullOrEmpty(peerId)) return;
+        string s = (state ?? "").ToLowerInvariant();
+        if (s == "connected" || s == "completed")
+        {
+            _connectedPeers[peerId] = true;
+        }
+        else if (s == "failed" || s == "closed" || s == "disconnected")
+        {
+            bool ignored;
+            _connectedPeers.TryRemove(peerId, out ignored);
+            // Drop any stale quality reading so the strip doesn't show a dead peer.
+            CohostNetStat removed;
+            _cohostNetStats.TryRemove(peerId, out removed);
+        }
+    }
+
+    // Peers whose WebRTC connection is currently established (drives the strip's
+    // connected/offline status in the new mesh model — replaces the relay-era
+    // AuthenticationManager session check).
+    private static readonly ConcurrentDictionary<string, bool> _connectedPeers =
+        new ConcurrentDictionary<string, bool>();
+
+    /// <summary>True while a live WebRTC connection to <paramref name="peerId"/> exists.</summary>
+    public static bool IsPeerConnected(string peerId)
+    {
+        if (string.IsNullOrEmpty(peerId)) return false;
+        bool v;
+        return _connectedPeers.TryGetValue(peerId, out v) && v;
+    }
+
+    /// <summary>Snapshot of currently-connected peer ids (for the UI to enumerate).</summary>
+    public static List<string> GetConnectedPeers()
+    {
+        return new List<string>(_connectedPeers.Keys);
     }
 
     /// <summary>
@@ -2471,7 +2505,12 @@ public class PartylineControlPanel : UserControl
     private CoHostRow CreateRow(CoHostAccount account, int yOffset)
     {
         CoHostRow row = new CoHostRow();
-        row.CohostId = account.Username;
+        // The mesh/worker identity for a co-host is the published invite name
+        // (DisplayName ?? Username), which becomes their peerId — and therefore the
+        // key used by the AudioMixer, connection tracking, telemetry, and quality.
+        // Row id MUST match that (mirrors PublishInvitesOnce) or per-row VU/latency/
+        // connection/quality lookups silently miss.
+        row.CohostId = !string.IsNullOrEmpty(account.DisplayName) ? account.DisplayName : account.Username;
 
         // Row panel
         Panel rowPanel = new Panel();
@@ -2786,8 +2825,10 @@ public class PartylineControlPanel : UserControl
                 row.VuFill.BackColor = System.Drawing.Color.FromArgb(34, 197, 94);
             }
 
-            // Update connected indicator pill (based on active session, not audio)
-            bool connected = _authManager.HasActiveSession(row.CohostId) || _authManager.HasAnyActiveSession();
+            // Update connected indicator pill — driven by the live WebRTC mesh
+            // connection state (the relay-era AuthenticationManager no longer tracks
+            // mesh co-hosts, which is why this previously showed "Offline").
+            bool connected = NewPlugin.IsPeerConnected(row.CohostId);
             NewPlugin.CohostNetStat net = connected ? NewPlugin.GetCohostNetStat(row.CohostId) : null;
             if (connected)
             {
