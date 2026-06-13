@@ -5842,15 +5842,72 @@ namespace Partyline.WebRtc
         }
 
         // --- Forwarded IWebRtcPeer operations (default -> child) -------------
-        public void SetIceServers(WebRtcIceServer[] iceServers) { _peer.SetIceServers(iceServers); }
-        public void CreatePeerConnection(string peerId) { _peer.CreatePeerConnection(peerId); }
-        public void ClosePeerConnection(string peerId) { _peer.ClosePeerConnection(peerId); }
-        public void CloseAll() { if (_peer != null) _peer.CloseAll(); }
-        public string CreateOffer(string peerId) { return _peer.CreateOffer(peerId); }
-        public string CreateAnswer(string peerId) { return _peer.CreateAnswer(peerId); }
-        public void ApplyRemoteDescription(string peerId, string type, string sdp) { _peer.ApplyRemoteDescription(peerId, type, sdp); }
-        public void AddIceCandidate(string peerId, string candidateJson) { _peer.AddIceCandidate(peerId, candidateJson); }
+        // Heavy SIPSorcery operations run on a dedicated thread with a LARGE stack.
+        // The cross-AppDomain transition consumes stack before SIPSorcery's deep
+        // peer-connection/DTLS/ICE setup runs; on the default 1 MB caller stack that
+        // overflowed and crashed the 32-bit host ("guard page cannot be created").
+        // A 16 MB executor stack gives that synchronous setup room, and serializes
+        // SIPSorcery access. PushOutboundAudio stays direct (shallow ring-buffer write).
+        public void SetIceServers(WebRtcIceServer[] iceServers) { Exec(() => _peer.SetIceServers(iceServers)); }
+        public void CreatePeerConnection(string peerId) { Exec(() => _peer.CreatePeerConnection(peerId)); }
+        public void ClosePeerConnection(string peerId) { Exec(() => _peer.ClosePeerConnection(peerId)); }
+        public void CloseAll() { if (_peer != null) Exec(() => _peer.CloseAll()); }
+        public string CreateOffer(string peerId) { return Exec(() => _peer.CreateOffer(peerId)); }
+        public string CreateAnswer(string peerId) { return Exec(() => _peer.CreateAnswer(peerId)); }
+        public void ApplyRemoteDescription(string peerId, string type, string sdp) { Exec(() => _peer.ApplyRemoteDescription(peerId, type, sdp)); }
+        public void AddIceCandidate(string peerId, string candidateJson) { Exec(() => _peer.AddIceCandidate(peerId, candidateJson)); }
         public void PushOutboundAudio(short[] pcm, int sampleCount, int sampleRate, int channels) { _peer.PushOutboundAudio(pcm, sampleCount, sampleRate, channels); }
+
+        // --- Large-stack single-threaded executor ---------------------------
+        private Thread _execThread;
+        private readonly object _execQLock = new object();
+        private readonly Queue<Action> _execQueue = new Queue<Action>();
+        private readonly AutoResetEvent _execSignal = new AutoResetEvent(false);
+
+        private void EnsureExecThread()
+        {
+            if (_execThread != null) return;
+            lock (_execQLock)
+            {
+                if (_execThread != null) return;
+                _execThread = new Thread(ExecLoop, 16 * 1024 * 1024) { IsBackground = true, Name = "SipSorceryExec" };
+                _execThread.Start();
+            }
+        }
+
+        private void ExecLoop()
+        {
+            while (true)
+            {
+                Action a = null;
+                lock (_execQLock) { if (_execQueue.Count > 0) a = _execQueue.Dequeue(); }
+                if (a == null) { _execSignal.WaitOne(100); continue; }
+                try { a(); } catch (Exception ex) { NewPlugin.LogStatic("[Isolated] exec op error: " + ex.Message); }
+            }
+        }
+
+        private void Exec(Action a)
+        {
+            EnsureExecThread();
+            Exception err = null;
+            using (var done = new ManualResetEventSlim(false))
+            {
+                lock (_execQLock)
+                {
+                    _execQueue.Enqueue(() => { try { a(); } catch (Exception e) { err = e; } finally { done.Set(); } });
+                }
+                _execSignal.Set();
+                done.Wait();
+            }
+            if (err != null) NewPlugin.LogStatic("[Isolated] op threw: " + err.Message);
+        }
+
+        private T Exec<T>(Func<T> f)
+        {
+            T result = default(T);
+            Exec(() => { result = f(); });
+            return result;
+        }
 
         public override object InitializeLifetimeService() { return null; }
     }
