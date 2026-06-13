@@ -2410,11 +2410,23 @@ public class PartylineConfigForm : Form
     // than a broken link.
     private string BuildJoinUrl(CoHostAccount acct)
     {
-        if (acct == null || string.IsNullOrEmpty(acct.Hash)) return "";
-        string code = NewPlugin.CohostCode(acct.Hash);
-        if (string.IsNullOrEmpty(code)) return "";
-        // Minimal co-host URL: just the short code on the co-host domain.
-        return "https://partyline.compressed.stream/" + code;
+        // Stable room link: the co-host URL is derived from the ROOM slug (not the
+        // co-host account), so it never changes when accounts are added/edited.
+        // The co-host logs in with their name + password; ?n= just prefills the name.
+        try
+        {
+            string[] ident = _settingsManager.EnsureRoomIdentity();
+            string slug = (ident != null && ident.Length > 0) ? ident[0] : "";
+            if (string.IsNullOrEmpty(slug)) return "";
+            string code = slug.Length > 6 ? slug.Substring(0, 6).ToLowerInvariant() : slug.ToLowerInvariant();
+            string url = "https://partyline.compressed.stream/" + code;
+            string name = (acct != null)
+                ? (!string.IsNullOrEmpty(acct.DisplayName) ? acct.DisplayName : acct.Username)
+                : null;
+            if (!string.IsNullOrEmpty(name)) url += "?n=" + Uri.EscapeDataString(name);
+            return url;
+        }
+        catch { return ""; }
     }
 
     private void LoadGrid()
