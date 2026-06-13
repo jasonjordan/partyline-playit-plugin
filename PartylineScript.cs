@@ -23,7 +23,7 @@ public class NewPlugin
 
     // Hardcoded signaling server (Cloudflare Worker custom domain). The signaling
     // endpoint is not user-configurable — the plugin always talks to this origin.
-    private const string SignalingBaseUrl = "https://signalling.compressed.stream";
+    private const string SignalingBaseUrl = "https://partyline.compressed.stream";
 
     private static string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Partyline", "partyline.log");
     private SettingsManager _settingsManager = new SettingsManager();
