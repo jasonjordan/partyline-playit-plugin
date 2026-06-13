@@ -5241,12 +5241,21 @@ namespace Partyline.WebRtc
                 {
                     WebRtcIceServer s = iceServers[i];
                     if (s == null || s.Urls == null || s.Urls.Length == 0) continue;
-                    var srv = new RTCIceServer();
-                    // SIPSorcery's RTCIceServer.urls is a single (comma-separated) string.
-                    srv.urls = string.Join(",", s.Urls);
-                    if (s.Username != null) srv.username = s.Username;
-                    if (s.Credential != null) srv.credential = s.Credential;
-                    config.iceServers.Add(srv);
+                    // One RTCIceServer per URL. SIPSorcery parses a single STUN/TURN
+                    // URI per entry and does NOT reliably split a comma-joined list,
+                    // so joining (the previous behaviour) produced an unparseable
+                    // url and yielded zero srflx/relay candidates (Task 9). Splitting
+                    // into one entry per URL lets each STUN/TURN server be gathered.
+                    for (int u = 0; u < s.Urls.Length; u++)
+                    {
+                        string url = s.Urls[u];
+                        if (string.IsNullOrEmpty(url)) continue;
+                        var srv = new RTCIceServer();
+                        srv.urls = url;
+                        if (s.Username != null) srv.username = s.Username;
+                        if (s.Credential != null) srv.credential = s.Credential;
+                        config.iceServers.Add(srv);
+                    }
                 }
             }
 
@@ -5262,7 +5271,7 @@ namespace Partyline.WebRtc
                 try { existing[i].Pc.setConfiguration(config); }
                 catch (Exception ex) { NewPlugin.LogStatic("[SIPSorcery] setConfiguration failed for " + existing[i].PeerId + ": " + ex.Message); }
             }
-            NewPlugin.LogStatic("[SIPSorcery] Applied " + config.iceServers.Count + " ICE server entries.");
+            NewPlugin.LogStatic("[SIPSorcery] Applied " + config.iceServers.Count + " ICE server entries (one per URL).");
         }
 
         // --- Connection lifecycle (one RTCPeerConnection per remote peerId) --

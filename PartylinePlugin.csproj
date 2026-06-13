@@ -9,15 +9,14 @@
   </PropertyGroup>
 
   <!--
-    MR-WebRTC primary adapter (task 5.2). Now ON by default: it is the native
-    Google-libwebrtc engine with full ICE/TURN relay (required on CGNAT/Starlink),
-    where the managed SIPSorcery fallback failed to gather relay candidates. The
-    native mrwebrtc.dll is embedded into PartylinePlugin.dll (see below) so the
-    build stays single-file. To build the SIPSorcery-only fallback instead:
-        dotnet build -p:PartylineMrWebRtc=false
+    MR-WebRTC primary adapter (task 5.2). DISABLED: MR-WebRTC 2.0.2 (the last
+    release) only ships DeviceAudioTrackSource (hardware-mic capture) and has NO
+    ExternalAudioTrackSource / AudioFrameRequest, so it cannot accept the pushed
+    PCM from the BASS program-mix tap. The adapter is kept behind this symbol for
+    reference only; the SIPSorcery + Concentus path is the active transport.
   -->
   <PropertyGroup>
-    <PartylineMrWebRtc Condition="'$(PartylineMrWebRtc)' == ''">true</PartylineMrWebRtc>
+    <PartylineMrWebRtc Condition="'$(PartylineMrWebRtc)' == ''">false</PartylineMrWebRtc>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(PartylineMrWebRtc)' == 'true'">
