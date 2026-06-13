@@ -614,6 +614,7 @@ public class NewPlugin
     /// changed from raw-PCM-over-WebSocket to Opus-over-WebRTC.
     /// (Requirement 5.3)
     /// </summary>
+    private bool _firstRemoteFrameLogged;
     private void OnRemoteAudioFrame(string peerId, short[] pcm, int sampleCount, int sampleRate)
     {
         if (_audioMixer == null || peerId == null || pcm == null || sampleCount <= 0) return;
@@ -623,6 +624,13 @@ public class NewPlugin
 
         byte[] mixerPcm = ResampleToMixerRate(pcm, sampleCount, srcRate, dstRate);
         if (mixerPcm.Length == 0) return;
+
+        if (!_firstRemoteFrameLogged)
+        {
+            _firstRemoteFrameLogged = true;
+            Log("First decoded remote audio frame ingested into mixer from " + peerId
+                + " (" + sampleCount + " samples @ " + srcRate + "Hz -> " + dstRate + "Hz)");
+        }
 
         _audioMixer.EnsureCoHost(peerId);
         _audioMixer.IngestAudio(peerId, mixerPcm, mixerPcm.Length);
@@ -5033,6 +5041,11 @@ namespace Partyline.WebRtc
             public RTCPeerConnection Pc;
             public OpusDecoder Decoder;
             public readonly object DecodeLock = new object();
+            // Diagnostics: one-time log flags + counters for the media bridge.
+            public bool FirstRtpLogged;
+            public long RtpReceived;
+            public bool FirstSendLogged;
+            public bool FirstSendErrorLogged;
         }
 
         // --- ICE configuration ----------------------------------------------
@@ -5296,8 +5309,24 @@ namespace Partyline.WebRtc
             {
                 for (int f = 0; f < encodedFrames.Count; f++)
                 {
-                    try { targets[p].Pc.SendAudio((uint)FrameSamples, encodedFrames[f]); }
-                    catch { /* a single peer's send failure must not stop the others */ }
+                    try
+                    {
+                        targets[p].Pc.SendAudio((uint)FrameSamples, encodedFrames[f]);
+                        if (!targets[p].FirstSendLogged)
+                        {
+                            targets[p].FirstSendLogged = true;
+                            NewPlugin.LogStatic("[SIPSorcery] first outbound audio RTP sent to " + targets[p].PeerId);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log the first failure per peer (don't silently swallow forever).
+                        if (!targets[p].FirstSendErrorLogged)
+                        {
+                            targets[p].FirstSendErrorLogged = true;
+                            NewPlugin.LogStatic("[SIPSorcery] SendAudio failed for " + targets[p].PeerId + ": " + ex.Message);
+                        }
+                    }
                 }
             }
         }
@@ -5399,6 +5428,13 @@ namespace Partyline.WebRtc
             {
                 if (media != SDPMediaTypesEnum.audio) return;
                 if (pkt == null || pkt.Payload == null || pkt.Payload.Length == 0) return;
+                e.RtpReceived++;
+                if (!e.FirstRtpLogged)
+                {
+                    e.FirstRtpLogged = true;
+                    NewPlugin.LogStatic("[SIPSorcery] first inbound audio RTP from " + peerId
+                        + " (pt=" + pkt.Header.PayloadType + ", " + pkt.Payload.Length + " bytes)");
+                }
                 DecodeRemote(e, pkt.Payload);
             };
         }
