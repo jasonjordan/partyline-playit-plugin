@@ -481,7 +481,12 @@ namespace Partyline.WebRtcHost
         private static string BuildCandidateJson(RTCIceCandidate cand)
         {
             var jo = new JObject();
-            jo["candidate"] = cand.candidate != null ? cand.candidate : "";
+            // The browser's addIceCandidate requires the "candidate:" prefix on the
+            // candidate attribute; SIPSorcery's .candidate omits it, which caused the
+            // browser's "OperationError: Error processing ICE candidate".
+            string c = cand.candidate != null ? cand.candidate : "";
+            if (c.Length > 0 && !c.StartsWith("candidate:", StringComparison.OrdinalIgnoreCase)) c = "candidate:" + c;
+            jo["candidate"] = c;
             jo["sdpMid"] = cand.sdpMid != null ? (JToken)cand.sdpMid : JValue.CreateNull();
             jo["sdpMLineIndex"] = (int)cand.sdpMLineIndex;
             return jo.ToString(Newtonsoft.Json.Formatting.None);

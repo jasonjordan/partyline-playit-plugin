@@ -1,10 +1,39 @@
 using System;
 using System.IO;
 using System.Text;
+using Microsoft.Extensions.Logging;
 using Newtonsoft.Json.Linq;
 
 namespace Partyline.WebRtcHost
 {
+    // Minimal ILogger that routes SIPSorcery's internal logging into our IPC log
+    // frames, so the plugin's partyline.log shows exactly why ICE gathering
+    // (STUN/TURN) succeeds or fails. Implemented against the Abstractions package
+    // only (no concrete logging dependency).
+    internal sealed class HostLoggerFactory : ILoggerFactory
+    {
+        public void AddProvider(ILoggerProvider provider) { }
+        public ILogger CreateLogger(string categoryName) => new HostLogger();
+        public void Dispose() { }
+    }
+
+    internal sealed class HostLogger : ILogger
+    {
+        public IDisposable BeginScope<TState>(TState state) => null;
+        public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Debug;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception exception, Func<TState, Exception, string> formatter)
+        {
+            try
+            {
+                if (logLevel < LogLevel.Debug) return;
+                string msg = formatter != null ? formatter(state, exception) : (state != null ? state.ToString() : "");
+                if (exception != null) msg += " :: " + exception.Message;
+                HostLog.Write("[sip:" + logLevel + "] " + msg);
+            }
+            catch { }
+        }
+    }
+
     /// <summary>
     /// Out-of-process WebRTC host. Reads length-prefixed binary frames from stdin
     /// (commands from the plugin) and writes event frames to stdout. All numbers
@@ -42,6 +71,11 @@ namespace Partyline.WebRtcHost
             _out = Console.OpenStandardOutput();
 
             HostLog.Write = (s) => WriteFrame(105, Encoding.UTF8.GetBytes(s ?? ""));
+
+            // Route SIPSorcery's internal logging into our IPC log so ICE gathering
+            // diagnostics (STUN/TURN, DNS, candidate errors) are visible in the plugin log.
+            try { SIPSorcery.LogFactory.Set(new HostLoggerFactory()); }
+            catch (Exception ex) { HostLog.Write("[host] could not set SIPSorcery logger: " + ex.Message); }
 
             _peer = new SipPeer();
             _peer.OnLocalIceCandidate = (peerId, candJson) =>
