@@ -2481,6 +2481,7 @@ public class PartylineConfigForm : Form
         _txtDisplayName.Text = "";
         _txtUsername.Enabled = true;
         _editPanel.Visible = true;
+        _editPanel.BringToFront();
     }
 
     private void BeginEdit(int index)
@@ -2493,6 +2494,7 @@ public class PartylineConfigForm : Form
         _txtDisplayName.Text = acct.DisplayName;
         _txtUsername.Enabled = false;
         _editPanel.Visible = true;
+        _editPanel.BringToFront();
     }
 
     private void OnSaveClick(object sender, EventArgs e)
