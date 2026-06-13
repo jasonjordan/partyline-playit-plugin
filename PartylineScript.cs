@@ -191,11 +191,12 @@ public class NewPlugin
     private static bool _sipPreloadDone;
 
     /// <summary>
-    /// Eagerly loads the Costura-embedded SIPSorcery 6.2.4 assembly into the
-    /// process before any SIPSorcery type is referenced, so it wins simple-name
-    /// binding over a host-shipped older copy (Task 9). Also logs any SIPSorcery
-    /// DLLs found in the host app directory for diagnostics. Best-effort: any
-    /// failure is logged and ignored (we still fall through to whatever binds).
+    /// Diagnostic only: logs any SIPSorcery DLLs found in the host app directory.
+    /// The actual 6.2.4 engine now runs in an isolated child AppDomain
+    /// (IsolatedSipSorceryPeer), so we intentionally do NOT load SIPSorcery into
+    /// the default domain here — doing so just duplicated the assembly and added
+    /// memory pressure in the 32-bit host (it contributed to a stack/address-space
+    /// exhaustion crash). Kept as a one-time diagnostic.
     /// </summary>
     internal static void PreloadBundledSipSorcery()
     {
@@ -217,72 +218,9 @@ public class NewPlugin
             }
         }
         catch { }
-
-        try
-        {
-            var self = typeof(NewPlugin).Assembly;
-
-            // Costura embeds managed deps as resources named
-            // "costura.<simplename>.dll" or ".dll.compressed" (gzip), lowercased.
-            string resName = null;
-            bool compressed = false;
-            foreach (var n in self.GetManifestResourceNames())
-            {
-                if (n.IndexOf("sipsorcery", StringComparison.OrdinalIgnoreCase) < 0) continue;
-                if (n.EndsWith(".dll.compressed", StringComparison.OrdinalIgnoreCase)) { resName = n; compressed = true; break; }
-                if (n.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)) { resName = n; compressed = false; break; }
-            }
-
-            if (resName == null)
-            {
-                LogStatic("[SIPSorcery] preload: no embedded SIPSorcery resource (Costura); relying on probing.");
-                return;
-            }
-
-            byte[] raw;
-            using (var rs = self.GetManifestResourceStream(resName))
-            {
-                if (rs == null) { LogStatic("[SIPSorcery] preload: resource stream null for " + resName); return; }
-                using (var ms = new MemoryStream())
-                {
-                    if (compressed)
-                    {
-                        // Costura.Fody compresses embedded assemblies with Deflate
-                        // (NOT GZip). Use DeflateStream to decompress the resource.
-                        using (var ds = new System.IO.Compression.DeflateStream(rs, System.IO.Compression.CompressionMode.Decompress))
-                            ds.CopyTo(ms);
-                    }
-                    else
-                    {
-                        rs.CopyTo(ms);
-                    }
-                    raw = ms.ToArray();
-                }
-            }
-
-            var asm = System.Reflection.Assembly.Load(raw);
-            var an = asm.GetName();
-            LogStatic("[SIPSorcery] preload: loaded embedded " + an.Name + " " + an.Version + " into process.");
-
-            // Belt-and-suspenders: if anything later asks for "SIPSorcery" and the
-            // loader would otherwise resolve the host's older copy, hand back the
-            // version we just loaded.
-            AppDomain.CurrentDomain.AssemblyResolve += (s, e) =>
-            {
-                try
-                {
-                    var reqName = new System.Reflection.AssemblyName(e.Name).Name;
-                    if (string.Equals(reqName, an.Name, StringComparison.OrdinalIgnoreCase)) return asm;
-                }
-                catch { }
-                return null;
-            };
-        }
-        catch (Exception ex)
-        {
-            LogStatic("[SIPSorcery] preload failed: " + ex.Message);
-        }
     }
+
+    // (former eager-preload body removed: the engine runs in the isolated domain)
 
     /// <summary>
     /// The short (<=6 char) invite code for a co-host account, derived from its
@@ -5248,21 +5186,28 @@ namespace Partyline.WebRtc
         {
             var config = new RTCConfiguration();
             config.iceServers = new List<RTCIceServer>();
+            // Cap the gathered servers. SIPSorcery spins up a STUN/TURN client per
+            // entry; in the 32-bit host (with the isolated AppDomain doubling the
+            // footprint) ~10 entries exhausted thread-stack address space and
+            // crashed PlayItLive. We keep at most one STUN (for srflx) and two TURN
+            // URLs (one relay path is enough on CGNAT/Starlink).
+            int stunKept = 0, turnKept = 0;
+            const int MaxStun = 1, MaxTurn = 2;
             if (iceServers != null)
             {
                 for (int i = 0; i < iceServers.Length; i++)
                 {
                     WebRtcIceServer s = iceServers[i];
                     if (s == null || s.Urls == null || s.Urls.Length == 0) continue;
-                    // One RTCIceServer per URL. SIPSorcery parses a single STUN/TURN
-                    // URI per entry and does NOT reliably split a comma-joined list,
-                    // so joining (the previous behaviour) produced an unparseable
-                    // url and yielded zero srflx/relay candidates (Task 9). Splitting
-                    // into one entry per URL lets each STUN/TURN server be gathered.
                     for (int u = 0; u < s.Urls.Length; u++)
                     {
                         string url = s.Urls[u];
                         if (string.IsNullOrEmpty(url)) continue;
+                        bool isTurn = url.StartsWith("turn:", StringComparison.OrdinalIgnoreCase)
+                                   || url.StartsWith("turns:", StringComparison.OrdinalIgnoreCase);
+                        if (isTurn) { if (turnKept >= MaxTurn) continue; turnKept++; }
+                        else { if (stunKept >= MaxStun) continue; stunKept++; }
+
                         var srv = new RTCIceServer();
                         srv.urls = url;
                         if (s.Username != null) srv.username = s.Username;
@@ -5284,7 +5229,7 @@ namespace Partyline.WebRtc
                 try { existing[i].Pc.setConfiguration(config); }
                 catch (Exception ex) { NewPlugin.LogStatic("[SIPSorcery] setConfiguration failed for " + existing[i].PeerId + ": " + ex.Message); }
             }
-            NewPlugin.LogStatic("[SIPSorcery] Applied " + config.iceServers.Count + " ICE server entries (one per URL).");
+            NewPlugin.LogStatic("[SIPSorcery] Applied " + config.iceServers.Count + " ICE server entries (capped: " + stunKept + " STUN, " + turnKept + " TURN).");
         }
 
         // --- Connection lifecycle (one RTCPeerConnection per remote peerId) --
