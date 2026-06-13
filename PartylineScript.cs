@@ -142,13 +142,27 @@ public class NewPlugin
 
     // DIAGNOSTIC: capture-rate measurement (samples/sec produced by the mixer DSP).
     private long _dspMonoSamplesSinceLog;
+    private long _dspFloatsSinceLog;
     private System.Diagnostics.Stopwatch _dspRateClock;
+    // Effective channel count of the DSP float buffer, detected from actual
+    // throughput. BASS_ChannelGetInfo can report 2 channels while the tap actually
+    // delivers a MONO float stream; trusting the reported count made the downmix
+    // average adjacent mono samples (heavy distortion + half rate). 0 = not yet
+    // detected (use the reported count until the first measurement).
+    private volatile int _dspChannels;
     // Measured actual capture rate (mono samples/sec of wall clock). The mixer DSP
     // tap can deliver at a rate that does NOT match BASS_ChannelGetInfo's reported
     // freq (observed ~22050 against a reported 44100), which made the outbound
     // resample assume 2x the real rate -> chipmunk + gaps. We drive the outbound
     // resample from THIS measured value so it is correct whatever the tap delivers.
     private volatile int _captureRateHz;
+    // Measured/derived true channel count of the DSP float buffer. BASS reports the
+    // MIXER's channel count, which here disagrees with what the tap actually
+    // delivers (reports 2, delivers mono). Treating a mono buffer as stereo averaged
+    // adjacent samples -> a crude 2:1 decimation that heavily distorted the audio.
+    // We derive the real count from floats/sec vs the reported mixer freq.
+    private volatile int _captureChannels;
+    private long _dspFloatsSinceLog;
     // DIAGNOSTIC: outbound pump push-rate measurement.
     private long _pumpFramesSinceLog;
     private System.Diagnostics.Stopwatch _pumpRateClock;
@@ -557,7 +571,8 @@ public class NewPlugin
         try
         {
             int floatSamples = length / 4;
-            int channels = _mixerChannels;
+            int channels = _captureChannels > 0 ? _captureChannels : (_mixerChannels > 0 ? _mixerChannels : 1);
+            if (channels < 1) channels = 1;
             int monoSamples = floatSamples / channels;
 
             // Copy float data from native buffer
@@ -610,21 +625,36 @@ public class NewPlugin
             // resample. For this tap it is ~half the reported mixer freq, which is
             // exactly what made playback 2x (chipmunk). A 1 s window locks quickly.
             _dspMonoSamplesSinceLog += monoSamples;
+            _dspFloatsSinceLog += floatSamples;
             if (_dspRateClock == null) _dspRateClock = System.Diagnostics.Stopwatch.StartNew();
             long dspMs = _dspRateClock.ElapsedMilliseconds;
             if (dspMs >= 1000)
             {
+                // Derive the buffer's REAL channel count: a freq-Hz stream of N
+                // channels delivers N*freq floats/sec. floats/sec is independent of
+                // any channel assumption, so this corrects a wrong reported count.
+                int floatsRate = (int)(_dspFloatsSinceLog * 1000L / dspMs);
+                int derivedCh = (int)Math.Round((double)floatsRate / Math.Max(1, _mixerFreq));
+                if (derivedCh < 1) derivedCh = 1;
+                if (derivedCh > 8) derivedCh = 8;
+                bool chChanged = (_captureChannels != derivedCh);
+                _captureChannels = derivedCh;
+
                 int rate = (int)(_dspMonoSamplesSinceLog * 1000L / dspMs);
                 if (rate >= 8000 && rate <= 96000)
                 {
-                    // Light smoothing once established; snap directly on first measure.
-                    _captureRateHz = _captureRateHz > 0 ? (_captureRateHz + rate) / 2 : rate;
+                    // Snap on first measure or when the channel count just changed
+                    // (the startup transient); otherwise smooth gently.
+                    if (chChanged || _captureRateHz == 0) _captureRateHz = rate;
+                    else _captureRateHz = (_captureRateHz * 3 + rate) / 4;
                 }
                 int backlog;
                 lock (_returnLock) { backlog = _returnAvailable; }
                 Log("DIAG capture rate=" + rate + " samples/sec (reported mixer ~" + _mixerFreq
-                    + ", using " + _captureRateHz + "); ring backlog=" + backlog + " bytes");
+                    + ", using " + _captureRateHz + "); bufChannels reported=" + _mixerChannels
+                    + " derived=" + derivedCh + "; ring backlog=" + backlog + " bytes");
                 _dspMonoSamplesSinceLog = 0;
+                _dspFloatsSinceLog = 0;
                 _dspRateClock.Restart();
             }
         }
