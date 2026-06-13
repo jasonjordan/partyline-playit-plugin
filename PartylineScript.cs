@@ -345,7 +345,10 @@ public class NewPlugin
             // room name, or room password. The plugin claims its own room with a
             // private DJ key and authorizes co-hosts via per-user invite passwords.
             string[] ident = _settingsManager.EnsureRoomIdentity();
-            string[] meta = _settingsManager.LoadMeta(); // [roomName, stationName, djName]
+            string[] metaNames = _settingsManager.LoadMeta(); // [roomName, stationName, djName]
+            // Append the DJ's optional custom Room ID as a 4th element so the mesh
+            // client can publish it to the server (provision + invites).
+            string[] meta = new string[] { metaNames[0], metaNames[1], metaNames[2], _settingsManager.LoadRoomCode() };
             string meshBaseUrl = SignalingBaseUrl;
             string meshSlug = ident[0];   // public room id (appears in invite URLs)
             string djKey = ident[1];      // private DJ credential (never shared)
@@ -666,7 +669,8 @@ public class NewPlugin
             try
             {
                 List<CoHostAccount> accounts = _settingsManager.Load();
-                string[] meta = _settingsManager.LoadMeta();
+                string[] m = _settingsManager.LoadMeta();
+                string[] meta = new string[] { m[0], m[1], m[2], _settingsManager.LoadRoomCode() };
                 if (_webRtcMesh != null) _webRtcMesh.RepublishConfig(accounts, meta);
             }
             catch (Exception ex)
@@ -1765,7 +1769,54 @@ public class SettingsManager
         return new string[] { "", "", "" };
     }
 
+    /// <summary>
+    /// The DJ-chosen custom room id (the public code co-hosts type into the join
+    /// link). Stored in meta.json alongside the display names. Empty when unset, in
+    /// which case the server falls back to the slug-derived code. Always returned
+    /// lowercased to match the case-insensitive join resolution.
+    /// </summary>
+    public string LoadRoomCode()
+    {
+        try
+        {
+            if (File.Exists(MetaPath))
+            {
+                string json = File.ReadAllText(MetaPath, Encoding.UTF8);
+                string code = ExtractTopLevelString(json, "roomCode");
+                return SanitizeRoomCode(code);
+            }
+        }
+        catch (Exception ex)
+        {
+            NewPlugin.LogStatic("ERROR reading roomCode: " + ex.Message);
+        }
+        return "";
+    }
+
+    /// <summary>
+    /// Normalises a room id to the server's accepted shape: trimmed, lowercased,
+    /// 1-24 chars of [a-z0-9_-] only. Returns "" if it cannot be made valid.
+    /// </summary>
+    public static string SanitizeRoomCode(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return "";
+        string code = raw.Trim().ToLowerInvariant();
+        if (code.Length == 0 || code.Length > 24) return "";
+        for (int i = 0; i < code.Length; i++)
+        {
+            char ch = code[i];
+            bool ok = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_';
+            if (!ok) return "";
+        }
+        return code;
+    }
+
     public void SaveMeta(string roomName, string stationName, string djName)
+    {
+        SaveMeta(roomName, stationName, djName, LoadRoomCode());
+    }
+
+    public void SaveMeta(string roomName, string stationName, string djName, string roomCode)
     {
         try
         {
@@ -1775,6 +1826,7 @@ public class SettingsManager
             sb.Append("{\"roomName\":").Append(EscapeJsonString(roomName ?? ""));
             sb.Append(",\"stationName\":").Append(EscapeJsonString(stationName ?? ""));
             sb.Append(",\"djName\":").Append(EscapeJsonString(djName ?? ""));
+            sb.Append(",\"roomCode\":").Append(EscapeJsonString(SanitizeRoomCode(roomCode)));
             sb.Append("}");
             File.WriteAllText(MetaPath, sb.ToString(), Encoding.UTF8);
         }
@@ -2159,8 +2211,10 @@ public class PartylineConfigForm : Form
     private TextBox _txtDjName;
     private TextBox _txtRelayUrl;
     private TextBox _txtStationKey;
+    private TextBox _txtRoomCode;
     private string _roomName;
     private string _djName;
+    private string _roomCode;
     private Button _btnSave;
     private Button _btnCancel;
     private Button _btnAdd;
@@ -2176,6 +2230,7 @@ public class PartylineConfigForm : Form
         _djName = meta[2];
         _relayUrl = _settingsManager.LoadRelayUrl();
         _stationKey = _settingsManager.LoadStationKey();
+        _roomCode = _settingsManager.LoadRoomCode();
         _editingIndex = -1;
         InitializeFormComponents();
         LoadGrid();
@@ -2186,7 +2241,7 @@ public class PartylineConfigForm : Form
         Text = "Partyline Co-Host Configuration";
         // Use ClientSize (not Width/Height) so the bottom buttons, which are
         // positioned in client coordinates, are never clipped by the title bar.
-        ClientSize = new System.Drawing.Size(548, 312);
+        ClientSize = new System.Drawing.Size(548, 358);
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
@@ -2230,9 +2285,31 @@ public class PartylineConfigForm : Form
         _txtDjName.Text = _djName;
         Controls.Add(_txtDjName);
 
+        // Room ID: the DJ-chosen public code that forms the co-host join link
+        // (partyline.compressed.stream/<room-id>). Up to 24 chars, no spaces.
+        Label lblRoomCode = new Label();
+        lblRoomCode.Text = "Room ID (co-host link):";
+        lblRoomCode.Location = new System.Drawing.Point(12, 58);
+        lblRoomCode.AutoSize = true;
+        lblRoomCode.Font = new System.Drawing.Font("Segoe UI", 8.5f, System.Drawing.FontStyle.Bold);
+        Controls.Add(lblRoomCode);
+        _txtRoomCode = new TextBox();
+        _txtRoomCode.Location = new System.Drawing.Point(12, 78);
+        _txtRoomCode.Size = new System.Drawing.Size(200, 22);
+        _txtRoomCode.MaxLength = 24;
+        _txtRoomCode.Text = _roomCode;
+        Controls.Add(_txtRoomCode);
+
+        Label lblRoomCodeHint = new Label();
+        lblRoomCodeHint.Text = "Up to 24 characters: letters, numbers, - and _ (no spaces). Leave blank for an auto code.";
+        lblRoomCodeHint.Location = new System.Drawing.Point(220, 81);
+        lblRoomCodeHint.AutoSize = true;
+        lblRoomCodeHint.ForeColor = System.Drawing.SystemColors.GrayText;
+        Controls.Add(lblRoomCodeHint);
+
         Label lblTitle = new Label();
         lblTitle.Text = "Co-Host Accounts:";
-        lblTitle.Location = new System.Drawing.Point(12, 64);
+        lblTitle.Location = new System.Drawing.Point(12, 110);
         lblTitle.AutoSize = true;
         lblTitle.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
         Controls.Add(lblTitle);
@@ -2240,14 +2317,14 @@ public class PartylineConfigForm : Form
         // Add button sits on the title row (was previously clipped under the grid).
         _btnAdd = new Button();
         _btnAdd.Text = "+ Add Co-Host";
-        _btnAdd.Location = new System.Drawing.Point(412, 60);
+        _btnAdd.Location = new System.Drawing.Point(412, 106);
         _btnAdd.Size = new System.Drawing.Size(124, 26);
         _btnAdd.Click += OnAddClick;
         Controls.Add(_btnAdd);
 
         // DataGridView for account list
         _grid = new DataGridView();
-        _grid.Location = new System.Drawing.Point(12, 92);
+        _grid.Location = new System.Drawing.Point(12, 138);
         _grid.Size = new System.Drawing.Size(524, 170);
         _grid.AllowUserToAddRows = false;
         _grid.AllowUserToDeleteRows = false;
@@ -2302,7 +2379,7 @@ public class PartylineConfigForm : Form
         // Edit panel (toggled by Add/Edit) overlays the grid area so it doesn't
         // force extra form height (which left a large blank gap).
         _editPanel = new Panel();
-        _editPanel.Location = new System.Drawing.Point(12, 92);
+        _editPanel.Location = new System.Drawing.Point(12, 138);
         _editPanel.Size = new System.Drawing.Size(524, 170);
         _editPanel.BackColor = System.Drawing.SystemColors.Control;
         _editPanel.Visible = false;
@@ -2385,11 +2462,33 @@ public class PartylineConfigForm : Form
 
     private void OnSaveCloseClick(object sender, EventArgs e)
     {
+        // Validate the optional custom Room ID before persisting: up to 24 chars,
+        // no spaces, URL-safe. Keep the dialog open on invalid input.
+        string rawCode = _txtRoomCode.Text.Trim();
+        if (rawCode.Length > 0)
+        {
+            string sanitized = SettingsManager.SanitizeRoomCode(rawCode);
+            if (sanitized.Length == 0)
+            {
+                MessageBox.Show(
+                    "Room ID must be 1-24 characters and may contain only letters, numbers, hyphens and underscores (no spaces).",
+                    "Invalid Room ID", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                _txtRoomCode.Focus();
+                _txtRoomCode.SelectAll();
+                return;
+            }
+            _roomCode = sanitized;
+        }
+        else
+        {
+            _roomCode = "";
+        }
+
         // Persist display metadata (shown to co-hosts) and the co-host accounts.
         _stationName = _txtStationName.Text.Trim();
         _roomName = _txtRoomName.Text.Trim();
         _djName = _txtDjName.Text.Trim();
-        _settingsManager.SaveMeta(_roomName, _stationName, _djName);
+        _settingsManager.SaveMeta(_roomName, _stationName, _djName, _roomCode);
         _settingsManager.Save(_accounts);
         DialogResult = DialogResult.OK;
         Close();
@@ -2418,7 +2517,10 @@ public class PartylineConfigForm : Form
             string[] ident = _settingsManager.EnsureRoomIdentity();
             string slug = (ident != null && ident.Length > 0) ? ident[0] : "";
             if (string.IsNullOrEmpty(slug)) return "";
-            string code = slug.Length > 6 ? slug.Substring(0, 6).ToLowerInvariant() : slug.ToLowerInvariant();
+            // Prefer the DJ's custom Room ID; fall back to the slug-derived code.
+            string code = _settingsManager.LoadRoomCode();
+            if (string.IsNullOrEmpty(code))
+                code = slug.Length > 6 ? slug.Substring(0, 6).ToLowerInvariant() : slug.ToLowerInvariant();
             string url = "https://partyline.compressed.stream/" + code;
             string name = (acct != null)
                 ? (!string.IsNullOrEmpty(acct.DisplayName) ? acct.DisplayName : acct.Username)
@@ -3311,6 +3413,7 @@ public class WebRtcMeshClient
     private string _metaRoomName;
     private string _metaStationName;
     private string _metaDjName;
+    private string _metaRoomCode;        // DJ-chosen custom room id (optional)
     private string _token;                // bearer session token (role 'dj')
     private volatile bool _invitesPublished;
     private volatile bool _metaPublished;
@@ -3357,6 +3460,7 @@ public class WebRtcMeshClient
         _metaRoomName = (meta != null && meta.Length > 0) ? (meta[0] ?? "") : "";
         _metaStationName = (meta != null && meta.Length > 1) ? (meta[1] ?? "") : "";
         _metaDjName = (meta != null && meta.Length > 2) ? (meta[2] ?? "") : "";
+        _metaRoomCode = (meta != null && meta.Length > 3) ? (meta[3] ?? "") : "";
     }
 
     /// <summary>
@@ -3372,6 +3476,7 @@ public class WebRtcMeshClient
         _metaRoomName = (meta != null && meta.Length > 0) ? (meta[0] ?? "") : "";
         _metaStationName = (meta != null && meta.Length > 1) ? (meta[1] ?? "") : "";
         _metaDjName = (meta != null && meta.Length > 2) ? (meta[2] ?? "") : "";
+        _metaRoomCode = (meta != null && meta.Length > 3) ? (meta[3] ?? "") : "";
         _invitesPublished = false;
         _metaPublished = false;
         // Only push now if we already hold a session token; otherwise the connect
@@ -3536,11 +3641,18 @@ public class WebRtcMeshClient
     private void Provision()
     {
         string url = _baseUrl.TrimEnd('/') + "/api/plugin/provision/" + Uri.EscapeDataString(_slug);
-        string body = "{\"djKey\":\"" + EscapeJson(_password) + "\"}";
+        string body = "{\"djKey\":\"" + EscapeJson(_password) + "\""
+            + (string.IsNullOrEmpty(_metaRoomCode) ? "" : ",\"roomCode\":\"" + EscapeJson(_metaRoomCode) + "\"")
+            + "}";
         string resp = HttpPost(url, body);
         if (resp == null)
         {
             throw new Exception("Room provision failed (no response).");
+        }
+        if (!string.IsNullOrEmpty(_metaRoomCode) && resp.IndexOf("\"roomCodeConflict\":true", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            Log("WARNING: Room ID '" + _metaRoomCode + "' is already in use by another room; "
+                + "co-hosts must use the auto-generated link until you choose a different Room ID.");
         }
         Log("Room provisioned/claimed: " + _slug);
     }
@@ -3618,7 +3730,12 @@ public class WebRtcMeshClient
             Log("Publishing co-host invite code '" + code + "' for '" + name + "'.");
             n++;
         }
-        sb.Append("]}");
+        sb.Append("]");
+        // Refresh the DJ's custom Room ID alongside the invites (provision also
+        // publishes it; this keeps it live on account-edit republishes).
+        if (!string.IsNullOrEmpty(_metaRoomCode))
+            sb.Append(",\"roomCode\":\"").Append(EscapeJson(_metaRoomCode)).Append("\"");
+        sb.Append("}");
 
         if (n == 0)
         {
