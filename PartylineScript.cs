@@ -614,6 +614,22 @@ public class NewPlugin
         lock (_returnLock) { return _returnAvailable; }
     }
 
+    /// <summary>Drop the oldest captured audio beyond <paramref name="maxBytes"/> so
+    /// buffered outbound latency stays bounded if PlayIt ever renders the main mix
+    /// ahead of real time in a burst. Normal (real-time-paced) operation rarely
+    /// triggers this; it is a safety cap, not the steady-state path.</summary>
+    internal void TrimReturnAudioBacklog(int maxBytes)
+    {
+        if (maxBytes < 0) maxBytes = 0;
+        lock (_returnLock)
+        {
+            if (_returnAvailable <= maxBytes) return;
+            int drop = _returnAvailable - maxBytes;
+            _returnReadPos = (_returnReadPos + drop) % _returnBuffer.Length;
+            _returnAvailable -= drop;
+        }
+    }
+
     public void MuteAll() { foreach (var c in _cohosts.Values) c.IsMuted = true; }
     public void UnmuteAll() { foreach (var c in _cohosts.Values) c.IsMuted = false; }
     public void KickAll() { _cohosts.Clear(); }
@@ -931,9 +947,20 @@ public class NewPlugin
     {
         Log("AudioPumpLoop started.");
         const int frameSamples = 960; // 20 ms @ 48 kHz mono
-        const int maxFramesPerTick = 8; // ~160 ms catch-up cap so we never spin
+        const int frameMs = 20;
+        const int maxCatchupFrames = 4;   // bound any burst if we briefly fall behind
+        const int backlogMs = 200;        // safety cap on buffered outbound latency
         short[] frame = new short[frameSamples];
         bool firstPushLogged = false;
+
+        // Pace outbound to REAL TIME: one 20 ms frame per 20 ms of wall clock. The
+        // capture DSP fills the return ring in real-time *bursts*; sending at the fill
+        // rate overfills the browser's NetEq jitter buffer, which then time-compresses
+        // playback (chipmunk/too fast) and later starves (gaps). Under-sending (an
+        // imprecise Sleep) instead drops audio through ring overflow. A wall-clock pace
+        // keeps the average send rate exact and the remote jitter buffer stable.
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        long framesSent = 0;
 
         while (_meshActive)
         {
@@ -941,27 +968,35 @@ public class NewPlugin
             {
                 IWebRtcPeer peer = _webRtcPeer;
 
-                // Drain EVERY complete 20 ms frame the capture DSP has buffered, not
-                // just one per wake. The DSP fills the return ring at real time (mixer
-                // rate), but Thread.Sleep wakes ~15-31 ms apart on Windows; pushing a
-                // single fixed frame per wake drained the ring slower than real time,
-                // so the overflow guard discarded audio and the surviving frames played
-                // back-to-back in the browser — time-compressed (chipmunk) with periodic
-                // gaps. Draining all complete frames each tick tracks real time and keeps
-                // latency bounded. The availability guard also avoids emitting a frame
-                // built from a partial (sub-20 ms) chunk.
                 int srcFreq = _mixerFreq > 0 ? _mixerFreq : 44100;
                 int inputBytesPerFrame = ((int)((long)frameSamples * srcFreq / 48000)) * 2;
                 if (inputBytesPerFrame < 2) inputBytesPerFrame = 2;
 
-                int pushed = 0;
-                while (peer != null
-                       && pushed < maxFramesPerTick
-                       && ReturnAudioAvailableBytes() >= inputBytesPerFrame
-                       && TryReadMainMixFrame(frame))
+                // Keep buffered latency bounded (safety only; real-time pacing keeps the
+                // ring near-empty in steady state).
+                int backlogBytes = (int)((long)inputBytesPerFrame * backlogMs / frameMs);
+                TrimReturnAudioBacklog(backlogBytes);
+
+                long framesDue = clock.ElapsedMilliseconds / frameMs;
+
+                // While no peer is connected, keep the pacing clock in step so we don't
+                // build a huge "owed frames" deficit that would burst-drain (and
+                // overfill NetEq) the instant a co-host joins.
+                if (peer == null) { framesSent = framesDue; Thread.Sleep(5); continue; }
+
+                int slots = (int)(framesDue - framesSent);
+                if (slots > maxCatchupFrames) slots = maxCatchupFrames;
+
+                for (int k = 0; k < slots; k++)
                 {
+                    // PlayIt's mixer always produces real-time samples (silence
+                    // included), so a shortfall here is transient sub-frame jitter:
+                    // wait for the next pass rather than dropping the slot, so no
+                    // program audio is lost and we stay locked to the wall clock.
+                    if (ReturnAudioAvailableBytes() < inputBytesPerFrame) break;
+                    if (!TryReadMainMixFrame(frame)) break;
                     peer.PushOutboundAudio(frame, frameSamples, 48000, 1);
-                    pushed++;
+                    framesSent++;
                     if (!firstPushLogged)
                     {
                         firstPushLogged = true;
@@ -973,7 +1008,7 @@ public class NewPlugin
             {
                 Log("AudioPumpLoop error: " + ex.Message);
             }
-            Thread.Sleep(10);
+            Thread.Sleep(5);
         }
         Log("AudioPumpLoop exited.");
     }
