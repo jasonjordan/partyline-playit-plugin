@@ -3827,6 +3827,7 @@ public class WebRtcMeshClient
         {
             string candidate = ExtractRawJsonObject(payload, "candidate");
             if (from == null || candidate == null) return;
+            Log("Remote ICE cand from " + from + ": " + candidate);
             _peer.AddIceCandidate(from, candidate);
         }
         else if (type == "join")
@@ -5458,9 +5459,27 @@ namespace Partyline.WebRtc
             pc.onicecandidate += (RTCIceCandidate cand) =>
             {
                 Action<string, string> h = OnLocalIceCandidate;
-                if (h == null || cand == null) return;
+                if (cand == null) return;
+                // Log candidate types so we can see whether TURN relay candidates
+                // are gathered (essential on CGNAT/Starlink). "typ relay" = TURN.
+                try
+                {
+                    string cstr = cand.candidate ?? cand.ToString();
+                    NewPlugin.LogStatic("[SIPSorcery] local ICE cand (" + peerId + "): " + cstr);
+                }
+                catch { }
+                if (h == null) return;
                 h(peerId, BuildCandidateJson(cand));
             };
+
+            try
+            {
+                pc.oniceconnectionstatechange += (RTCIceConnectionState st) =>
+                {
+                    NewPlugin.LogStatic("[SIPSorcery] ICE state [" + peerId + "]: " + st);
+                };
+            }
+            catch (Exception ex) { NewPlugin.LogStatic("[SIPSorcery] oniceconnectionstatechange unavailable: " + ex.Message); }
 
             pc.onconnectionstatechange += (RTCPeerConnectionState st) =>
             {
