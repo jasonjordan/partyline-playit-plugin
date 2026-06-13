@@ -3440,6 +3440,12 @@ public class WebRtcMeshClient
             {
                 Provision();
                 Authenticate();
+                // Republish invites + metadata on EVERY (re)connect so the current
+                // co-host codes/names are always live server-side. Previously the
+                // "once per process" guard meant an account edit (new code) or a
+                // missed publish was never retried, so co-host links 404'd.
+                _invitesPublished = false;
+                _metaPublished = false;
                 PublishInvitesOnce();
                 PublishMetaOnce();
                 FetchRtcConfig();
