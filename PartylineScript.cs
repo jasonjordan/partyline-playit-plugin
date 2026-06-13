@@ -580,7 +580,21 @@ public class NewPlugin
     public void Configure()
     {
         var form = new PartylineConfigForm(_settingsManager);
-        form.ShowDialog();
+        if (form.ShowDialog() == DialogResult.OK)
+        {
+            // Push saved co-host accounts + display names to the running mesh so
+            // invite links and room/station/DJ names take effect without a restart.
+            try
+            {
+                List<CoHostAccount> accounts = _settingsManager.Load();
+                string[] meta = _settingsManager.LoadMeta();
+                if (_webRtcMesh != null) _webRtcMesh.RepublishConfig(accounts, meta);
+            }
+            catch (Exception ex)
+            {
+                Log("Config republish error: " + ex.Message);
+            }
+        }
     }
 
     /// <summary>
@@ -3206,10 +3220,10 @@ public class WebRtcMeshClient
     // room invites once, right after auth, so browser co-hosts are authorized by
     // the plugin's local account list.
     private readonly string _password;
-    private readonly List<CoHostAccount> _accounts;
-    private readonly string _metaRoomName;
-    private readonly string _metaStationName;
-    private readonly string _metaDjName;
+    private List<CoHostAccount> _accounts;
+    private string _metaRoomName;
+    private string _metaStationName;
+    private string _metaDjName;
     private string _token;                // bearer session token (role 'dj')
     private volatile bool _invitesPublished;
     private volatile bool _metaPublished;
@@ -3256,6 +3270,30 @@ public class WebRtcMeshClient
         _metaRoomName = (meta != null && meta.Length > 0) ? (meta[0] ?? "") : "";
         _metaStationName = (meta != null && meta.Length > 1) ? (meta[1] ?? "") : "";
         _metaDjName = (meta != null && meta.Length > 2) ? (meta[2] ?? "") : "";
+    }
+
+    /// <summary>
+    /// Applies updated co-host accounts + display metadata (e.g. after the Configure
+    /// dialog is saved) and re-publishes them to the signaling server immediately,
+    /// so a plugin restart is not needed for invite links / names to take effect.
+    /// Safe to call before the client has connected (republish will then happen on
+    /// connect). 
+    /// </summary>
+    public void RepublishConfig(List<CoHostAccount> accounts, string[] meta)
+    {
+        _accounts = accounts;
+        _metaRoomName = (meta != null && meta.Length > 0) ? (meta[0] ?? "") : "";
+        _metaStationName = (meta != null && meta.Length > 1) ? (meta[1] ?? "") : "";
+        _metaDjName = (meta != null && meta.Length > 2) ? (meta[2] ?? "") : "";
+        _invitesPublished = false;
+        _metaPublished = false;
+        // Only push now if we already hold a session token; otherwise the connect
+        // path will publish with the refreshed values.
+        if (!string.IsNullOrEmpty(_token))
+        {
+            try { PublishInvitesOnce(); } catch (Exception ex) { Log("RepublishConfig invites error: " + ex.Message); }
+            try { PublishMetaOnce(); } catch (Exception ex) { Log("RepublishConfig meta error: " + ex.Message); }
+        }
     }
 
     public void Start(CancellationToken ct)
