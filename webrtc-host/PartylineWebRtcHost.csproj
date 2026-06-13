@@ -28,6 +28,10 @@
     <PackageReference Include="SIPSorcery" Version="6.2.4" />
     <PackageReference Include="Concentus" Version="1.1.7" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <!-- Provides net48 reference assemblies on any build host (and inside nested
+         MSBuild invocations), so the plugin build can bundle this exe even where
+         the .NET Framework targeting pack isn't separately installed. -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
   </ItemGroup>
 
 </Project>

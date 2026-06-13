@@ -126,38 +126,43 @@
   </ItemGroup>
 
   <!--
-    Out-of-process WebRTC host (Task 9). The plugin builds the PartylineWebRtcHost
-    console exe, zips its entire output folder, and embeds that single zip as a
-    manifest resource. At runtime the plugin extracts the zip to a temp folder and
-    launches the exe (OutOfProcessWebRtcPeer), keeping single-DLL deployment.
-    ReferenceOutputAssembly=false: we launch it as a process, never reference its
-    assembly.
+    Out-of-process WebRTC host (Task 9). Build the PartylineWebRtcHost console exe,
+    zip its entire output folder, and embed that single zip as a manifest resource
+    (Partyline.webrtchost.zip). At runtime the plugin extracts it to a temp folder
+    and launches the exe (OutOfProcessWebRtcPeer), keeping single-DLL deployment.
+
+    The EmbeddedResource is declared statically (a literal path, so the item always
+    exists) and the BuildAndZipWebRtcHost target creates the file before CoreCompile.
+    The target builds the helper explicitly (Restore;Build) so it works on a clean
+    checkout without relying on ProjectReference ordering.
   -->
+  <ItemGroup>
+    <EmbeddedResource Include="$(IntermediateOutputPath)webrtchost.zip">
+      <LogicalName>Partyline.webrtchost.zip</LogicalName>
+      <Visible>false</Visible>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <!-- Build the helper as part of this build (restored transitively by the outer
+       restore, built before CoreCompile). ReferenceOutputAssembly=false: it is
+       launched as a process, never referenced as an assembly. -->
   <ItemGroup>
     <ProjectReference Include="webrtc-host/PartylineWebRtcHost.csproj">
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
       <Private>false</Private>
-      <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>
     </ProjectReference>
   </ItemGroup>
 
-  <Target Name="ZipAndEmbedWebRtcHost"
-          BeforeTargets="CoreCompile"
-          DependsOnTargets="ResolveProjectReferences">
+  <Target Name="BuildAndZipWebRtcHost" BeforeTargets="CoreCompile" DependsOnTargets="ResolveProjectReferences">
     <PropertyGroup>
-      <WebRtcHostOutDir>$(MSBuildProjectDirectory)/webrtc-host/bin/$(Configuration)/net48</WebRtcHostOutDir>
-      <WebRtcHostZip>$(IntermediateOutputPath)webrtchost.zip</WebRtcHostZip>
+      <_WebRtcHostOutDir>$(MSBuildProjectDirectory)/webrtc-host/bin/$(Configuration)/net48</_WebRtcHostOutDir>
     </PropertyGroup>
-    <ZipDirectory SourceDirectory="$(WebRtcHostOutDir)"
-                  DestinationFile="$(WebRtcHostZip)"
-                  Overwrite="true"
-                  Condition="Exists('$(WebRtcHostOutDir)')" />
-    <ItemGroup>
-      <EmbeddedResource Include="$(WebRtcHostZip)" Condition="Exists('$(WebRtcHostZip)')">
-        <LogicalName>Partyline.webrtchost.zip</LogicalName>
-        <Visible>false</Visible>
-      </EmbeddedResource>
-    </ItemGroup>
+    <Error Condition="!Exists('$(_WebRtcHostOutDir)/PartylineWebRtcHost.exe')"
+           Text="WebRTC host build produced no exe at $(_WebRtcHostOutDir). Cannot embed." />
+    <ZipDirectory SourceDirectory="$(_WebRtcHostOutDir)"
+                  DestinationFile="$(IntermediateOutputPath)webrtchost.zip"
+                  Overwrite="true" />
+    <Message Importance="high" Text="Partyline: embedded out-of-process WebRTC host -> $(IntermediateOutputPath)webrtchost.zip" />
   </Target>
 
 </Project>
