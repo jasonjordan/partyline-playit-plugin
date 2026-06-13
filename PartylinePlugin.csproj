@@ -9,17 +9,15 @@
   </PropertyGroup>
 
   <!--
-    MR-WebRTC primary adapter (task 5.2). Off by default so the project still
-    restores and the IDE/language server still reports clean diagnostics on
-    machines that cannot pull the native Microsoft.MixedReality.WebRTC package
-    (e.g. non-Windows dev boxes). Enable on a Windows build with:
-        dotnet build -p:PartylineMrWebRtc=true
-    which defines PARTYLINE_MRWEBRTC and pulls in the pinned NuGet package.
-    The native mrwebrtc.dll must be vendored per architecture (win-x86/win-x64)
-    matching the PlayIt Live host process bitness, alongside bass.dll.
+    MR-WebRTC primary adapter (task 5.2). Now ON by default: it is the native
+    Google-libwebrtc engine with full ICE/TURN relay (required on CGNAT/Starlink),
+    where the managed SIPSorcery fallback failed to gather relay candidates. The
+    native mrwebrtc.dll is embedded into PartylinePlugin.dll (see below) so the
+    build stays single-file. To build the SIPSorcery-only fallback instead:
+        dotnet build -p:PartylineMrWebRtc=false
   -->
   <PropertyGroup>
-    <PartylineMrWebRtc Condition="'$(PartylineMrWebRtc)' == ''">false</PartylineMrWebRtc>
+    <PartylineMrWebRtc Condition="'$(PartylineMrWebRtc)' == ''">true</PartylineMrWebRtc>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(PartylineMrWebRtc)' == 'true'">
@@ -86,8 +84,28 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(PartylineMrWebRtc)' == 'true'">
-    <!-- Pinned: last published MR-WebRTC release (project archived since 2022). -->
-    <PackageReference Include="Microsoft.MixedReality.WebRTC" Version="2.0.2" />
+    <!-- Pinned: last published MR-WebRTC release (project archived since 2022).
+         GeneratePathProperty exposes $(PkgMicrosoft_MixedReality_WebRTC) so the
+         native engine can be embedded below for single-file deployment. -->
+    <PackageReference Include="Microsoft.MixedReality.WebRTC" Version="2.0.2" GeneratePathProperty="true" />
+  </ItemGroup>
+
+  <!--
+    Single-file native packaging: embed mrwebrtc.dll (both architectures) as
+    manifest resources INSIDE PartylinePlugin.dll. Costura only embeds managed
+    assemblies; the native engine is unmanaged, so we embed it ourselves and
+    extract + LoadLibrary it at startup (MixedRealityWebRtcLoader). Result: a
+    single PartylinePlugin.dll with no loose native files to copy.
+  -->
+  <ItemGroup Condition="'$(PartylineMrWebRtc)' == 'true'">
+    <EmbeddedResource Include="$(PkgMicrosoft_MixedReality_WebRTC)\runtimes\win10-x86\native\mrwebrtc.dll">
+      <LogicalName>Partyline.native.x86.mrwebrtc.dll</LogicalName>
+      <Visible>false</Visible>
+    </EmbeddedResource>
+    <EmbeddedResource Include="$(PkgMicrosoft_MixedReality_WebRTC)\runtimes\win10-x64\native\mrwebrtc.dll">
+      <LogicalName>Partyline.native.x64.mrwebrtc.dll</LogicalName>
+      <Visible>false</Visible>
+    </EmbeddedResource>
   </ItemGroup>
 
   <ItemGroup>

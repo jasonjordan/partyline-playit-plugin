@@ -4371,9 +4371,18 @@ public static class MixedRealityWebRtcLoader
             string arch = Environment.Is64BitProcess ? "x64" : "x86";
             string dllName = NativeBaseName + ".dll";
             string path = ResolveDllPath(nativeDir, dllName, arch);
+            bool fromEmbedded = false;
             if (path == null)
             {
-                NewPlugin.LogStatic("[MRWebRTC] " + dllName + " not found for host arch " + arch + "; falling back.");
+                // Not found loose on disk -> use the copy embedded inside
+                // PartylinePlugin.dll (single-file deployment). Extract to a
+                // temp folder and load from there.
+                path = ExtractEmbeddedNative(arch, dllName);
+                fromEmbedded = path != null;
+            }
+            if (path == null)
+            {
+                NewPlugin.LogStatic("[MRWebRTC] " + dllName + " not found (disk or embedded) for host arch " + arch + "; falling back.");
                 return false;
             }
 
@@ -4407,7 +4416,8 @@ public static class MixedRealityWebRtcLoader
                 return false;
             }
 
-            NewPlugin.LogStatic("[MRWebRTC] Loaded native engine " + path + " (host " + arch + ").");
+            NewPlugin.LogStatic("[MRWebRTC] Loaded native engine " + path + " (host " + arch
+                + (fromEmbedded ? ", embedded" : ", on-disk") + ").");
             _available = true;
             return true;
         }
@@ -4462,6 +4472,54 @@ public static class MixedRealityWebRtcLoader
             catch { }
         }
         return null;
+    }
+
+    // Extracts the architecture-appropriate mrwebrtc.dll embedded inside
+    // PartylinePlugin.dll (single-file deployment) to a stable temp folder and
+    // returns its path. Returns null if the resource is absent or extraction
+    // fails. The bytes are embedded by the csproj (PartylineMrWebRtc build) as
+    // manifest resources "Partyline.native.<arch>.mrwebrtc.dll".
+    private static string ExtractEmbeddedNative(string arch, string dllName)
+    {
+        try
+        {
+            var asm = typeof(MixedRealityWebRtcLoader).Assembly;
+            string resName = "Partyline.native." + arch + "." + dllName;
+            using (var rs = asm.GetManifestResourceStream(resName))
+            {
+                if (rs == null)
+                {
+                    NewPlugin.LogStatic("[MRWebRTC] embedded native resource not found: " + resName
+                        + " (was the plugin built with -p:PartylineMrWebRtc=true?).");
+                    return null;
+                }
+                string ver = asm.GetName().Version != null ? asm.GetName().Version.ToString() : "0";
+                string dir = Path.Combine(Path.Combine(Path.GetTempPath(), "Partyline.native"), ver + "." + arch);
+                Directory.CreateDirectory(dir);
+                string outPath = Path.Combine(dir, dllName);
+
+                bool needWrite = true;
+                try { if (File.Exists(outPath) && new FileInfo(outPath).Length == rs.Length) needWrite = false; }
+                catch { }
+
+                if (needWrite)
+                {
+                    using (var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                        rs.CopyTo(fs);
+                    NewPlugin.LogStatic("[MRWebRTC] extracted embedded native to " + outPath);
+                }
+                else
+                {
+                    NewPlugin.LogStatic("[MRWebRTC] using previously extracted native " + outPath);
+                }
+                return outPath;
+            }
+        }
+        catch (Exception ex)
+        {
+            NewPlugin.LogStatic("[MRWebRTC] embedded native extraction failed: " + ex.Message);
+            return null;
+        }
     }
 
     // Reads the COFF "machine" field from a PE/DLL file. Returns false if the
