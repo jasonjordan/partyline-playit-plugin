@@ -143,9 +143,24 @@ public class NewPlugin
     // DIAGNOSTIC: capture-rate measurement (samples/sec produced by the mixer DSP).
     private long _dspMonoSamplesSinceLog;
     private System.Diagnostics.Stopwatch _dspRateClock;
+    // Measured actual capture rate (mono samples/sec of wall clock). The mixer DSP
+    // tap can deliver at a rate that does NOT match BASS_ChannelGetInfo's reported
+    // freq (observed ~22050 against a reported 44100), which made the outbound
+    // resample assume 2x the real rate -> chipmunk + gaps. We drive the outbound
+    // resample from THIS measured value so it is correct whatever the tap delivers.
+    private volatile int _captureRateHz;
     // DIAGNOSTIC: outbound pump push-rate measurement.
     private long _pumpFramesSinceLog;
     private System.Diagnostics.Stopwatch _pumpRateClock;
+
+    /// <summary>The source sample rate to resample outbound audio FROM: the measured
+    /// capture rate once known, else the reported mixer freq, else 44100.</summary>
+    private int CaptureSourceRate()
+    {
+        int r = _captureRateHz;
+        if (r >= 8000 && r <= 96000) return r;
+        return _mixerFreq > 0 ? _mixerFreq : 44100;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct BASS_CHANNELINFO
@@ -591,19 +606,24 @@ public class NewPlugin
                 }
             }
 
-            // DIAGNOSTIC: measure the actual capture rate. For a real-time mixer this
-            // should report ~_mixerFreq samples/sec. A much higher number means the
-            // mixer is being pulled faster than real time (the real chipmunk cause).
+            // Measure the ACTUAL capture rate and use it to drive the outbound
+            // resample. For this tap it is ~half the reported mixer freq, which is
+            // exactly what made playback 2x (chipmunk). A 1 s window locks quickly.
             _dspMonoSamplesSinceLog += monoSamples;
             if (_dspRateClock == null) _dspRateClock = System.Diagnostics.Stopwatch.StartNew();
             long dspMs = _dspRateClock.ElapsedMilliseconds;
-            if (dspMs >= 5000)
+            if (dspMs >= 1000)
             {
-                long rate = _dspMonoSamplesSinceLog * 1000L / dspMs;
+                int rate = (int)(_dspMonoSamplesSinceLog * 1000L / dspMs);
+                if (rate >= 8000 && rate <= 96000)
+                {
+                    // Light smoothing once established; snap directly on first measure.
+                    _captureRateHz = _captureRateHz > 0 ? (_captureRateHz + rate) / 2 : rate;
+                }
                 int backlog;
                 lock (_returnLock) { backlog = _returnAvailable; }
-                Log("DIAG capture rate=" + rate + " samples/sec (expected ~" + _mixerFreq
-                    + "); ring backlog=" + backlog + " bytes (" + (backlog / 2 * 1000 / Math.Max(1, _mixerFreq)) + " ms)");
+                Log("DIAG capture rate=" + rate + " samples/sec (reported mixer ~" + _mixerFreq
+                    + ", using " + _captureRateHz + "); ring backlog=" + backlog + " bytes");
                 _dspMonoSamplesSinceLog = 0;
                 _dspRateClock.Restart();
             }
@@ -992,7 +1012,7 @@ public class NewPlugin
             {
                 IWebRtcPeer peer = _webRtcPeer;
 
-                int srcFreq = _mixerFreq > 0 ? _mixerFreq : 44100;
+                int srcFreq = CaptureSourceRate();
                 int inputBytesPerFrame = ((int)((long)frameSamples * srcFreq / 48000)) * 2;
                 if (inputBytesPerFrame < 2) inputBytesPerFrame = 2;
 
@@ -1059,7 +1079,7 @@ public class NewPlugin
     private bool TryReadMainMixFrame(short[] frame)
     {
         const int outputSamples = 960; // 20 ms @ 48 kHz mono
-        int srcFreq = _mixerFreq > 0 ? _mixerFreq : 44100;
+        int srcFreq = CaptureSourceRate();
 
         // Source (mono PCM16) sample count needed to produce 960 samples at 48 kHz.
         int inputSamplesNeeded = (int)((long)outputSamples * srcFreq / 48000);
