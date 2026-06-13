@@ -5745,47 +5745,103 @@ namespace Partyline.WebRtc
 namespace Partyline.WebRtc
 {
     using System;
+    using System.Collections.Generic;
     using System.IO;
+    using System.Threading;
 
-    /// <summary>
-    /// Default-domain callback sink the child-domain worker calls back into.
-    /// MarshalByRefObject so the worker holds a proxy; its methods execute in the
-    /// DEFAULT domain where the delegate fields live. Infinite lease so it is not
-    /// reclaimed mid-session.
-    /// </summary>
-    public sealed class WebRtcCallbackSink : MarshalByRefObject
+    /// <summary>Serializable decoded-remote-audio frame marshaled child -> default.</summary>
+    [Serializable]
+    public sealed class AudioFrameDto
     {
-        public Action<string, string> LocalIceCandidate;
-        public Action<string, short[], int, int> RemoteAudioFrame;
-        public Action<string, string> ConnectionStateChanged;
+        public string PeerId;
+        public short[] Pcm;
+        public int Count;
+        public int Rate;
+    }
 
-        public void RaiseLocalIceCandidate(string peerId, string json) { var h = LocalIceCandidate; if (h != null) h(peerId, json); }
-        public void RaiseRemoteAudioFrame(string peerId, short[] pcm, int count, int rate) { var h = RemoteAudioFrame; if (h != null) h(peerId, pcm, count, rate); }
-        public void RaiseConnectionStateChanged(string peerId, string state) { var h = ConnectionStateChanged; if (h != null) h(peerId, state); }
-
-        public override object InitializeLifetimeService() { return null; }
+    /// <summary>Serializable signaling event (local ICE candidate or state change).</summary>
+    [Serializable]
+    public sealed class SignalEventDto
+    {
+        public string Kind;   // "ice" | "state"
+        public string PeerId;
+        public string Data;   // candidate JSON, or connection-state string
     }
 
     /// <summary>
     /// Lives INSIDE the child AppDomain. Wraps a real <see cref="SipSorceryWebRtcPeer"/>
-    /// (which binds to SIPSorcery 6.2.4 in this domain) and forwards its Action
-    /// callbacks to the default-domain sink. All IWebRtcPeer operations are exposed
-    /// as marshalable methods.
+    /// (which binds to SIPSorcery 6.2.4 here). SIPSorcery's callbacks fire on its own
+    /// worker threads; those threads must NOT cross the AppDomain boundary (cross-domain
+    /// marshaling needs a deep stack and overflowed SIPSorcery's small thread stacks,
+    /// crashing the 32-bit host). So callbacks only ENQUEUE into in-domain buffers; the
+    /// default domain pulls them via Drain* (those calls run on a healthy default-domain
+    /// stack).
     /// </summary>
     public sealed class SipSorceryDomainWorker : MarshalByRefObject
     {
         private SipSorceryWebRtcPeer _peer;
-        private WebRtcCallbackSink _sink;
+        private readonly object _qlock = new object();
+        private readonly Queue<SignalEventDto> _events = new Queue<SignalEventDto>();
+        private readonly Queue<AudioFrameDto> _audio = new Queue<AudioFrameDto>();
+        private const int MaxAudioQueued = 300;   // ~6s of 20ms frames; drop oldest beyond
+        private const int MaxEventsQueued = 2000;
 
-        public void Init(WebRtcCallbackSink sink)
+        public void Init()
         {
-            _sink = sink;
             _peer = new SipSorceryWebRtcPeer();
-            _peer.OnLocalIceCandidate = (peerId, json) => { try { _sink.RaiseLocalIceCandidate(peerId, json); } catch { } };
-            _peer.OnRemoteAudioFrame = (peerId, pcm, count, rate) => { try { _sink.RaiseRemoteAudioFrame(peerId, pcm, count, rate); } catch { } };
-            _peer.OnConnectionStateChanged = (peerId, state) => { try { _sink.RaiseConnectionStateChanged(peerId, state); } catch { } };
+            _peer.OnLocalIceCandidate = (peerId, json) =>
+            {
+                lock (_qlock)
+                {
+                    if (_events.Count < MaxEventsQueued)
+                        _events.Enqueue(new SignalEventDto { Kind = "ice", PeerId = peerId, Data = json });
+                }
+            };
+            _peer.OnConnectionStateChanged = (peerId, state) =>
+            {
+                lock (_qlock)
+                {
+                    if (_events.Count < MaxEventsQueued)
+                        _events.Enqueue(new SignalEventDto { Kind = "state", PeerId = peerId, Data = state });
+                }
+            };
+            _peer.OnRemoteAudioFrame = (peerId, pcm, count, rate) =>
+            {
+                // Copy the buffer: SIPSorcery may reuse it after the callback returns.
+                short[] copy = new short[count];
+                if (pcm != null) Array.Copy(pcm, copy, Math.Min(count, pcm.Length));
+                lock (_qlock)
+                {
+                    if (_audio.Count >= MaxAudioQueued) _audio.Dequeue();
+                    _audio.Enqueue(new AudioFrameDto { PeerId = peerId, Pcm = copy, Count = count, Rate = rate });
+                }
+            };
         }
 
+        // --- Pulled by the default domain (runs on a healthy stack) ----------
+        public SignalEventDto[] DrainEvents()
+        {
+            lock (_qlock)
+            {
+                if (_events.Count == 0) return null;
+                var arr = _events.ToArray();
+                _events.Clear();
+                return arr;
+            }
+        }
+
+        public AudioFrameDto[] DrainRemoteAudio()
+        {
+            lock (_qlock)
+            {
+                if (_audio.Count == 0) return null;
+                var arr = _audio.ToArray();
+                _audio.Clear();
+                return arr;
+            }
+        }
+
+        // --- Forwarded IWebRtcPeer operations (default -> child) -------------
         public void SetIceServers(WebRtcIceServer[] iceServers) { _peer.SetIceServers(iceServers); }
         public void CreatePeerConnection(string peerId) { _peer.CreatePeerConnection(peerId); }
         public void ClosePeerConnection(string peerId) { _peer.ClosePeerConnection(peerId); }
@@ -5801,14 +5857,16 @@ namespace Partyline.WebRtc
 
     /// <summary>
     /// Default-domain <see cref="IWebRtcPeer"/> that hosts a child AppDomain running
-    /// SIPSorcery 6.2.4 in isolation from the host's shadowing 5.2.3. Forwards every
-    /// call to the child worker and surfaces its callbacks via the sink.
+    /// SIPSorcery 6.2.4 in isolation from the host's shadowing 5.2.3. A poll thread in
+    /// THIS domain pulls buffered candidates/audio/state from the worker so SIPSorcery's
+    /// own threads never make cross-domain calls.
     /// </summary>
     public sealed class IsolatedSipSorceryPeer : IWebRtcPeer, IDisposable
     {
         private AppDomain _domain;
         private SipSorceryDomainWorker _worker;
-        private WebRtcCallbackSink _sink;
+        private Thread _pump;
+        private volatile bool _running;
 
         public Action<string, string> OnLocalIceCandidate { get; set; }
         public Action<string, short[], int, int> OnRemoteAudioFrame { get; set; }
@@ -5835,15 +5893,57 @@ namespace Partyline.WebRtc
             setup.ApplicationBase = baseDir;
             _domain = AppDomain.CreateDomain("PartylineWebRtc", null, setup);
 
-            _sink = new WebRtcCallbackSink();
-            _sink.LocalIceCandidate = (p, j) => { var h = OnLocalIceCandidate; if (h != null) h(p, j); };
-            _sink.RemoteAudioFrame = (p, pcm, c, r) => { var h = OnRemoteAudioFrame; if (h != null) h(p, pcm, c, r); };
-            _sink.ConnectionStateChanged = (p, s) => { var h = OnConnectionStateChanged; if (h != null) h(p, s); };
-
             _worker = (SipSorceryDomainWorker)_domain.CreateInstanceAndUnwrap(
                 selfAsm.FullName, typeof(SipSorceryDomainWorker).FullName);
-            _worker.Init(_sink);
+            _worker.Init();
+
+            _running = true;
+            _pump = new Thread(PumpLoop) { IsBackground = true, Name = "PartylineWebRtcPump" };
+            _pump.Start();
             NewPlugin.LogStatic("[Isolated] SIPSorcery worker started in child AppDomain (base=" + baseDir + ").");
+        }
+
+        // Default-domain poll loop: pulls buffered events/audio from the child worker
+        // and raises them locally. Cross-domain calls run on THIS thread's healthy stack.
+        private void PumpLoop()
+        {
+            while (_running)
+            {
+                bool any = false;
+                try
+                {
+                    SignalEventDto[] events = _worker.DrainEvents();
+                    if (events != null)
+                    {
+                        any = true;
+                        for (int i = 0; i < events.Length; i++)
+                        {
+                            var ev = events[i];
+                            if (ev == null) continue;
+                            if (ev.Kind == "ice") { var h = OnLocalIceCandidate; if (h != null) h(ev.PeerId, ev.Data); }
+                            else if (ev.Kind == "state") { var h = OnConnectionStateChanged; if (h != null) h(ev.PeerId, ev.Data); }
+                        }
+                    }
+
+                    AudioFrameDto[] frames = _worker.DrainRemoteAudio();
+                    if (frames != null)
+                    {
+                        any = true;
+                        var h = OnRemoteAudioFrame;
+                        if (h != null)
+                            for (int i = 0; i < frames.Length; i++)
+                            {
+                                var f = frames[i];
+                                if (f != null) h(f.PeerId, f.Pcm, f.Count, f.Rate);
+                            }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    NewPlugin.LogStatic("[Isolated] pump error: " + ex.Message);
+                }
+                if (!any) Thread.Sleep(10);
+            }
         }
 
         public void SetIceServers(WebRtcIceServer[] iceServers) { _worker.SetIceServers(iceServers); }
@@ -5858,6 +5958,8 @@ namespace Partyline.WebRtc
 
         public void Dispose()
         {
+            _running = false;
+            try { if (_pump != null) _pump.Join(1000); } catch { }
             try { if (_worker != null) _worker.CloseAll(); } catch { }
             try { if (_domain != null) AppDomain.Unload(_domain); } catch { }
             _domain = null; _worker = null;
