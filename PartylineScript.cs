@@ -3572,10 +3572,21 @@ public class WebRtcMeshClient
         var sb = new StringBuilder();
         sb.Append("{\"invites\":[");
         int n = 0;
+        int skipped = 0;
         for (int i = 0; i < _accounts.Count; i++)
         {
             CoHostAccount a = _accounts[i];
-            if (a == null || string.IsNullOrEmpty(a.Hash) || string.IsNullOrEmpty(a.Password)) continue;
+            if (a == null || string.IsNullOrEmpty(a.Hash) || string.IsNullOrEmpty(a.Password))
+            {
+                // A co-host with no stored plaintext password can't be (re)published
+                // (the server needs it to hash the invite). This silently broke
+                // co-host links after editing an account without re-entering a password.
+                skipped++;
+                Log("Invite NOT published for '" + (a != null ? (a.Username ?? a.DisplayName ?? "?") : "null")
+                    + "': missing " + (a == null ? "account" : (string.IsNullOrEmpty(a.Hash) ? "hash" : "password"))
+                    + " (re-enter the co-host password in Configure to publish its link).");
+                continue;
+            }
             string name = !string.IsNullOrEmpty(a.DisplayName) ? a.DisplayName : a.Username;
             if (string.IsNullOrEmpty(name)) name = a.Hash;
             // The invite id IS the short 6-char code used in the co-host URL.
@@ -3584,11 +3595,17 @@ public class WebRtcMeshClient
             sb.Append("{\"inviteId\":\"").Append(EscapeJson(code)).Append("\",");
             sb.Append("\"name\":\"").Append(EscapeJson(name)).Append("\",");
             sb.Append("\"password\":\"").Append(EscapeJson(a.Password)).Append("\"}");
+            Log("Publishing co-host invite code '" + code + "' for '" + name + "'.");
             n++;
         }
         sb.Append("]}");
 
-        if (n == 0) { _invitesPublished = true; return; }
+        if (n == 0)
+        {
+            _invitesPublished = true;
+            Log("No co-host invites published (" + skipped + " skipped). Co-host links will 404 until an account with a password is saved.");
+            return;
+        }
 
         string url = _baseUrl.TrimEnd('/') + "/api/plugin/invites/" + Uri.EscapeDataString(_slug);
         string resp = HttpPost(url, sb.ToString());
