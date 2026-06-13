@@ -96,6 +96,34 @@ public class NewPlugin
         if (hook != null) hook(on);
     }
 
+    // --- Per-co-host network quality (traffic light) -------------------------
+    // The mesh client polls the signaling server's telemetry every few seconds
+    // and publishes each co-host's quality here; the UI strip reads it per row.
+    public sealed class CohostNetStat
+    {
+        public string Quality = "none"; // good | fair | poor | none
+        public int Rtt;
+        public int Loss;
+        public int Jitter;
+    }
+    private static readonly ConcurrentDictionary<string, CohostNetStat> _cohostNetStats =
+        new ConcurrentDictionary<string, CohostNetStat>();
+
+    /// <summary>Publishes a co-host's latest network-quality sample (called by the mesh client).</summary>
+    public static void PublishCohostNetStat(string peerId, string quality, int rtt, int loss, int jitter)
+    {
+        if (string.IsNullOrEmpty(peerId)) return;
+        _cohostNetStats[peerId] = new CohostNetStat { Quality = quality ?? "none", Rtt = rtt, Loss = loss, Jitter = jitter };
+    }
+
+    /// <summary>Reads a co-host's network-quality sample for the UI; null if none.</summary>
+    public static CohostNetStat GetCohostNetStat(string peerId)
+    {
+        if (string.IsNullOrEmpty(peerId)) return null;
+        CohostNetStat s;
+        return _cohostNetStats.TryGetValue(peerId, out s) ? s : null;
+    }
+
     // Return audio (BASS mixer capture)
     private int _mixerHandle;
     private int _mixerChannels = 2; // default stereo, updated from BASS_ChannelGetInfo
@@ -2760,19 +2788,32 @@ public class PartylineControlPanel : UserControl
 
             // Update connected indicator pill (based on active session, not audio)
             bool connected = _authManager.HasActiveSession(row.CohostId) || _authManager.HasAnyActiveSession();
+            NewPlugin.CohostNetStat net = connected ? NewPlugin.GetCohostNetStat(row.CohostId) : null;
             if (connected)
             {
-                row.ConnectedIndicator.Text = "Connected";
-                row.ConnectedIndicator.ForeColor = System.Drawing.Color.White;
-                // Throb between bright green and dimmer green every 500ms (10 ticks at 50ms)
-                bool bright = ((_pulseCounter / 10) % 2) == 0;
-                if (bright)
+                // Traffic light: color the pill by network quality when we have a
+                // telemetry sample; fall back to the throbbing green "Connected".
+                if (net != null && net.Quality == "poor")
                 {
-                    row.ConnectedIndicator.BackColor = System.Drawing.Color.FromArgb(34, 197, 94);
+                    row.ConnectedIndicator.Text = "\u25CF Poor";
+                    row.ConnectedIndicator.ForeColor = System.Drawing.Color.White;
+                    row.ConnectedIndicator.BackColor = System.Drawing.Color.FromArgb(239, 68, 68);
+                }
+                else if (net != null && net.Quality == "fair")
+                {
+                    row.ConnectedIndicator.Text = "\u25CF Fair";
+                    row.ConnectedIndicator.ForeColor = System.Drawing.Color.FromArgb(40, 30, 0);
+                    row.ConnectedIndicator.BackColor = System.Drawing.Color.FromArgb(245, 158, 11);
                 }
                 else
                 {
-                    row.ConnectedIndicator.BackColor = System.Drawing.Color.FromArgb(24, 157, 74);
+                    row.ConnectedIndicator.Text = (net != null) ? "\u25CF Good" : "Connected";
+                    row.ConnectedIndicator.ForeColor = System.Drawing.Color.White;
+                    // Throb between bright green and dimmer green every 500ms (10 ticks at 50ms)
+                    bool bright = ((_pulseCounter / 10) % 2) == 0;
+                    row.ConnectedIndicator.BackColor = bright
+                        ? System.Drawing.Color.FromArgb(34, 197, 94)
+                        : System.Drawing.Color.FromArgb(24, 157, 74);
                 }
             }
             else
@@ -2782,26 +2823,23 @@ public class PartylineControlPanel : UserControl
                 row.ConnectedIndicator.BackColor = System.Drawing.Color.FromArgb(80, 80, 90);
             }
 
-            // Update combined latency + IP display
+            // Update combined latency / loss / jitter + IP display
             if (connected)
             {
-                float latency = _audioMixer.GetLatency(row.CohostId);
-                string ip = _audioMixer.GetIp(row.CohostId);
                 string combined = "";
-                if (latency > 0)
+                if (net != null)
                 {
-                    combined = ((int)latency).ToString() + "ms";
+                    combined = net.Rtt + "ms \u00b7 " + net.Loss + "% \u00b7 " + net.Jitter + "ms jit";
                 }
+                else
+                {
+                    float latency = _audioMixer.GetLatency(row.CohostId);
+                    if (latency > 0) combined = ((int)latency).ToString() + "ms";
+                }
+                string ip = _audioMixer.GetIp(row.CohostId);
                 if (ip != null && ip.Length > 0)
                 {
-                    if (combined.Length > 0)
-                    {
-                        combined += " | " + ip;
-                    }
-                    else
-                    {
-                        combined = ip;
-                    }
+                    combined = combined.Length > 0 ? (combined + " | " + ip) : ip;
                 }
                 row.LatencyLabel.Text = combined;
             }
@@ -3342,6 +3380,8 @@ public class WebRtcMeshClient
                 if (!_heartbeatRunning || _cts.IsCancellationRequested) break;
                 try { Join(); }
                 catch (Exception ex) { Log("Heartbeat join error: " + ex.Message); }
+                try { FetchCohostStats(); }
+                catch (Exception ex) { Log("Heartbeat stats error: " + ex.Message); }
             }
         });
         _heartbeatThread.IsBackground = true;
@@ -3358,6 +3398,42 @@ public class WebRtcMeshClient
         {
             try { t.Join(1000); } catch { }
         }
+    }
+
+    /// <summary>
+    /// Fetches per-co-host network telemetry (rtt/loss/jitter/quality) from the
+    /// signaling server and publishes it for the UI strip's traffic-light display.
+    /// Uses the authenticated short-request client (Bearer token already attached).
+    /// </summary>
+    private void FetchCohostStats()
+    {
+        string url = _baseUrl.TrimEnd('/') + "/api/telemetry/stats/" + Uri.EscapeDataString(_slug);
+        string resp = HttpGet(url);
+        if (resp == null) return;
+
+        List<string> rows = ExtractJsonArrayObjects(resp, "stats");
+        for (int i = 0; i < rows.Count; i++)
+        {
+            string obj = rows[i];
+            string userId = ExtractJsonValue(obj, "user_id");
+            if (string.IsNullOrEmpty(userId) || userId == _peerId) continue;
+            string quality = ExtractJsonValue(obj, "quality");
+            int rtt = ParseIntSafe(ExtractJsonValue(obj, "rtt"));
+            int loss = ParseIntSafe(ExtractJsonValue(obj, "packet_loss"));
+            int jitter = ParseIntSafe(ExtractJsonValue(obj, "jitter"));
+            NewPlugin.PublishCohostNetStat(userId, quality, rtt, loss, jitter);
+        }
+    }
+
+    private static int ParseIntSafe(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return 0;
+        double d;
+        if (double.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out d))
+        {
+            return (int)Math.Round(d);
+        }
+        return 0;
     }
 
     private void Join()
