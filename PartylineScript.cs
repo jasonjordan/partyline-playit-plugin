@@ -159,6 +159,10 @@ public class NewPlugin
     // DIAGNOSTIC: stereo-separation probe — sum|L-R| vs sum|L|+|R| over the window.
     private double _dspSumLRDiff;
     private double _dspSumAbs;
+    // DIAGNOSTIC: peak source float and peak post-gain value over the window, to tell
+    // whether overmodulation is hot source material being hard-clamped at capture.
+    private float _dspPeakSrc;
+    private float _dspPeakOut;
     // DIAGNOSTIC: outbound pump push-rate measurement.
     private long _pumpFramesSinceLog;
     private System.Diagnostics.Stopwatch _pumpRateClock;
@@ -567,7 +571,13 @@ public class NewPlugin
         try
         {
             int floatSamples = length / 4;
-            int channels = _captureChannels > 0 ? _captureChannels : (_mixerChannels > 0 ? _mixerChannels : 1);
+            // Trust the BASS-reported channel count for the INTERLEAVE (it is reliable
+            // for de-interleaving; the per-frame RATE is what differs from the reported
+            // freq, and that is handled separately by the measured capture rate).
+            // Do NOT derive channels from floats/sec vs freq: the real frame rate here
+            // (22050) != reported freq (44100), which mislabels stereo as mono and turns
+            // the de-interleave into a sample-doubling (zero-order-hold) distortion.
+            int channels = _mixerChannels > 0 ? _mixerChannels : 2;
             if (channels < 1) channels = 1;
             int monoSamples = floatSamples / channels;
 
@@ -585,6 +595,8 @@ public class NewPlugin
                 float b = floatData[p + 1];
                 _dspSumLRDiff += Math.Abs(a - b);
                 _dspSumAbs += Math.Abs(a) + Math.Abs(b);
+                float aa = Math.Abs(a); if (aa > _dspPeakSrc) _dspPeakSrc = aa;
+                float bb = Math.Abs(b); if (bb > _dspPeakSrc) _dspPeakSrc = bb;
             }
 
             // Convert to PCM16 mono
@@ -603,6 +615,8 @@ public class NewPlugin
                 float mono = sum / channels;
                 // Reduce level by 6dB to prevent clipping
                 mono = mono * 0.5f;
+                float mAbs = mono < 0 ? -mono : mono;
+                if (mAbs > _dspPeakOut) _dspPeakOut = mAbs;
                 if (mono > 1f) mono = 1f;
                 if (mono < -1f) mono = -1f;
                 short s16 = (short)(mono * 32767f);
@@ -665,11 +679,14 @@ public class NewPlugin
                 Log("DIAG capture rate=" + rate + " samples/sec (reported mixer ~" + _mixerFreq
                     + ", using " + _captureRateHz + "); bufChannels reported=" + _mixerChannels
                     + " derived=" + derivedCh + "; lane-separation=" + sepPct + "% (0%=mono/dual-mono); "
-                    + "info[" + ciStr + "]; ring backlog=" + backlog + " bytes");
+                    + "peakSrc=" + _dspPeakSrc.ToString("0.00") + " peakOut=" + _dspPeakOut.ToString("0.00")
+                    + " (>1.00=clipping); info[" + ciStr + "]; ring backlog=" + backlog + " bytes");
                 _dspMonoSamplesSinceLog = 0;
                 _dspFloatsSinceLog = 0;
                 _dspSumLRDiff = 0;
                 _dspSumAbs = 0;
+                _dspPeakSrc = 0;
+                _dspPeakOut = 0;
                 _dspRateClock.Restart();
             }
         }
@@ -1140,12 +1157,24 @@ public class NewPlugin
         int inputSamples = raw.Length / 2;
         for (int i = 0; i < outputSamples; i++)
         {
-            // Nearest-sample resample srcFreq -> 48 kHz.
-            int srcIdx = (int)((long)i * srcFreq / 48000);
-            if (srcIdx >= inputSamples) srcIdx = inputSamples - 1;
-            int lo = raw[srcIdx * 2];
-            int hi = raw[srcIdx * 2 + 1];
-            frame[i] = (short)(lo | (hi << 8));
+            // Linear-interpolated resample srcFreq -> 48 kHz. Nearest-sample (zero-order
+            // hold) on an upsample (e.g. 22050 -> 48000) injects audible imaging
+            // distortion ("overmodulation"); linear interpolation is clean for voice/
+            // program material.
+            long pos = (long)i * srcFreq;          // position in source, scaled by 48000
+            int srcIdx = (int)(pos / 48000);
+            int frac = (int)(pos % 48000);         // 0..47999 fractional part
+            if (srcIdx >= inputSamples - 1)
+            {
+                int last = inputSamples - 1;
+                frame[i] = (short)(raw[last * 2] | (raw[last * 2 + 1] << 8));
+            }
+            else
+            {
+                short s0 = (short)(raw[srcIdx * 2] | (raw[srcIdx * 2 + 1] << 8));
+                short s1 = (short)(raw[(srcIdx + 1) * 2] | (raw[(srcIdx + 1) * 2 + 1] << 8));
+                frame[i] = (short)(s0 + (int)(((long)(s1 - s0) * frac) / 48000));
+            }
         }
         return true;
     }
