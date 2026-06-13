@@ -2184,8 +2184,9 @@ public class PartylineConfigForm : Form
     private void InitializeFormComponents()
     {
         Text = "Partyline Co-Host Configuration";
-        Width = 564;
-        Height = 500;
+        // Use ClientSize (not Width/Height) so the bottom buttons, which are
+        // positioned in client coordinates, are never clipped by the title bar.
+        ClientSize = new System.Drawing.Size(548, 312);
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
@@ -2298,10 +2299,12 @@ public class PartylineConfigForm : Form
         _grid.CellContentClick += OnGridCellContentClick;
         Controls.Add(_grid);
 
-        // Edit panel (toggled by Add/Edit), sits just below the grid.
+        // Edit panel (toggled by Add/Edit) overlays the grid area so it doesn't
+        // force extra form height (which left a large blank gap).
         _editPanel = new Panel();
-        _editPanel.Location = new System.Drawing.Point(12, 272);
-        _editPanel.Size = new System.Drawing.Size(524, 150);
+        _editPanel.Location = new System.Drawing.Point(12, 92);
+        _editPanel.Size = new System.Drawing.Size(524, 170);
+        _editPanel.BackColor = System.Drawing.SystemColors.Control;
         _editPanel.Visible = false;
 
         Label lblSep = new Label();
@@ -2361,10 +2364,10 @@ public class PartylineConfigForm : Form
 
         Controls.Add(_editPanel);
 
-        // Save & Close button at bottom-right
+        // Save & Close button at bottom-right (client coordinates).
         Button btnSaveClose = new Button();
         btnSaveClose.Text = "Save && Close";
-        btnSaveClose.Location = new System.Drawing.Point(Width - 220, Height - 60);
+        btnSaveClose.Location = new System.Drawing.Point(ClientSize.Width - 210, ClientSize.Height - 40);
         btnSaveClose.Size = new System.Drawing.Size(100, 30);
         btnSaveClose.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
         btnSaveClose.Click += OnSaveCloseClick;
@@ -2373,7 +2376,7 @@ public class PartylineConfigForm : Form
         // Close button (no save)
         Button btnClose = new Button();
         btnClose.Text = "Close";
-        btnClose.Location = new System.Drawing.Point(Width - 110, Height - 60);
+        btnClose.Location = new System.Drawing.Point(ClientSize.Width - 100, ClientSize.Height - 40);
         btnClose.Size = new System.Drawing.Size(80, 30);
         btnClose.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
         btnClose.Click += OnCloseClick;
