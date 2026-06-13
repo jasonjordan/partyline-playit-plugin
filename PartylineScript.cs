@@ -269,6 +269,7 @@ public class NewPlugin
             // room name, or room password. The plugin claims its own room with a
             // private DJ key and authorizes co-hosts via per-user invite passwords.
             string[] ident = _settingsManager.EnsureRoomIdentity();
+            string[] meta = _settingsManager.LoadMeta(); // [roomName, stationName, djName]
             string meshBaseUrl = SignalingBaseUrl;
             string meshSlug = ident[0];   // public room id (appears in invite URLs)
             string djKey = ident[1];      // private DJ credential (never shared)
@@ -276,8 +277,9 @@ public class NewPlugin
             if (meshSlug != null && meshSlug.Length > 0 && djKey != null && djKey.Length > 0)
             {
                 // The client auto-provisions/claims the room with djKey, authenticates
-                // as the DJ, and publishes the co-host accounts as invites.
-                _webRtcMesh = new WebRtcMeshClient(meshBaseUrl, meshSlug, "plugin", _webRtcPeer, djKey, accounts);
+                // as the DJ, publishes the co-host accounts as invites, and publishes
+                // the display metadata (room/station/DJ names) for the co-host page.
+                _webRtcMesh = new WebRtcMeshClient(meshBaseUrl, meshSlug, "plugin", _webRtcPeer, djKey, accounts, meta);
                 _staticWebRtcMesh = _webRtcMesh;
                 _webRtcMesh.Start(_cts.Token);
                 Log("WebRTC mesh signaling started: base=" + meshBaseUrl + " room=" + meshSlug);
@@ -1633,6 +1635,54 @@ public class SettingsManager
         return EnsureRoomIdentity()[0];
     }
 
+    // Display metadata shown to co-hosts (room name / station name / DJ name).
+    // Stored separately from accounts + identity. Returns { roomName, stationName, djName }.
+    private static readonly string MetaPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "Partyline",
+        "meta.json");
+
+    public string[] LoadMeta()
+    {
+        try
+        {
+            if (File.Exists(MetaPath))
+            {
+                string json = File.ReadAllText(MetaPath, Encoding.UTF8);
+                return new string[]
+                {
+                    ExtractTopLevelString(json, "roomName") ?? "",
+                    ExtractTopLevelString(json, "stationName") ?? "",
+                    ExtractTopLevelString(json, "djName") ?? ""
+                };
+            }
+        }
+        catch (Exception ex)
+        {
+            NewPlugin.LogStatic("ERROR reading meta.json: " + ex.Message);
+        }
+        return new string[] { "", "", "" };
+    }
+
+    public void SaveMeta(string roomName, string stationName, string djName)
+    {
+        try
+        {
+            string dir = Path.GetDirectoryName(MetaPath);
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            var sb = new StringBuilder();
+            sb.Append("{\"roomName\":").Append(EscapeJsonString(roomName ?? ""));
+            sb.Append(",\"stationName\":").Append(EscapeJsonString(stationName ?? ""));
+            sb.Append(",\"djName\":").Append(EscapeJsonString(djName ?? ""));
+            sb.Append("}");
+            File.WriteAllText(MetaPath, sb.ToString(), Encoding.UTF8);
+        }
+        catch (Exception ex)
+        {
+            NewPlugin.LogStatic("ERROR writing meta.json: " + ex.Message);
+        }
+    }
+
     private static string ExtractTopLevelString(string json, string key)
     {
         if (json == null) return null;
@@ -2004,8 +2054,12 @@ public class PartylineConfigForm : Form
     private TextBox _txtPassword;
     private TextBox _txtDisplayName;
     private TextBox _txtStationName;
+    private TextBox _txtRoomName;
+    private TextBox _txtDjName;
     private TextBox _txtRelayUrl;
     private TextBox _txtStationKey;
+    private string _roomName;
+    private string _djName;
     private Button _btnSave;
     private Button _btnCancel;
     private Button _btnAdd;
@@ -2015,7 +2069,10 @@ public class PartylineConfigForm : Form
     {
         _settingsManager = settingsManager;
         _accounts = _settingsManager.Load();
-        _stationName = _settingsManager.LoadStationName();
+        string[] meta = _settingsManager.LoadMeta();
+        _roomName = meta[0];
+        _stationName = meta[1];
+        _djName = meta[2];
         _relayUrl = _settingsManager.LoadRelayUrl();
         _stationKey = _settingsManager.LoadStationKey();
         _editingIndex = -1;
@@ -2027,32 +2084,68 @@ public class PartylineConfigForm : Form
     {
         Text = "Partyline Co-Host Configuration";
         Width = 550;
-        Height = 620;
+        Height = 720;
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
 
-        // Co-host accounts are the ONLY user-configurable settings. The signaling
-        // server is hardcoded and the room identity is auto-generated, so there is
-        // no station name, URL, or room-password field here.
+        // Display metadata shown to co-hosts on their screen. These are labels only
+        // (the room id stays auto-generated); the plugin publishes them to the
+        // signaling server so the co-host page can render them.
+        Label lblStationName = new Label();
+        lblStationName.Text = "Station Name:";
+        lblStationName.Location = new System.Drawing.Point(12, 15);
+        lblStationName.AutoSize = true;
+        lblStationName.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+        Controls.Add(lblStationName);
+        _txtStationName = new TextBox();
+        _txtStationName.Location = new System.Drawing.Point(130, 12);
+        _txtStationName.Size = new System.Drawing.Size(390, 22);
+        _txtStationName.Text = _stationName;
+        Controls.Add(_txtStationName);
+
+        Label lblRoomName = new Label();
+        lblRoomName.Text = "Room Name:";
+        lblRoomName.Location = new System.Drawing.Point(12, 45);
+        lblRoomName.AutoSize = true;
+        lblRoomName.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+        Controls.Add(lblRoomName);
+        _txtRoomName = new TextBox();
+        _txtRoomName.Location = new System.Drawing.Point(130, 42);
+        _txtRoomName.Size = new System.Drawing.Size(390, 22);
+        _txtRoomName.Text = _roomName;
+        Controls.Add(_txtRoomName);
+
+        Label lblDjName = new Label();
+        lblDjName.Text = "DJ Name:";
+        lblDjName.Location = new System.Drawing.Point(12, 75);
+        lblDjName.AutoSize = true;
+        lblDjName.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+        Controls.Add(lblDjName);
+        _txtDjName = new TextBox();
+        _txtDjName.Location = new System.Drawing.Point(130, 72);
+        _txtDjName.Size = new System.Drawing.Size(390, 22);
+        _txtDjName.Text = _djName;
+        Controls.Add(_txtDjName);
+
         Label lblIntro = new Label();
         lblIntro.Text = "Add a co-host below and set their password. Use the Copy button to send each co-host their personal join link.";
-        lblIntro.Location = new System.Drawing.Point(12, 12);
+        lblIntro.Location = new System.Drawing.Point(12, 104);
         lblIntro.Size = new System.Drawing.Size(510, 32);
         lblIntro.ForeColor = System.Drawing.SystemColors.GrayText;
         Controls.Add(lblIntro);
 
         Label lblTitle = new Label();
         lblTitle.Text = "Co-Host Accounts:";
-        lblTitle.Location = new System.Drawing.Point(12, 48);
+        lblTitle.Location = new System.Drawing.Point(12, 140);
         lblTitle.AutoSize = true;
         lblTitle.Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
         Controls.Add(lblTitle);
 
         // DataGridView for account list
         _grid = new DataGridView();
-        _grid.Location = new System.Drawing.Point(12, 70);
+        _grid.Location = new System.Drawing.Point(12, 162);
         _grid.Size = new System.Drawing.Size(510, 200);
         _grid.AllowUserToAddRows = false;
         _grid.AllowUserToDeleteRows = false;
@@ -2201,9 +2294,11 @@ public class PartylineConfigForm : Form
 
     private void OnSaveCloseClick(object sender, EventArgs e)
     {
-        // Co-host accounts are the only configurable settings. The signaling URL is
-        // hardcoded and the room identity is auto-generated, so there is nothing
-        // else to validate or persist here.
+        // Persist display metadata (shown to co-hosts) and the co-host accounts.
+        _stationName = _txtStationName.Text.Trim();
+        _roomName = _txtRoomName.Text.Trim();
+        _djName = _txtDjName.Text.Trim();
+        _settingsManager.SaveMeta(_roomName, _stationName, _djName);
         _settingsManager.Save(_accounts);
         DialogResult = DialogResult.OK;
         Close();
@@ -3112,8 +3207,12 @@ public class WebRtcMeshClient
     // the plugin's local account list.
     private readonly string _password;
     private readonly List<CoHostAccount> _accounts;
+    private readonly string _metaRoomName;
+    private readonly string _metaStationName;
+    private readonly string _metaDjName;
     private string _token;                // bearer session token (role 'dj')
     private volatile bool _invitesPublished;
+    private volatile bool _metaPublished;
 
     private HttpClient _httpClient;       // short requests (config + POST signal)
     private HttpClient _streamClient;     // long-lived SSE read (infinite timeout)
@@ -3136,11 +3235,16 @@ public class WebRtcMeshClient
     }
 
     public WebRtcMeshClient(string baseUrl, string slug, string peerId, IWebRtcPeer peer)
-        : this(baseUrl, slug, peerId, peer, null, null)
+        : this(baseUrl, slug, peerId, peer, null, null, null)
     {
     }
 
     public WebRtcMeshClient(string baseUrl, string slug, string peerId, IWebRtcPeer peer, string password, List<CoHostAccount> accounts)
+        : this(baseUrl, slug, peerId, peer, password, accounts, null)
+    {
+    }
+
+    public WebRtcMeshClient(string baseUrl, string slug, string peerId, IWebRtcPeer peer, string password, List<CoHostAccount> accounts, string[] meta)
     {
         _baseUrl = baseUrl != null ? baseUrl : "";
         _slug = slug != null ? slug : "";
@@ -3149,6 +3253,9 @@ public class WebRtcMeshClient
         _peer = peer;
         _password = password != null ? password : "";
         _accounts = accounts;
+        _metaRoomName = (meta != null && meta.Length > 0) ? (meta[0] ?? "") : "";
+        _metaStationName = (meta != null && meta.Length > 1) ? (meta[1] ?? "") : "";
+        _metaDjName = (meta != null && meta.Length > 2) ? (meta[2] ?? "") : "";
     }
 
     public void Start(CancellationToken ct)
@@ -3223,6 +3330,7 @@ public class WebRtcMeshClient
                 Provision();
                 Authenticate();
                 PublishInvitesOnce();
+                PublishMetaOnce();
                 FetchRtcConfig();
                 Join();
                 _connected = true;
@@ -3379,6 +3487,29 @@ public class WebRtcMeshClient
         else
         {
             Log("WARNING: failed to publish co-host invites (will retry on reconnect).");
+        }
+    }
+
+    /// <summary>
+    /// Publishes the room display metadata (room/station/DJ names) so the co-host
+    /// page can render them. Once per process; retried on reconnect if it fails.
+    /// </summary>
+    private void PublishMetaOnce()
+    {
+        if (_metaPublished) return;
+        string body = "{\"roomName\":\"" + EscapeJson(_metaRoomName) + "\","
+            + "\"stationName\":\"" + EscapeJson(_metaStationName) + "\","
+            + "\"djName\":\"" + EscapeJson(_metaDjName) + "\"}";
+        string url = _baseUrl.TrimEnd('/') + "/api/plugin/meta/" + Uri.EscapeDataString(_slug);
+        string resp = HttpPost(url, body);
+        if (resp != null)
+        {
+            _metaPublished = true;
+            Log("Published room metadata (station/room/DJ names).");
+        }
+        else
+        {
+            Log("WARNING: failed to publish room metadata (will retry on reconnect).");
         }
     }
 
