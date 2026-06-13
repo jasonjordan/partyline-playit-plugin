@@ -132,6 +132,7 @@ public class NewPlugin
     private int _mixerHandle;
     private int _mixerChannels = 2; // default stereo, updated from BASS_ChannelGetInfo
     private int _mixerFreq = 44100; // default 44.1kHz, updated from BASS_ChannelGetInfo
+    private bool _mixerIsFloat;     // true if the DSP buffer is 32-bit float, else 16-bit PCM
     private byte[] _returnBuffer = new byte[44100 * 2 * 4]; // 4 seconds of 16-bit mono at 44.1kHz
     private int _returnWritePos;
     private int _returnReadPos;
@@ -521,7 +522,10 @@ public class NewPlugin
                     {
                         _mixerFreq = info.freq > 0 ? info.freq : 44100;
                         _mixerChannels = info.chans > 0 ? info.chans : 2;
-                        Log("Mixer format: freq=" + info.freq + " chans=" + info.chans + " flags=" + info.flags);
+                        // BASS_SAMPLE_FLOAT = 0x100. If absent, the channel is 16-bit PCM.
+                        _mixerIsFloat = (info.flags & 0x100) != 0;
+                        Log("Mixer format: freq=" + info.freq + " chans=" + info.chans
+                            + " flags=" + info.flags + " => " + (_mixerIsFloat ? "32-bit float" : "16-bit PCM"));
                     }
                     else
                     {
@@ -574,70 +578,72 @@ public class NewPlugin
 
         try
         {
-            int floatSamples = length / 4;
-            // Trust the BASS-reported channel count for the INTERLEAVE (it is reliable
-            // for de-interleaving; the per-frame RATE is what differs from the reported
-            // freq, and that is handled separately by the measured capture rate).
-            // Do NOT derive channels from floats/sec vs freq: the real frame rate here
-            // (22050) != reported freq (44100), which mislabels stereo as mono and turns
-            // the de-interleave into a sample-doubling (zero-order-hold) distortion.
             int channels = _mixerChannels > 0 ? _mixerChannels : 2;
             if (channels < 1) channels = 1;
-            int monoSamples = floatSamples / channels;
 
-            // Copy float data from native buffer
-            float[] floatData = new float[floatSamples];
-            Marshal.Copy(buffer, floatData, 0, floatSamples);
+            // The PlayIt main-mix tap here is 16-bit PCM (BASS_SAMPLE_FLOAT absent),
+            // NOT 32-bit float. Reading it as float was the root cause of the garbage
+            // samples / distortion / wrong rate. Read per the detected format. PCM is
+            // interleaved Int16 at the full mixer rate (e.g. 44100 stereo).
+            byte[] pcm16;
+            int monoSamples;
+            float cleanPeak = 0f;
 
-            // DIAGNOSTIC: probe interleaved stereo separation (treat as 2ch regardless
-            // of the downmix decision). If the two interleaved lanes carry different
-            // audio, sum|a-b| is a real fraction of sum|a|+|b|; if they are identical
-            // (true mono, or dual-mono) the ratio is ~0.
-            for (int p = 0; p + 1 < floatSamples; p += 2)
+            if (_mixerIsFloat)
             {
-                float a = floatData[p];
-                float b = floatData[p + 1];
-                _dspSumLRDiff += Math.Abs(a - b);
-                _dspSumAbs += Math.Abs(a) + Math.Abs(b);
-                float aa = Math.Abs(a); if (aa > _dspPeakSrc) _dspPeakSrc = aa;
-                float bb = Math.Abs(b); if (bb > _dspPeakSrc) _dspPeakSrc = bb;
-            }
-
-            // Convert to PCM16 mono
-            byte[] pcm16 = new byte[monoSamples * 2];
-            for (int i = 0; i < monoSamples; i++)
-            {
-                float sum = 0;
-                for (int ch = 0; ch < channels; ch++)
+                int floatSamples = length / 4;
+                monoSamples = floatSamples / channels;
+                float[] fd = new float[floatSamples];
+                Marshal.Copy(buffer, fd, 0, floatSamples);
+                pcm16 = new byte[monoSamples * 2];
+                for (int i = 0; i < monoSamples; i++)
                 {
-                    int idx = i * channels + ch;
-                    if (idx < floatSamples)
+                    float sum = 0;
+                    for (int ch = 0; ch < channels; ch++)
                     {
-                        // Sanitize: the tap occasionally contains non-finite/garbage
-                        // floats (observed up to float.MaxValue) that, once clamped to
-                        // full scale, pin the meter and overmodulate. Drop them.
-                        float v = floatData[idx];
-                        if (float.IsNaN(v) || float.IsInfinity(v) || v > 2f || v < -2f)
+                        int idx = i * channels + ch;
+                        if (idx < floatSamples)
                         {
-                            v = 0f;
-                            _dspSanitizedSinceLog++;
+                            float v = fd[idx];
+                            if (float.IsNaN(v) || float.IsInfinity(v) || v > 4f || v < -4f) v = 0f;
+                            sum += v;
                         }
-                        sum += v;
                     }
+                    float mono = sum / channels;
+                    float a = mono < 0 ? -mono : mono; if (a > cleanPeak) cleanPeak = a;
+                    if (mono > 1f) mono = 1f;
+                    if (mono < -1f) mono = -1f;
+                    short s16 = (short)(mono * 32767f);
+                    pcm16[i * 2] = (byte)(s16 & 0xFF);
+                    pcm16[i * 2 + 1] = (byte)((s16 >> 8) & 0xFF);
                 }
-                float mono = sum / channels;
-                float cAbs = mono < 0 ? -mono : mono;
-                if (cAbs > _dspCleanPeak) _dspCleanPeak = cAbs;
-                // Reduce level by 6dB to prevent clipping
-                mono = mono * 0.5f;
-                float mAbs = mono < 0 ? -mono : mono;
-                if (mAbs > _dspPeakOut) _dspPeakOut = mAbs;
-                if (mono > 1f) mono = 1f;
-                if (mono < -1f) mono = -1f;
-                short s16 = (short)(mono * 32767f);
-                pcm16[i * 2] = (byte)(s16 & 0xFF);
-                pcm16[i * 2 + 1] = (byte)((s16 >> 8) & 0xFF);
             }
+            else
+            {
+                int totalSamples = length / 2;          // 16-bit samples in the buffer
+                monoSamples = totalSamples / channels;  // interleaved frames
+                short[] pin = new short[totalSamples];
+                Marshal.Copy(buffer, pin, 0, totalSamples);
+                pcm16 = new byte[monoSamples * 2];
+                for (int i = 0; i < monoSamples; i++)
+                {
+                    int sum = 0;
+                    for (int ch = 0; ch < channels; ch++)
+                    {
+                        int idx = i * channels + ch;
+                        if (idx < totalSamples) sum += pin[idx];
+                    }
+                    int mono = sum / channels;          // average stays within Int16 range
+                    if (mono > 32767) mono = 32767;
+                    if (mono < -32768) mono = -32768;
+                    int am = mono < 0 ? -mono : mono;
+                    float af = am / 32768f; if (af > cleanPeak) cleanPeak = af;
+                    short s16 = (short)mono;
+                    pcm16[i * 2] = (byte)(s16 & 0xFF);
+                    pcm16[i * 2 + 1] = (byte)((s16 >> 8) & 0xFF);
+                }
+            }
+            if (cleanPeak > _dspCleanPeak) _dspCleanPeak = cleanPeak;
 
             lock (_returnLock)
             {
@@ -658,53 +664,22 @@ public class NewPlugin
                 }
             }
 
-            // Measure the ACTUAL capture rate and use it to drive the outbound
-            // resample. For this tap it is ~half the reported mixer freq, which is
-            // exactly what made playback 2x (chipmunk). A 1 s window locks quickly.
+            // Measure the actual capture (frame) rate to drive the outbound resample.
             _dspMonoSamplesSinceLog += monoSamples;
-            _dspFloatsSinceLog += floatSamples;
             if (_dspRateClock == null) _dspRateClock = System.Diagnostics.Stopwatch.StartNew();
             long dspMs = _dspRateClock.ElapsedMilliseconds;
             if (dspMs >= 1000)
             {
-                // Derive the buffer's REAL channel count: a freq-Hz stream of N
-                // channels delivers N*freq floats/sec. floats/sec is independent of
-                // any channel assumption, so this corrects a wrong reported count.
-                int floatsRate = (int)(_dspFloatsSinceLog * 1000L / dspMs);
-                int derivedCh = (int)Math.Round((double)floatsRate / Math.Max(1, _mixerFreq));
-                if (derivedCh < 1) derivedCh = 1;
-                if (derivedCh > 8) derivedCh = 8;
-                bool chChanged = (_captureChannels != derivedCh);
-                _captureChannels = derivedCh;
-
                 int rate = (int)(_dspMonoSamplesSinceLog * 1000L / dspMs);
                 if (rate >= 8000 && rate <= 96000)
-                {
-                    // Snap on first measure or when the channel count just changed
-                    // (the startup transient); otherwise smooth gently.
-                    if (chChanged || _captureRateHz == 0) _captureRateHz = rate;
-                    else _captureRateHz = (_captureRateHz * 3 + rate) / 4;
-                }
+                    _captureRateHz = _captureRateHz > 0 ? (_captureRateHz * 3 + rate) / 4 : rate;
                 int backlog;
                 lock (_returnLock) { backlog = _returnAvailable; }
-                int sepPct = _dspSumAbs > 0 ? (int)(100.0 * _dspSumLRDiff / _dspSumAbs) : 0;
-                BASS_CHANNELINFO ci = new BASS_CHANNELINFO();
-                string ciStr = BASS_ChannelGetInfo(_mixerHandle, ref ci)
-                    ? ("freq=" + ci.freq + " chans=" + ci.chans) : "n/a";
-                Log("DIAG capture rate=" + rate + " samples/sec (reported mixer ~" + _mixerFreq
-                    + ", using " + _captureRateHz + "); bufChannels reported=" + _mixerChannels
-                    + " derived=" + derivedCh + "; lane-separation=" + sepPct + "% (0%=mono/dual-mono); "
-                    + "peakSrc=" + _dspPeakSrc.ToString("0.00") + " peakOut=" + _dspPeakOut.ToString("0.00")
-                    + " (>1.00=clipping); cleanPeak=" + _dspCleanPeak.ToString("0.00")
-                    + " sanitized=" + _dspSanitizedSinceLog
-                    + "; info[" + ciStr + "]; ring backlog=" + backlog + " bytes");
+                Log("DIAG capture rate=" + rate + " samples/sec (using " + _captureRateHz + "); "
+                    + (_mixerIsFloat ? "float" : "pcm16") + " ch=" + _mixerChannels
+                    + " cleanPeak=" + _dspCleanPeak.ToString("0.00")
+                    + "; ring backlog=" + backlog + " bytes");
                 _dspMonoSamplesSinceLog = 0;
-                _dspFloatsSinceLog = 0;
-                _dspSumLRDiff = 0;
-                _dspSumAbs = 0;
-                _dspPeakSrc = 0;
-                _dspPeakOut = 0;
-                _dspSanitizedSinceLog = 0;
                 _dspCleanPeak = 0;
                 _dspRateClock.Restart();
             }
