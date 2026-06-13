@@ -360,11 +360,20 @@ public class NewPlugin
 #endif
             if (peer == null)
             {
-                // Default path (PARTYLINE_MRWEBRTC off, or MR load/construction failed):
-                // pure-managed SIPSorcery + Concentus fallback (R5.1 amendment is
-                // documented on the adapter type).
-                peer = new Partyline.WebRtc.SipSorceryWebRtcPeer();
-                Log("WebRTC binding: SIPSorcery + Concentus (managed fallback).");
+                // Default path: run SIPSorcery 6.2.4 in an isolated child AppDomain
+                // so the host's shadowing 5.2.3 is never probed (Task 9). Falls back
+                // to the in-process adapter only if the child domain can't be created.
+                try
+                {
+                    peer = new Partyline.WebRtc.IsolatedSipSorceryPeer();
+                    Log("WebRTC binding: SIPSorcery 6.2.4 (isolated AppDomain).");
+                }
+                catch (Exception ex)
+                {
+                    Log("Isolated SIPSorcery domain failed (" + ex.Message + "); using in-process SIPSorcery.");
+                    peer = new Partyline.WebRtc.SipSorceryWebRtcPeer();
+                    Log("WebRTC binding: SIPSorcery + Concentus (in-process fallback).");
+                }
             }
 
             _webRtcPeer = peer;
@@ -685,6 +694,9 @@ public class NewPlugin
         {
             try { _webRtcPeer.CloseAll(); }
             catch (Exception ex) { Log("Error closing WebRTC peer: " + ex.Message); }
+            // Unload the isolated SIPSorcery AppDomain if one is in use.
+            var disposablePeer = _webRtcPeer as IDisposable;
+            if (disposablePeer != null) { try { disposablePeer.Dispose(); } catch { } }
         }
 
         if (_authManager != null)
@@ -3207,6 +3219,7 @@ internal class CoHostRow
 /// <summary>
 /// A single ICE server entry returned by GET /api/rtc-config/:slug.
 /// </summary>
+[Serializable]
 public class WebRtcIceServer
 {
     public string[] Urls;
@@ -5770,3 +5783,140 @@ namespace Partyline.WebRtc
     }
 }
 // ==================  END SIPSORCERY + CONCENTUS FALLBACK ADAPTER  ============
+
+// =============================================================================
+// =========  ISOLATED SIPSORCERY 6.2.4 (child AppDomain) — Task 9  ============
+// =============================================================================
+// PlayIt Live ships its OWN SIPSorcery 5.2.3 in its app directory, which the CLR
+// probes FIRST (unsigned -> matched by simple name), so our bundled 6.2.4 never
+// wins in the default AppDomain. 5.2.3's RTCPeerConnection does not gather
+// STUN/TURN candidates, so ICE fails on CGNAT/Starlink.
+//
+// Fix: run the SIPSorcery peer in a CHILD AppDomain whose ApplicationBase is a
+// clean temp folder (NOT the host directory). There, the host's 5.2.3 is never
+// on the probe path, and Costura (inside our copied PartylinePlugin.dll) resolves
+// the embedded 6.2.4. The default domain talks to the child via MarshalByRefObject
+// proxies; audio frames (short[]) and signaling (strings) marshal by value.
+namespace Partyline.WebRtc
+{
+    using System;
+    using System.IO;
+
+    /// <summary>
+    /// Default-domain callback sink the child-domain worker calls back into.
+    /// MarshalByRefObject so the worker holds a proxy; its methods execute in the
+    /// DEFAULT domain where the delegate fields live. Infinite lease so it is not
+    /// reclaimed mid-session.
+    /// </summary>
+    public sealed class WebRtcCallbackSink : MarshalByRefObject
+    {
+        public Action<string, string> LocalIceCandidate;
+        public Action<string, short[], int, int> RemoteAudioFrame;
+        public Action<string, string> ConnectionStateChanged;
+
+        public void RaiseLocalIceCandidate(string peerId, string json) { var h = LocalIceCandidate; if (h != null) h(peerId, json); }
+        public void RaiseRemoteAudioFrame(string peerId, short[] pcm, int count, int rate) { var h = RemoteAudioFrame; if (h != null) h(peerId, pcm, count, rate); }
+        public void RaiseConnectionStateChanged(string peerId, string state) { var h = ConnectionStateChanged; if (h != null) h(peerId, state); }
+
+        public override object InitializeLifetimeService() { return null; }
+    }
+
+    /// <summary>
+    /// Lives INSIDE the child AppDomain. Wraps a real <see cref="SipSorceryWebRtcPeer"/>
+    /// (which binds to SIPSorcery 6.2.4 in this domain) and forwards its Action
+    /// callbacks to the default-domain sink. All IWebRtcPeer operations are exposed
+    /// as marshalable methods.
+    /// </summary>
+    public sealed class SipSorceryDomainWorker : MarshalByRefObject
+    {
+        private SipSorceryWebRtcPeer _peer;
+        private WebRtcCallbackSink _sink;
+
+        public void Init(WebRtcCallbackSink sink)
+        {
+            _sink = sink;
+            _peer = new SipSorceryWebRtcPeer();
+            _peer.OnLocalIceCandidate = (peerId, json) => { try { _sink.RaiseLocalIceCandidate(peerId, json); } catch { } };
+            _peer.OnRemoteAudioFrame = (peerId, pcm, count, rate) => { try { _sink.RaiseRemoteAudioFrame(peerId, pcm, count, rate); } catch { } };
+            _peer.OnConnectionStateChanged = (peerId, state) => { try { _sink.RaiseConnectionStateChanged(peerId, state); } catch { } };
+        }
+
+        public void SetIceServers(WebRtcIceServer[] iceServers) { _peer.SetIceServers(iceServers); }
+        public void CreatePeerConnection(string peerId) { _peer.CreatePeerConnection(peerId); }
+        public void ClosePeerConnection(string peerId) { _peer.ClosePeerConnection(peerId); }
+        public void CloseAll() { if (_peer != null) _peer.CloseAll(); }
+        public string CreateOffer(string peerId) { return _peer.CreateOffer(peerId); }
+        public string CreateAnswer(string peerId) { return _peer.CreateAnswer(peerId); }
+        public void ApplyRemoteDescription(string peerId, string type, string sdp) { _peer.ApplyRemoteDescription(peerId, type, sdp); }
+        public void AddIceCandidate(string peerId, string candidateJson) { _peer.AddIceCandidate(peerId, candidateJson); }
+        public void PushOutboundAudio(short[] pcm, int sampleCount, int sampleRate, int channels) { _peer.PushOutboundAudio(pcm, sampleCount, sampleRate, channels); }
+
+        public override object InitializeLifetimeService() { return null; }
+    }
+
+    /// <summary>
+    /// Default-domain <see cref="IWebRtcPeer"/> that hosts a child AppDomain running
+    /// SIPSorcery 6.2.4 in isolation from the host's shadowing 5.2.3. Forwards every
+    /// call to the child worker and surfaces its callbacks via the sink.
+    /// </summary>
+    public sealed class IsolatedSipSorceryPeer : IWebRtcPeer, IDisposable
+    {
+        private AppDomain _domain;
+        private SipSorceryDomainWorker _worker;
+        private WebRtcCallbackSink _sink;
+
+        public Action<string, string> OnLocalIceCandidate { get; set; }
+        public Action<string, short[], int, int> OnRemoteAudioFrame { get; set; }
+        public Action<string, string> OnConnectionStateChanged { get; set; }
+
+        public IsolatedSipSorceryPeer()
+        {
+            var selfAsm = typeof(IsolatedSipSorceryPeer).Assembly;
+            string selfSrc = selfAsm.Location;
+            string ver = selfAsm.GetName().Version != null ? selfAsm.GetName().Version.ToString() : "0";
+            string baseDir = Path.Combine(Path.Combine(Path.GetTempPath(), "Partyline.webrtc"), ver);
+            Directory.CreateDirectory(baseDir);
+
+            // Copy our plugin DLL into the clean base dir so the child domain loads
+            // it (and resolves SIPSorcery 6.2.4 from Costura) WITHOUT probing the
+            // host directory where 5.2.3 lives.
+            string selfDst = Path.Combine(baseDir, Path.GetFileName(selfSrc));
+            try { File.Copy(selfSrc, selfDst, true); }
+            catch (Exception ex) { NewPlugin.LogStatic("[Isolated] plugin DLL copy skipped: " + ex.Message); }
+            if (!File.Exists(selfDst))
+                throw new InvalidOperationException("could not stage plugin DLL at " + selfDst);
+
+            var setup = new AppDomainSetup();
+            setup.ApplicationBase = baseDir;
+            _domain = AppDomain.CreateDomain("PartylineWebRtc", null, setup);
+
+            _sink = new WebRtcCallbackSink();
+            _sink.LocalIceCandidate = (p, j) => { var h = OnLocalIceCandidate; if (h != null) h(p, j); };
+            _sink.RemoteAudioFrame = (p, pcm, c, r) => { var h = OnRemoteAudioFrame; if (h != null) h(p, pcm, c, r); };
+            _sink.ConnectionStateChanged = (p, s) => { var h = OnConnectionStateChanged; if (h != null) h(p, s); };
+
+            _worker = (SipSorceryDomainWorker)_domain.CreateInstanceAndUnwrap(
+                selfAsm.FullName, typeof(SipSorceryDomainWorker).FullName);
+            _worker.Init(_sink);
+            NewPlugin.LogStatic("[Isolated] SIPSorcery worker started in child AppDomain (base=" + baseDir + ").");
+        }
+
+        public void SetIceServers(WebRtcIceServer[] iceServers) { _worker.SetIceServers(iceServers); }
+        public void CreatePeerConnection(string peerId) { _worker.CreatePeerConnection(peerId); }
+        public void ClosePeerConnection(string peerId) { _worker.ClosePeerConnection(peerId); }
+        public void CloseAll() { try { if (_worker != null) _worker.CloseAll(); } catch { } }
+        public string CreateOffer(string peerId) { return _worker.CreateOffer(peerId); }
+        public string CreateAnswer(string peerId) { return _worker.CreateAnswer(peerId); }
+        public void ApplyRemoteDescription(string peerId, string type, string sdp) { _worker.ApplyRemoteDescription(peerId, type, sdp); }
+        public void AddIceCandidate(string peerId, string candidateJson) { _worker.AddIceCandidate(peerId, candidateJson); }
+        public void PushOutboundAudio(short[] pcm, int sampleCount, int sampleRate, int channels) { _worker.PushOutboundAudio(pcm, sampleCount, sampleRate, channels); }
+
+        public void Dispose()
+        {
+            try { if (_worker != null) _worker.CloseAll(); } catch { }
+            try { if (_domain != null) AppDomain.Unload(_domain); } catch { }
+            _domain = null; _worker = null;
+        }
+    }
+}
+// =========  END ISOLATED SIPSORCERY 6.2.4 (child AppDomain)  =================
