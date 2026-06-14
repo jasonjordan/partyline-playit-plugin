@@ -168,27 +168,9 @@ public class NewPlugin
     private System.Diagnostics.Stopwatch _dspRateClock;
     // Measured actual capture rate (mono samples/sec of wall clock). The mixer DSP
     // tap can deliver at a rate that does NOT match BASS_ChannelGetInfo's reported
-    // freq (observed ~22050 against a reported 44100), which made the outbound
-    // resample assume 2x the real rate -> chipmunk + gaps. We drive the outbound
-    // resample from THIS measured value so it is correct whatever the tap delivers.
+    // freq, so we drive the outbound resample from THIS measured value.
     private volatile int _captureRateHz;
-    // Measured/derived true channel count of the DSP float buffer. BASS reports the
-    // MIXER's channel count, which here disagrees with what the tap actually
-    // delivers (reports 2, delivers mono). Treating a mono buffer as stereo averaged
-    // adjacent samples -> a crude 2:1 decimation that heavily distorted the audio.
-    // We derive the real count from floats/sec vs the reported mixer freq.
-    private volatile int _captureChannels;
-    private long _dspFloatsSinceLog;
-    // DIAGNOSTIC: stereo-separation probe — sum|L-R| vs sum|L|+|R| over the window.
-    private double _dspSumLRDiff;
-    private double _dspSumAbs;
-    // DIAGNOSTIC: peak source float and peak post-gain value over the window, to tell
-    // whether overmodulation is hot source material being hard-clamped at capture.
-    private float _dspPeakSrc;
-    private float _dspPeakOut;
-    // DIAGNOSTIC: count of non-finite/absurd source samples sanitized, and the peak
-    // of the CLEAN (sanitized) signal, per window.
-    private long _dspSanitizedSinceLog;
+    // Peak of the captured (sanitized) signal over the window, for the DIAG line.
     private float _dspCleanPeak;
     // DIAGNOSTIC: outbound pump push-rate measurement.
     private long _pumpFramesSinceLog;
