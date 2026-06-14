@@ -3767,21 +3767,36 @@ public class WebRtcMeshClient
         _reconnectDelay = 1000;
         EnsureClients();
 
+        // Full provision/auth/publish only on first connect or after a failure. On a
+        // routine SSE drop we just refresh the token and re-open the stream, so the
+        // plugin starts draining its signaling mailbox again within ~1s instead of
+        // spending ~9s re-running the whole sequence (which strands co-host offers).
+        bool needFullInit = true;
+
         while (_running && !_cts.IsCancellationRequested)
         {
             try
             {
-                Provision();
-                Authenticate();
-                // Republish invites + metadata on EVERY (re)connect so the current
-                // co-host codes/names are always live server-side. Previously the
-                // "once per process" guard meant an account edit (new code) or a
-                // missed publish was never retried, so co-host links 404'd.
-                _invitesPublished = false;
-                _metaPublished = false;
-                PublishInvitesOnce();
-                PublishMetaOnce();
-                FetchRtcConfig();
+                if (needFullInit)
+                {
+                    Provision();
+                    Authenticate();
+                    // Republish invites + metadata so the current co-host codes/names
+                    // are always live server-side.
+                    _invitesPublished = false;
+                    _metaPublished = false;
+                    PublishInvitesOnce();
+                    PublishMetaOnce();
+                    FetchRtcConfig();
+                    needFullInit = false;
+                }
+                else
+                {
+                    // Lightweight reconnect: refresh the auth token only (one request),
+                    // then re-open the stream immediately. Provision/invites/meta/ICE
+                    // are unchanged since the first connect.
+                    Authenticate();
+                }
                 Join();
                 _connected = true;
                 _reconnectDelay = 1000; // reset on a successful (re)subscribe
@@ -3802,6 +3817,9 @@ public class WebRtcMeshClient
             catch (Exception ex)
             {
                 Log("Signaling connection lost: " + ex.Message);
+                // A failed attempt may mean the token expired or the room state was
+                // lost; force a full provision/auth/publish on the next attempt.
+                needFullInit = true;
             }
 
             _connected = false;
@@ -4256,40 +4274,51 @@ public class WebRtcMeshClient
 
             Log("Signal stream open: " + url);
 
-            using (var reader = new StreamReader(stream, Encoding.UTF8))
+            try
             {
-                string eventName = null;
-                var dataBuffer = new StringBuilder();
-
-                while (_running && !_cts.IsCancellationRequested)
+                using (var reader = new StreamReader(stream, Encoding.UTF8))
                 {
-                    string line = reader.ReadLine();
-                    if (line == null) break; // stream closed
+                    string eventName = null;
+                    var dataBuffer = new StringBuilder();
 
-                    if (line.Length == 0)
+                    while (_running && !_cts.IsCancellationRequested)
                     {
-                        // Blank line terminates an SSE event.
-                        if (dataBuffer.Length > 0)
+                        string line = reader.ReadLine();
+                        if (line == null) break; // stream closed
+
+                        if (line.Length == 0)
                         {
-                            DispatchSseEvent(eventName, dataBuffer.ToString());
+                            // Blank line terminates an SSE event.
+                            if (dataBuffer.Length > 0)
+                            {
+                                DispatchSseEvent(eventName, dataBuffer.ToString());
+                            }
+                            eventName = null;
+                            dataBuffer.Length = 0;
+                            continue;
                         }
-                        eventName = null;
-                        dataBuffer.Length = 0;
-                        continue;
-                    }
 
-                    if (line[0] == ':') continue; // SSE comment / keep-alive
+                        if (line[0] == ':') continue; // SSE comment / keep-alive
 
-                    if (line.StartsWith("event:"))
-                    {
-                        eventName = line.Substring(6).Trim();
-                    }
-                    else if (line.StartsWith("data:"))
-                    {
-                        if (dataBuffer.Length > 0) dataBuffer.Append("\n");
-                        dataBuffer.Append(line.Substring(5).Trim());
+                        if (line.StartsWith("event:"))
+                        {
+                            eventName = line.Substring(6).Trim();
+                        }
+                        else if (line.StartsWith("data:"))
+                        {
+                            if (dataBuffer.Length > 0) dataBuffer.Append("\n");
+                            dataBuffer.Append(line.Substring(5).Trim());
+                        }
                     }
                 }
+            }
+            catch (Exception ex)
+            {
+                // The stream was already open, so this is a benign long-lived SSE
+                // drop (idle timeout / network blip), not a setup failure. Returning
+                // normally lets ReconnectLoop reconnect lightweight (token refresh +
+                // re-open) instead of re-running the full provision sequence.
+                Log("Signal stream closed: " + ex.Message);
             }
         }
         finally
