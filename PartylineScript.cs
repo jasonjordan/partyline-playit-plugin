@@ -274,6 +274,35 @@ public class NewPlugin
     private System.Runtime.InteropServices.GCHandle _dspGcHandle;
     private int _dspHandle;
 
+    // --- Co-host mix -> main mix injection -----------------------------------
+    // PlayIt's RegisterSpecialAudioStream is NOT auto-pulled into the broadcast
+    // mix (confirmed: FillAudioBuffer is never called), so co-host audio never
+    // reached air. Instead we create our own BASS decode stream (the co-host mix)
+    // and add it directly to PlayIt's main-mix BASSmix channel — the same channel
+    // the outbound DSP tap reads. BASSmix lives in bassmix.dll, loaded in-process.
+    private delegate int STREAMPROC(int handle, IntPtr buffer, int length, IntPtr user);
+
+    [DllImport("bass", CallingConvention = CallingConvention.StdCall)]
+    private static extern int BASS_StreamCreate(int freq, int chans, int flags, STREAMPROC proc, IntPtr user);
+
+    [DllImport("bass", CallingConvention = CallingConvention.StdCall)]
+    private static extern bool BASS_StreamFree(int handle);
+
+    [DllImport("bass", CallingConvention = CallingConvention.StdCall)]
+    private static extern int BASS_ErrorGetCode();
+
+    [DllImport("bassmix", CallingConvention = CallingConvention.StdCall)]
+    private static extern bool BASS_Mixer_StreamAddChannel(int handle, int channel, int flags);
+
+    [DllImport("bassmix", CallingConvention = CallingConvention.StdCall)]
+    private static extern bool BASS_Mixer_ChannelRemove(int handle);
+
+    private const int BASS_STREAM_DECODE = 0x200000;
+
+    private STREAMPROC _mixStreamProc;
+    private System.Runtime.InteropServices.GCHandle _mixStreamGcHandle;
+    private int _mixStreamHandle;
+
     private static void Log(string message)
     {
         try
@@ -556,6 +585,23 @@ public class NewPlugin
 
     public int GetCoHostCount() { return _cohosts.Count; }
 
+    /// <summary>
+    /// BASS STREAMPROC: PlayIt's main-mix mixer pulls the co-host mix from here
+    /// (mono 16-bit PCM at 44.1kHz). Delegates to the AudioMixer, which sums every
+    /// live+unmuted co-host (and writes silence when none are active). This is what
+    /// actually puts co-host audio on air, since the special-stream path is never
+    /// pulled by PlayIt.
+    /// </summary>
+    private int MixStreamProc(int handle, IntPtr buffer, int length, IntPtr user)
+    {
+        try
+        {
+            if (_audioMixer != null) return _audioMixer.FillOutputBuffer(length, buffer);
+        }
+        catch { }
+        return length;
+    }
+
     private void StartCaptureWhenReady()
     {
         Log("Waiting for mixer to become available...");
@@ -604,6 +650,32 @@ public class NewPlugin
                     else
                     {
                         Log("WARNING: BASS_ChannelSetDSP failed. Return audio disabled.");
+                    }
+
+                    // Inject the co-host mix directly INTO the main mix so it reaches
+                    // air. A mono 16-bit 44.1kHz decode stream pulled by the mixer via
+                    // FillOutputBuffer; the mixer up/resamples to its own format.
+                    try
+                    {
+                        _mixStreamProc = new STREAMPROC(MixStreamProc);
+                        _mixStreamGcHandle = System.Runtime.InteropServices.GCHandle.Alloc(_mixStreamProc);
+                        _mixStreamHandle = BASS_StreamCreate(44100, 1, BASS_STREAM_DECODE, _mixStreamProc, IntPtr.Zero);
+                        if (_mixStreamHandle == 0)
+                        {
+                            Log("WARNING: BASS_StreamCreate for co-host mix failed (err=" + BASS_ErrorGetCode() + "). Co-host audio will not reach air.");
+                        }
+                        else if (!BASS_Mixer_StreamAddChannel(_mixerHandle, _mixStreamHandle, 0))
+                        {
+                            Log("WARNING: BASS_Mixer_StreamAddChannel failed (err=" + BASS_ErrorGetCode() + "). Co-host audio will not reach air.");
+                        }
+                        else
+                        {
+                            Log("Co-host mix added to main mix (stream=" + _mixStreamHandle + "). Co-host audio now routes to air.");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("ERROR adding co-host mix to main mix: " + ex.Message);
                     }
 
                     Log("Return audio capture ready.");
@@ -805,6 +877,18 @@ public class NewPlugin
         if (_dspGcHandle.IsAllocated)
         {
             _dspGcHandle.Free();
+        }
+
+        // Remove + free the co-host mix injection stream from the main mix.
+        if (_mixStreamHandle != 0)
+        {
+            try { BASS_Mixer_ChannelRemove(_mixStreamHandle); } catch { }
+            try { BASS_StreamFree(_mixStreamHandle); } catch { }
+            _mixStreamHandle = 0;
+        }
+        if (_mixStreamGcHandle.IsAllocated)
+        {
+            _mixStreamGcHandle.Free();
         }
 
         _meshActive = false;
