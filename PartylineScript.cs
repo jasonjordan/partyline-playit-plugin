@@ -63,6 +63,28 @@ public class NewPlugin
     /// Configure dialog to publish a Room ID change immediately.</summary>
     public static WebRtcMeshClient ActiveMesh { get { return _staticWebRtcMesh; } }
 
+    // The active WebRTC peer transport, exposed statically so the control panel's
+    // Kick button can forcibly drop a co-host's connection.
+    private static IWebRtcPeer _staticPeer;
+
+    /// <summary>
+    /// Forcibly drop a co-host: close its WebRTC peer connection and clear the
+    /// connected/live tracking so the host UI stops showing it and the co-host can
+    /// reconnect cleanly. <paramref name="peerId"/> must be the audio/connection key
+    /// (the co-host's display name), i.e. the row CohostId.
+    /// </summary>
+    public static void KickPeer(string peerId)
+    {
+        if (string.IsNullOrEmpty(peerId)) return;
+        try { if (_staticPeer != null) _staticPeer.ClosePeerConnection(peerId); }
+        catch (Exception ex) { LogStatic("KickPeer close error: " + ex.Message); }
+        bool ignored;
+        _connectedPeers.TryRemove(peerId, out ignored);
+        CohostNetStat removedStat;
+        _cohostNetStats.TryRemove(peerId, out removedStat);
+        LogStatic("Kicked co-host '" + peerId + "': connection closed and state cleared.");
+    }
+
     /// <summary>True while the WebRTC mesh signaling client reports a live connection.</summary>
     public static bool IsMeshConnected
     {
@@ -405,6 +427,7 @@ public class NewPlugin
                 // the display metadata (room/station/DJ names) for the co-host page.
                 _webRtcMesh = new WebRtcMeshClient(meshBaseUrl, meshSlug, "plugin", _webRtcPeer, djKey, accounts, meta);
                 _staticWebRtcMesh = _webRtcMesh;
+                _staticPeer = _webRtcPeer;
                 _webRtcMesh.Start(_cts.Token);
                 Log("WebRTC mesh signaling started: base=" + meshBaseUrl + " room=" + meshSlug);
             }
@@ -872,6 +895,15 @@ public class NewPlugin
         if (s == "connected" || s == "completed")
         {
             _connectedPeers[peerId] = true;
+            // Put the connected presenter on air automatically, keyed by the SAME
+            // peerId that receives audio, so it is actually mixed into the main output
+            // (FillOutputBuffer only sums IsLive co-hosts). The DJ can still mute.
+            if (_audioMixer != null)
+            {
+                _audioMixer.EnsureCoHost(peerId);
+                _audioMixer.SetLive(peerId, true);
+            }
+            Log("Co-host " + peerId + " connected -> on air (auto-live).");
         }
         else if (s == "failed" || s == "closed" || s == "disconnected")
         {
@@ -880,6 +912,10 @@ public class NewPlugin
             // Drop any stale quality reading so the strip doesn't show a dead peer.
             CohostNetStat removed;
             _cohostNetStats.TryRemove(peerId, out removed);
+            // Stop mixing and tracking a co-host that is no longer connected, so the
+            // host UI/roster reflect reality instead of showing ghosts.
+            if (_audioMixer != null) _audioMixer.RemoveCoHost(peerId);
+            Log("Co-host " + peerId + " " + s + " -> removed from mix.");
         }
     }
 
@@ -3148,7 +3184,7 @@ public class PartylineControlPanel : UserControl
         muteBtn.BackColor = System.Drawing.Color.FromArgb(70, 70, 85);
         muteBtn.FlatAppearance.BorderSize = 0;
         muteBtn.Cursor = Cursors.Hand;
-        muteBtn.Tag = account.Username;
+        muteBtn.Tag = row.CohostId;
         muteBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         muteBtn.Click += OnMuteClick;
         rowPanel.Controls.Add(muteBtn);
@@ -3165,7 +3201,7 @@ public class PartylineControlPanel : UserControl
         kickBtn.BackColor = System.Drawing.Color.FromArgb(180, 60, 60);
         kickBtn.FlatAppearance.BorderSize = 0;
         kickBtn.Cursor = Cursors.Hand;
-        kickBtn.Tag = account.Username;
+        kickBtn.Tag = row.CohostId;
         kickBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         kickBtn.Click += OnKickClick;
         rowPanel.Controls.Add(kickBtn);
@@ -3182,7 +3218,7 @@ public class PartylineControlPanel : UserControl
         liveBtn.BackColor = System.Drawing.Color.FromArgb(50, 50, 60);
         liveBtn.FlatAppearance.BorderSize = 0;
         liveBtn.Cursor = Cursors.Hand;
-        liveBtn.Tag = account.Username;
+        liveBtn.Tag = row.CohostId;
         liveBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         liveBtn.Click += OnLiveClick;
         rowPanel.Controls.Add(liveBtn);
@@ -3234,6 +3270,9 @@ public class PartylineControlPanel : UserControl
 
         _authManager.InvalidateSession(cohostId);
         _audioMixer.RemoveCoHost(cohostId);
+        // Forcibly drop the live WebRTC connection so the co-host is actually
+        // disconnected (not just removed from the mix) and can reconnect cleanly.
+        NewPlugin.KickPeer(cohostId);
 
         UpdateRowState(cohostId);
     }
