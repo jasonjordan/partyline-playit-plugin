@@ -2033,9 +2033,9 @@ public class SettingsManager
     {
         try
         {
-            if (File.Exists(IdentityPath))
+            if (SettingsStore.Has("identity"))
             {
-                string json = File.ReadAllText(IdentityPath, Encoding.UTF8);
+                string json = SettingsStore.Read("identity");
                 string rid = ExtractTopLevelString(json, "roomId");
                 string dk = ExtractTopLevelString(json, "djKey");
                 if (!string.IsNullOrEmpty(rid) && !string.IsNullOrEmpty(dk))
@@ -2054,10 +2054,8 @@ public class SettingsManager
         string djKey = Guid.NewGuid().ToString("N"); // 32 hex chars
         try
         {
-            string dir = Path.GetDirectoryName(IdentityPath);
-            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
             string body = "{\"roomId\":\"" + roomId + "\",\"djKey\":\"" + djKey + "\"}";
-            File.WriteAllText(IdentityPath, body, Encoding.UTF8);
+            SettingsStore.Write("identity", body);
             NewPlugin.LogStatic("Generated new room identity (roomId=" + roomId + ").");
         }
         catch (Exception ex)
@@ -2084,9 +2082,9 @@ public class SettingsManager
     {
         try
         {
-            if (File.Exists(MetaPath))
+            if (SettingsStore.Has("meta"))
             {
-                string json = File.ReadAllText(MetaPath, Encoding.UTF8);
+                string json = SettingsStore.Read("meta");
                 return new string[]
                 {
                     ExtractTopLevelString(json, "roomName") ?? "",
@@ -2112,9 +2110,9 @@ public class SettingsManager
     {
         try
         {
-            if (File.Exists(MetaPath))
+            if (SettingsStore.Has("meta"))
             {
-                string json = File.ReadAllText(MetaPath, Encoding.UTF8);
+                string json = SettingsStore.Read("meta");
                 string code = ExtractTopLevelString(json, "roomCode");
                 return SanitizeRoomCode(code);
             }
@@ -2153,19 +2151,17 @@ public class SettingsManager
     {
         try
         {
-            string dir = Path.GetDirectoryName(MetaPath);
-            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
             var sb = new StringBuilder();
             sb.Append("{\"roomName\":").Append(EscapeJsonString(roomName ?? ""));
             sb.Append(",\"stationName\":").Append(EscapeJsonString(stationName ?? ""));
             sb.Append(",\"djName\":").Append(EscapeJsonString(djName ?? ""));
             sb.Append(",\"roomCode\":").Append(EscapeJsonString(SanitizeRoomCode(roomCode)));
             sb.Append("}");
-            File.WriteAllText(MetaPath, sb.ToString(), Encoding.UTF8);
+            SettingsStore.Write("meta", sb.ToString());
         }
         catch (Exception ex)
         {
-            NewPlugin.LogStatic("ERROR writing meta.json: " + ex.Message);
+            NewPlugin.LogStatic("ERROR writing meta: " + ex.Message);
         }
     }
 
@@ -2189,13 +2185,13 @@ public class SettingsManager
     {
         try
         {
-            if (!File.Exists(SettingsPath))
+            if (!SettingsStore.Has("cohosts"))
             {
-                NewPlugin.LogStatic("Settings file not found at " + SettingsPath + ", starting with empty list");
+                NewPlugin.LogStatic("No saved co-host accounts, starting with empty list");
                 return new List<CoHostAccount>();
             }
 
-            string json = File.ReadAllText(SettingsPath, Encoding.UTF8);
+            string json = SettingsStore.Read("cohosts");
             List<CoHostAccount> accounts = ParseAccountsJson(json);
 
             // Generate hash for any accounts that are missing one (legacy accounts)
@@ -2237,12 +2233,12 @@ public class SettingsManager
     {
         try
         {
-            if (!File.Exists(SettingsPath))
+            if (!SettingsStore.Has("cohosts"))
             {
                 return "Partyline Co-Host";
             }
 
-            string json = File.ReadAllText(SettingsPath, Encoding.UTF8);
+            string json = SettingsStore.Read("cohosts");
             string name = ExtractJsonStringValue(json, "stationName");
             if (string.IsNullOrEmpty(name))
             {
@@ -2261,12 +2257,12 @@ public class SettingsManager
     {
         try
         {
-            if (!File.Exists(SettingsPath))
+            if (!SettingsStore.Has("cohosts"))
             {
                 return "";
             }
 
-            string json = File.ReadAllText(SettingsPath, Encoding.UTF8);
+            string json = SettingsStore.Read("cohosts");
             string url = ExtractJsonStringValue(json, "relayUrl");
             if (string.IsNullOrEmpty(url))
             {
@@ -2285,12 +2281,12 @@ public class SettingsManager
     {
         try
         {
-            if (!File.Exists(SettingsPath))
+            if (!SettingsStore.Has("cohosts"))
             {
                 return "";
             }
 
-            string json = File.ReadAllText(SettingsPath, Encoding.UTF8);
+            string json = SettingsStore.Read("cohosts");
             string key = ExtractJsonStringValue(json, "stationKey");
             if (string.IsNullOrEmpty(key))
             {
@@ -2408,12 +2404,6 @@ public class SettingsManager
     {
         try
         {
-            string dir = Path.GetDirectoryName(SettingsPath);
-            if (!Directory.Exists(dir))
-            {
-                Directory.CreateDirectory(dir);
-            }
-
             // If stationName not provided, preserve the existing one
             if (stationName == null)
             {
@@ -2463,13 +2453,135 @@ public class SettingsManager
 
             sb.Append("]}");
 
-            File.WriteAllText(SettingsPath, sb.ToString(), Encoding.UTF8);
+            SettingsStore.Write("cohosts", sb.ToString());
             NewPlugin.LogStatic("Saved " + accounts.Count + " co-host accounts to settings");
         }
         catch (Exception ex)
         {
             NewPlugin.LogStatic("ERROR saving settings: " + ex.Message);
             throw;
+        }
+    }
+
+    // Single obfuscated settings container. Replaces the separate cohosts.json /
+    // identity.json / meta.json plain-text files with ONE DPAPI-encrypted file
+    // (partyline.dat). Each logical section keeps its original JSON text, so every
+    // existing parser is unchanged — only the storage layer differs. Encryption is
+    // per-Windows-user (DPAPI, CurrentUser scope), so the file is unreadable if
+    // copied to another machine/account. Legacy plain-text files are migrated on
+    // first load and then deleted.
+    private static class SettingsStore
+    {
+        private static readonly string Dir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Partyline");
+        private static readonly string StorePath = Path.Combine(Dir, "partyline.dat");
+        private static readonly string[][] Legacy = new string[][] {
+            new[] { "cohosts",  Path.Combine(Dir, "cohosts.json") },
+            new[] { "identity", Path.Combine(Dir, "identity.json") },
+            new[] { "meta",     Path.Combine(Dir, "meta.json") },
+        };
+
+        private static readonly object _lock = new object();
+        private static Dictionary<string, string> _cache;
+
+        private static void EnsureLoaded()
+        {
+            if (_cache != null) return;
+            var map = new Dictionary<string, string>(StringComparer.Ordinal);
+            try
+            {
+                if (File.Exists(StorePath))
+                {
+                    byte[] prot = File.ReadAllBytes(StorePath);
+                    byte[] plain = System.Security.Cryptography.ProtectedData.Unprotect(
+                        prot, null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+                    Deserialize(plain, map);
+                    _cache = map;
+                    return;
+                }
+
+                // No encrypted store yet: migrate any legacy plain-text files.
+                bool migrated = false;
+                foreach (var l in Legacy)
+                {
+                    try
+                    {
+                        if (File.Exists(l[1])) { map[l[0]] = File.ReadAllText(l[1], Encoding.UTF8); migrated = true; }
+                    }
+                    catch { }
+                }
+                _cache = map;
+                if (migrated)
+                {
+                    Persist();
+                    foreach (var l in Legacy) { try { if (File.Exists(l[1])) File.Delete(l[1]); } catch { } }
+                    NewPlugin.LogStatic("Migrated legacy settings into encrypted store.");
+                }
+                return;
+            }
+            catch (Exception ex)
+            {
+                NewPlugin.LogStatic("ERROR reading settings store: " + ex.Message);
+            }
+            _cache = map;
+        }
+
+        private static void Persist()
+        {
+            try
+            {
+                if (!Directory.Exists(Dir)) Directory.CreateDirectory(Dir);
+                byte[] plain = Serialize(_cache);
+                byte[] prot = System.Security.Cryptography.ProtectedData.Protect(
+                    plain, null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+                File.WriteAllBytes(StorePath, prot);
+            }
+            catch (Exception ex)
+            {
+                NewPlugin.LogStatic("ERROR writing settings store: " + ex.Message);
+            }
+        }
+
+        private static byte[] Serialize(Dictionary<string, string> map)
+        {
+            using (var ms = new MemoryStream())
+            using (var bw = new BinaryWriter(ms, Encoding.UTF8))
+            {
+                bw.Write(map.Count);
+                foreach (var kv in map) { bw.Write(kv.Key); bw.Write(kv.Value ?? ""); }
+                bw.Flush();
+                return ms.ToArray();
+            }
+        }
+
+        private static void Deserialize(byte[] data, Dictionary<string, string> map)
+        {
+            using (var ms = new MemoryStream(data))
+            using (var br = new BinaryReader(ms, Encoding.UTF8))
+            {
+                int n = br.ReadInt32();
+                for (int i = 0; i < n; i++)
+                {
+                    string k = br.ReadString();
+                    string v = br.ReadString();
+                    map[k] = v;
+                }
+            }
+        }
+
+        public static bool Has(string name)
+        {
+            lock (_lock) { EnsureLoaded(); string v; return _cache.TryGetValue(name, out v) && !string.IsNullOrEmpty(v); }
+        }
+
+        public static string Read(string name)
+        {
+            lock (_lock) { EnsureLoaded(); string v; return _cache.TryGetValue(name, out v) ? v : null; }
+        }
+
+        public static void Write(string name, string content)
+        {
+            lock (_lock) { EnsureLoaded(); _cache[name] = content ?? ""; Persist(); }
         }
     }
 
@@ -6661,6 +6773,7 @@ namespace Partyline.WebRtc
         private Thread _reader;
         private volatile bool _running;
         private readonly object _writeLock = new object();
+        private readonly string _extractDir; // temp folder holding the extracted exe + dlls
 
         // Pending CreateOffer/CreateAnswer awaiters, keyed by peerId.
         private readonly object _pendLock = new object();
@@ -6680,6 +6793,7 @@ namespace Partyline.WebRtc
         public OutOfProcessWebRtcPeer()
         {
             string exePath = ExtractHost();
+            _extractDir = Path.GetDirectoryName(exePath);
             var psi = new ProcessStartInfo(exePath);
             psi.UseShellExecute = false;
             psi.RedirectStandardInput = true;
@@ -6976,6 +7090,42 @@ namespace Partyline.WebRtc
             }
             catch { }
             try { if (_reader != null) _reader.Join(1000); } catch { }
+            // The process has exited; remove the decompressed helper (exe + DLLs) so
+            // nothing is left on disk after shutdown.
+            try { CleanupExtractedHost(_extractDir); } catch { }
+        }
+
+        // Deletes the extracted helper folder (and any stale sibling builds). The exe
+        // can stay locked for a moment after exit, so retry briefly.
+        private static void CleanupExtractedHost(string dir)
+        {
+            if (string.IsNullOrEmpty(dir)) return;
+            for (int i = 0; i < 15; i++)
+            {
+                try
+                {
+                    if (Directory.Exists(dir)) Directory.Delete(dir, true);
+                    break;
+                }
+                catch { System.Threading.Thread.Sleep(100); }
+            }
+            // Sweep sibling builds left under %TEMP%\Partyline.webrtchost (e.g. from a
+            // prior crash that never reached Dispose).
+            try
+            {
+                string parent = Path.GetDirectoryName(dir);
+                if (!string.IsNullOrEmpty(parent) && Directory.Exists(parent)
+                    && Path.GetFileName(parent).Equals("Partyline.webrtchost", StringComparison.OrdinalIgnoreCase))
+                {
+                    foreach (var sub in Directory.GetDirectories(parent))
+                    {
+                        try { Directory.Delete(sub, true); } catch { }
+                    }
+                    try { Directory.Delete(parent, false); } catch { }
+                }
+            }
+            catch { }
+            NewPlugin.LogStatic("[OutOfProc] cleaned up extracted helper files.");
         }
     }
 }
