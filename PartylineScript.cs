@@ -165,6 +165,36 @@ public class NewPlugin
         catch { }
     }
 
+    // --- Remote (co-host) self-mute state ------------------------------------
+    // Tracks whether each co-host has their OWN microphone open. Driven by the
+    // 'mic-state' signals the co-host browser broadcasts. Lets the plugin UI show
+    // when a remote presenter has muted themselves (distinct from the DJ muting them).
+    private static readonly ConcurrentDictionary<string, bool> _cohostMicOn =
+        new ConcurrentDictionary<string, bool>();
+
+    /// <summary>Records a co-host's own mic on/off state (from a 'mic-state' signal).</summary>
+    public static void SetCohostRemoteMic(string peerId, bool micOn)
+    {
+        if (string.IsNullOrEmpty(peerId)) return;
+        _cohostMicOn[peerId] = micOn;
+    }
+
+    /// <summary>Clears a co-host's tracked mic state (on disconnect).</summary>
+    public static void ClearCohostRemoteMic(string peerId)
+    {
+        if (string.IsNullOrEmpty(peerId)) return;
+        bool ignored;
+        _cohostMicOn.TryRemove(peerId, out ignored);
+    }
+
+    /// <summary>True when a co-host is known to have muted their own microphone.</summary>
+    public static bool IsCohostSelfMuted(string peerId)
+    {
+        if (string.IsNullOrEmpty(peerId)) return false;
+        bool micOn;
+        return _cohostMicOn.TryGetValue(peerId, out micOn) && !micOn;
+    }
+
     // Return audio (BASS mixer capture)
     private int _mixerHandle;
     private int _mixerChannels = 2; // default stereo, updated from BASS_ChannelGetInfo
@@ -190,6 +220,15 @@ public class NewPlugin
     // DIAGNOSTIC: outbound pump push-rate measurement.
     private long _pumpFramesSinceLog;
     private System.Diagnostics.Stopwatch _pumpRateClock;
+
+    // Reusable DSP scratch buffers (touched only on the BASS playback thread). The
+    // DSP callback used to allocate fresh float/short/byte arrays on every buffer,
+    // which created steady garbage on the audio thread; the resulting GC pauses
+    // showed up as periodic warble (slight speed-up/slow-down) in the main playout.
+    // Reusing these (growing only when needed) keeps the playback thread allocation-free.
+    private float[] _dspFloatScratch;
+    private short[] _dspShortScratch;
+    private byte[] _dspPcm16Scratch;
 
     /// <summary>The source sample rate to resample outbound audio FROM: the measured
     /// capture rate once known, else the reported mixer freq, else 44100.</summary>
@@ -588,12 +627,6 @@ public class NewPlugin
 
     private void DspCallback(int handle, int channel, IntPtr buffer, int length, IntPtr user)
     {
-        if (!_dspFirstCallLogged)
-        {
-            _dspFirstCallLogged = true;
-            Log("DspCallback firing: length=" + length + " channels=" + _mixerChannels);
-        }
-
         if (!_meshActive) return;
 
         try
@@ -602,20 +635,24 @@ public class NewPlugin
             if (channels < 1) channels = 1;
 
             // The PlayIt main-mix tap here is 16-bit PCM (BASS_SAMPLE_FLOAT absent),
-            // NOT 32-bit float. Reading it as float was the root cause of the garbage
-            // samples / distortion / wrong rate. Read per the detected format. PCM is
-            // interleaved Int16 at the full mixer rate (e.g. 44100 stereo).
-            byte[] pcm16;
+            // NOT 32-bit float. Read per the detected format. PCM is interleaved Int16
+            // at the full mixer rate (e.g. 44100 stereo). All scratch buffers are
+            // reused (no per-callback allocation) to keep the audio thread GC-free.
             int monoSamples;
-            float cleanPeak = 0f;
+            byte[] pcm16;
 
             if (_mixerIsFloat)
             {
                 int floatSamples = length / 4;
                 monoSamples = floatSamples / channels;
-                float[] fd = new float[floatSamples];
+                if (_dspFloatScratch == null || _dspFloatScratch.Length < floatSamples)
+                    _dspFloatScratch = new float[floatSamples];
+                float[] fd = _dspFloatScratch;
                 Marshal.Copy(buffer, fd, 0, floatSamples);
-                pcm16 = new byte[monoSamples * 2];
+                int need = monoSamples * 2;
+                if (_dspPcm16Scratch == null || _dspPcm16Scratch.Length < need)
+                    _dspPcm16Scratch = new byte[need];
+                pcm16 = _dspPcm16Scratch;
                 for (int i = 0; i < monoSamples; i++)
                 {
                     float sum = 0;
@@ -630,7 +667,6 @@ public class NewPlugin
                         }
                     }
                     float mono = sum / channels;
-                    float a = mono < 0 ? -mono : mono; if (a > cleanPeak) cleanPeak = a;
                     if (mono > 1f) mono = 1f;
                     if (mono < -1f) mono = -1f;
                     short s16 = (short)(mono * 32767f);
@@ -642,9 +678,14 @@ public class NewPlugin
             {
                 int totalSamples = length / 2;          // 16-bit samples in the buffer
                 monoSamples = totalSamples / channels;  // interleaved frames
-                short[] pin = new short[totalSamples];
+                if (_dspShortScratch == null || _dspShortScratch.Length < totalSamples)
+                    _dspShortScratch = new short[totalSamples];
+                short[] pin = _dspShortScratch;
                 Marshal.Copy(buffer, pin, 0, totalSamples);
-                pcm16 = new byte[monoSamples * 2];
+                int need = monoSamples * 2;
+                if (_dspPcm16Scratch == null || _dspPcm16Scratch.Length < need)
+                    _dspPcm16Scratch = new byte[need];
+                pcm16 = _dspPcm16Scratch;
                 for (int i = 0; i < monoSamples; i++)
                 {
                     int sum = 0;
@@ -656,18 +697,16 @@ public class NewPlugin
                     int mono = sum / channels;          // average stays within Int16 range
                     if (mono > 32767) mono = 32767;
                     if (mono < -32768) mono = -32768;
-                    int am = mono < 0 ? -mono : mono;
-                    float af = am / 32768f; if (af > cleanPeak) cleanPeak = af;
                     short s16 = (short)mono;
                     pcm16[i * 2] = (byte)(s16 & 0xFF);
                     pcm16[i * 2 + 1] = (byte)((s16 >> 8) & 0xFF);
                 }
             }
-            if (cleanPeak > _dspCleanPeak) _dspCleanPeak = cleanPeak;
 
+            int pcmBytes = monoSamples * 2;
             lock (_returnLock)
             {
-                for (int i = 0; i < pcm16.Length; i++)
+                for (int i = 0; i < pcmBytes; i++)
                 {
                     _returnBuffer[_returnWritePos] = pcm16[i];
                     _returnWritePos = (_returnWritePos + 1) % _returnBuffer.Length;
@@ -693,14 +732,7 @@ public class NewPlugin
                 int rate = (int)(_dspMonoSamplesSinceLog * 1000L / dspMs);
                 if (rate >= 8000 && rate <= 96000)
                     _captureRateHz = _captureRateHz > 0 ? (_captureRateHz * 3 + rate) / 4 : rate;
-                int backlog;
-                lock (_returnLock) { backlog = _returnAvailable; }
-                Log("DIAG capture rate=" + rate + " samples/sec (using " + _captureRateHz + "); "
-                    + (_mixerIsFloat ? "float" : "pcm16") + " ch=" + _mixerChannels
-                    + " cleanPeak=" + _dspCleanPeak.ToString("0.00")
-                    + "; ring backlog=" + backlog + " bytes");
                 _dspMonoSamplesSinceLog = 0;
-                _dspCleanPeak = 0;
                 _dspRateClock.Restart();
             }
         }
@@ -905,6 +937,9 @@ public class NewPlugin
             }
             // Tell this co-host's web page it is connected but muted (sign off).
             if (_webRtcMesh != null) _webRtcMesh.PublishMuteState(peerId, true);
+            // Co-hosts join with their own mic muted; assume self-muted until a
+            // mic-state signal says otherwise so the UI starts in the right state.
+            NewPlugin.SetCohostRemoteMic(peerId, false);
             Log("Co-host " + peerId + " connected -> live but muted.");
         }
         else if (s == "failed" || s == "closed" || s == "disconnected")
@@ -917,6 +952,7 @@ public class NewPlugin
             // Stop mixing and tracking a co-host that is no longer connected, so the
             // host UI/roster reflect reality instead of showing ghosts.
             if (_audioMixer != null) _audioMixer.RemoveCoHost(peerId);
+            ClearCohostRemoteMic(peerId);
             Log("Co-host " + peerId + " " + s + " -> removed from mix.");
         }
     }
@@ -1143,17 +1179,6 @@ public class NewPlugin
                     }
                 }
 
-                // DIAGNOSTIC: report the real outbound push rate. ~50 frames/sec is
-                // correct real-time (one 20 ms frame per 20 ms).
-                if (_pumpRateClock == null) _pumpRateClock = System.Diagnostics.Stopwatch.StartNew();
-                long pumpMs = _pumpRateClock.ElapsedMilliseconds;
-                if (pumpMs >= 5000)
-                {
-                    long fps = _pumpFramesSinceLog * 1000L / pumpMs;
-                    Log("DIAG pump push rate=" + fps + " frames/sec (expected ~50)");
-                    _pumpFramesSinceLog = 0;
-                    _pumpRateClock.Restart();
-                }
             }
             catch (Exception ex)
             {
@@ -1798,22 +1823,6 @@ public class AudioMixer
             {
                 activeStates.Add(s);
             }
-        }
-
-        // DIAG (throttled ~2s): why is/ isn't co-host audio reaching the air mix?
-        if (_mixDiagClock.ElapsedMilliseconds >= 2000)
-        {
-            _mixDiagClock.Restart();
-            var sb = new System.Text.StringBuilder();
-            sb.Append("MIX DIAG active=").Append(activeStates.Count).Append(" total=").Append(_coHosts.Count);
-            foreach (var kvp in _coHosts)
-            {
-                CoHostState st = kvp.Value;
-                float pk = (st.Buffer != null) ? st.Buffer.GetPeakLevel() : 0f;
-                sb.Append(" [").Append(kvp.Key).Append(" live=").Append(st.IsLive)
-                  .Append(" muted=").Append(st.IsMuted).Append(" peak=").Append(pk.ToString("0.00")).Append("]");
-            }
-            NewPlugin.LogStatic(sb.ToString());
         }
 
         if (activeStates.Count == 0)
@@ -3400,6 +3409,12 @@ public class PartylineControlPanel : UserControl
                 {
                     combined = combined.Length > 0 ? (combined + " | " + ip) : ip;
                 }
+                // Show when the remote presenter has muted their OWN mic (distinct
+                // from the DJ muting them via the row's Mute button).
+                if (NewPlugin.IsCohostSelfMuted(row.CohostId))
+                {
+                    combined = "\uD83D\uDD07 SELF-MUTED" + (combined.Length > 0 ? "  \u00b7  " + combined : "");
+                }
                 row.LatencyLabel.Text = combined;
             }
             else
@@ -4413,9 +4428,10 @@ public class WebRtcMeshClient
         }
         else if (type == "mic-state")
         {
-            // On-air/muted indicators are surfaced by the UI layer; just log here.
+            // Track the co-host's own mic state so the plugin UI can show when a
+            // remote presenter has muted themselves (distinct from the DJ muting them).
             string micOn = ExtractJsonValue(payload, "micOn");
-            Log("mic-state from " + (from ?? "?") + ": " + (micOn ?? "?"));
+            NewPlugin.SetCohostRemoteMic(from, micOn == "true");
         }
     }
 
