@@ -901,9 +901,12 @@ public class NewPlugin
             if (_audioMixer != null)
             {
                 _audioMixer.EnsureCoHost(peerId);
+                // Live (in the mix path) but muted by default — the DJ unmutes when
+                // they want the presenter on air.
                 _audioMixer.SetLive(peerId, true);
+                _audioMixer.SetMuted(peerId, true);
             }
-            Log("Co-host " + peerId + " connected -> on air (auto-live).");
+            Log("Co-host " + peerId + " connected -> live but muted.");
         }
         else if (s == "failed" || s == "closed" || s == "disconnected")
         {
