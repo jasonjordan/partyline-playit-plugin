@@ -150,6 +150,21 @@ public class NewPlugin
         return _cohostNetStats.TryGetValue(peerId, out s) ? s : null;
     }
 
+    /// <summary>
+    /// Publishes a co-host's mute state to the signaling server so that co-host's
+    /// web page can drive its ON-AIR sign (unmuted == live to air). Routed through
+    /// the running mesh client; a safe no-op before the mesh is up.
+    /// </summary>
+    public static void PublishCohostMuteState(string peerId, bool muted)
+    {
+        try
+        {
+            WebRtcMeshClient mesh = _staticWebRtcMesh;
+            if (mesh != null) mesh.PublishMuteState(peerId, muted);
+        }
+        catch { }
+    }
+
     // Return audio (BASS mixer capture)
     private int _mixerHandle;
     private int _mixerChannels = 2; // default stereo, updated from BASS_ChannelGetInfo
@@ -888,6 +903,8 @@ public class NewPlugin
                 _audioMixer.SetLive(peerId, true);
                 _audioMixer.SetMuted(peerId, true);
             }
+            // Tell this co-host's web page it is connected but muted (sign off).
+            if (_webRtcMesh != null) _webRtcMesh.PublishMuteState(peerId, true);
             Log("Co-host " + peerId + " connected -> live but muted.");
         }
         else if (s == "failed" || s == "closed" || s == "disconnected")
@@ -1665,6 +1682,7 @@ public class AudioMixer
     private ConcurrentDictionary<string, float> _lastLatency;
     private ConcurrentDictionary<string, bool> _firstAudioLogged;
     private ConcurrentDictionary<string, string> _cohostIps;
+    private readonly System.Diagnostics.Stopwatch _mixDiagClock = System.Diagnostics.Stopwatch.StartNew();
 
     public AudioMixer()
     {
@@ -1780,6 +1798,22 @@ public class AudioMixer
             {
                 activeStates.Add(s);
             }
+        }
+
+        // DIAG (throttled ~2s): why is/ isn't co-host audio reaching the air mix?
+        if (_mixDiagClock.ElapsedMilliseconds >= 2000)
+        {
+            _mixDiagClock.Restart();
+            var sb = new System.Text.StringBuilder();
+            sb.Append("MIX DIAG active=").Append(activeStates.Count).Append(" total=").Append(_coHosts.Count);
+            foreach (var kvp in _coHosts)
+            {
+                CoHostState st = kvp.Value;
+                float pk = (st.Buffer != null) ? st.Buffer.GetPeakLevel() : 0f;
+                sb.Append(" [").Append(kvp.Key).Append(" live=").Append(st.IsLive)
+                  .Append(" muted=").Append(st.IsMuted).Append(" peak=").Append(pk.ToString("0.00")).Append("]");
+            }
+            NewPlugin.LogStatic(sb.ToString());
         }
 
         if (activeStates.Count == 0)
@@ -2974,7 +3008,6 @@ public class PartylineControlPanel : UserControl
     private SettingsManager _settingsManager;
     private int _pulseCounter;
     private Label _meshStatusLabel;
-    private Button _micButton;
     public PartylineControlPanel(AudioMixer audioMixer, AuthenticationManager authManager, List<CoHostAccount> accounts, SettingsManager settingsManager)
     {
         _audioMixer = audioMixer;
@@ -3048,22 +3081,6 @@ public class PartylineControlPanel : UserControl
         _meshStatusLabel.BackColor = System.Drawing.Color.FromArgb(50, 50, 55);
         titlePanel.Controls.Add(_meshStatusLabel);
         _toolTip.SetToolTip(_meshStatusLabel, "WebRTC mesh connection status");
-
-        // Latching Mic toggle (task 5.6) — replaces any push-to-talk control. Each
-        // click flips the plugin's outbound mic state via NewPlugin (sets the gate the
-        // AudioPumpLoop checks and broadcasts mic-state). Never momentary, never
-        // always-open. Label/color reflect on-air vs muted (Req 7.3-7.8).
-        _micButton = new Button();
-        _micButton.FlatStyle = FlatStyle.Flat;
-        _micButton.Size = new System.Drawing.Size(96, 22);
-        _micButton.Dock = DockStyle.Right;
-        _micButton.Font = new System.Drawing.Font("Segoe UI", 8f, System.Drawing.FontStyle.Bold);
-        _micButton.FlatAppearance.BorderSize = 0;
-        _micButton.Cursor = Cursors.Hand;
-        _micButton.Click += OnMicToggleClick;
-        titlePanel.Controls.Add(_micButton);
-        _toolTip.SetToolTip(_micButton, "Toggle your microphone on/off air");
-        UpdateMicButton(NewPlugin.IsMicOn);
 
         Controls.Add(titlePanel);
 
@@ -3193,44 +3210,13 @@ public class PartylineControlPanel : UserControl
         row.KickButton = kickBtn;
         _toolTip.SetToolTip(kickBtn, "Disconnect co-host");
 
-        // Live toggle button (anchored to right)
-        Button liveBtn = new Button();
-        liveBtn.Text = "Go Live";
-        liveBtn.FlatStyle = FlatStyle.Flat;
-        liveBtn.Size = new System.Drawing.Size(60, 22);
-        liveBtn.Font = new System.Drawing.Font("Segoe UI", 7.5f, System.Drawing.FontStyle.Bold);
-        liveBtn.ForeColor = System.Drawing.Color.Gray;
-        liveBtn.BackColor = System.Drawing.Color.FromArgb(50, 50, 60);
-        liveBtn.FlatAppearance.BorderSize = 0;
-        liveBtn.Cursor = Cursors.Hand;
-        liveBtn.Tag = row.CohostId;
-        liveBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-        liveBtn.Click += OnLiveClick;
-        rowPanel.Controls.Add(liveBtn);
-        row.LiveButton = liveBtn;
-        _toolTip.SetToolTip(liveBtn, "Toggle co-host audio on/off air");
-
         // Position buttons from right edge
         int rightEdge = rowPanel.Width;
-        liveBtn.Location = new System.Drawing.Point(rightEdge - 64, 2);
-        kickBtn.Location = new System.Drawing.Point(rightEdge - 108, 2);
-        muteBtn.Location = new System.Drawing.Point(rightEdge - 162, 2);
+        kickBtn.Location = new System.Drawing.Point(rightEdge - 64, 2);
+        muteBtn.Location = new System.Drawing.Point(rightEdge - 118, 2);
 
         Controls.Add(rowPanel);
         return row;
-    }
-
-    private void OnLiveClick(object sender, EventArgs e)
-    {
-        Button btn = sender as Button;
-        if (btn == null) return;
-        string cohostId = btn.Tag as string;
-        if (cohostId == null) return;
-
-        bool currentLive = _audioMixer.GetLive(cohostId);
-        _audioMixer.SetLive(cohostId, !currentLive);
-
-        UpdateRowState(cohostId);
     }
 
     private void OnMuteClick(object sender, EventArgs e)
@@ -3242,6 +3228,8 @@ public class PartylineControlPanel : UserControl
 
         bool currentMuted = _audioMixer.GetMuted(cohostId);
         _audioMixer.SetMuted(cohostId, !currentMuted);
+        // Reflect the new state on the co-host's web page (drives their ON-AIR sign).
+        NewPlugin.PublishCohostMuteState(cohostId, !currentMuted);
 
         UpdateRowState(cohostId);
     }
@@ -3268,46 +3256,6 @@ public class PartylineControlPanel : UserControl
         form.ShowDialog();
     }
 
-    /// <summary>
-    /// Latching Mic toggle handler (task 5.6). Reads the current outbound mic state,
-    /// flips it, and pushes the new state to the plugin via
-    /// <see cref="NewPlugin.RequestMicToggle"/> (which sets the AudioPumpLoop gate and
-    /// broadcasts mic-state). Then repaints the button to the on-air/muted style. There
-    /// is no mouse-down/mouse-up (momentary) behavior and no always-open mode
-    /// (Req 7.4, 7.5, 7.6).
-    /// </summary>
-    private void OnMicToggleClick(object sender, EventArgs e)
-    {
-        bool next = !NewPlugin.IsMicOn;
-        NewPlugin.RequestMicToggle(next);
-        UpdateMicButton(NewPlugin.IsMicOn);
-    }
-
-    /// <summary>
-    /// Paints the Mic button to reflect the plugin's outbound mic state: a red
-    /// "ON AIR" indicator while transmitting (Req 7.7) and a muted indicator while off
-    /// (Req 7.8).
-    /// </summary>
-    private void UpdateMicButton(bool on)
-    {
-        if (_micButton == null) return;
-
-        if (on)
-        {
-            // U+1F399 studio microphone + on-air, red.
-            _micButton.Text = "\uD83C\uDF99 ON AIR";
-            _micButton.ForeColor = System.Drawing.Color.White;
-            _micButton.BackColor = System.Drawing.Color.FromArgb(239, 68, 68);
-        }
-        else
-        {
-            // U+1F507 muted speaker.
-            _micButton.Text = "\uD83D\uDD07 Muted";
-            _micButton.ForeColor = System.Drawing.Color.FromArgb(200, 200, 210);
-            _micButton.BackColor = System.Drawing.Color.FromArgb(60, 60, 70);
-        }
-    }
-
     private void UpdateRowState(string cohostId)
     {
         for (int i = 0; i < _rows.Count; i++)
@@ -3315,22 +3263,7 @@ public class PartylineControlPanel : UserControl
             CoHostRow row = _rows[i];
             if (row.CohostId == cohostId)
             {
-                bool isLive = _audioMixer.GetLive(cohostId);
                 bool isMuted = _audioMixer.GetMuted(cohostId);
-
-                // Update live button
-                if (isLive)
-                {
-                    row.LiveButton.Text = "\u25CF LIVE";
-                    row.LiveButton.ForeColor = System.Drawing.Color.FromArgb(34, 197, 94);
-                    row.LiveButton.BackColor = System.Drawing.Color.FromArgb(20, 60, 30);
-                }
-                else
-                {
-                    row.LiveButton.Text = "Go Live";
-                    row.LiveButton.ForeColor = System.Drawing.Color.Gray;
-                    row.LiveButton.BackColor = System.Drawing.Color.FromArgb(50, 50, 60);
-                }
 
                 // Update mute button
                 if (isMuted)
@@ -3344,8 +3277,9 @@ public class PartylineControlPanel : UserControl
                     row.MuteButton.BackColor = System.Drawing.Color.FromArgb(70, 70, 85);
                 }
 
-                // Update row background
-                if (isLive)
+                // Row background reflects on-air state. Co-hosts are always live once
+                // connected, so "on air" == not muted (green); muted == off air (gray).
+                if (!isMuted)
                 {
                     row.RowPanel.BackColor = System.Drawing.Color.FromArgb(30, 70, 40);
                 }
@@ -3384,13 +3318,6 @@ public class PartylineControlPanel : UserControl
                 _meshStatusLabel.ForeColor = System.Drawing.Color.FromArgb(239, 68, 68);
                 _meshStatusLabel.BackColor = System.Drawing.Color.FromArgb(60, 30, 30);
             }
-        }
-
-        // Keep the Mic button in sync with the plugin's outbound mic state so the
-        // on-air/muted indicator stays correct if state changes outside a click.
-        if (_micButton != null)
-        {
-            UpdateMicButton(NewPlugin.IsMicOn);
         }
 
         for (int i = 0; i < _rows.Count; i++)
@@ -3505,7 +3432,6 @@ internal class CoHostRow
     private Panel _vuOuter;
     private Button _muteButton;
     private Button _kickButton;
-    private Button _liveButton;
     private Label _connectedIndicator;
     private Label _latencyLabel;
 
@@ -3543,12 +3469,6 @@ internal class CoHostRow
     {
         get { return _kickButton; }
         set { _kickButton = value; }
-    }
-
-    public Button LiveButton
-    {
-        get { return _liveButton; }
-        set { _liveButton = value; }
     }
 
     public Label ConnectedIndicator
@@ -4205,6 +4125,27 @@ public class WebRtcMeshClient
             return (int)Math.Round(d);
         }
         return 0;
+    }
+
+    /// <summary>
+    /// Publishes a single co-host's mute state to the server's latest-wins mute map
+    /// (POST /api/telemetry/mute-state/:slug). The co-host page reads its own entry
+    /// to flash the ON-AIR sign when the DJ unmutes it. Fire-and-forget.
+    /// </summary>
+    public void PublishMuteState(string peerId, bool muted)
+    {
+        if (string.IsNullOrEmpty(peerId)) return;
+        try
+        {
+            EnsureClients();
+            string url = _baseUrl.TrimEnd('/') + "/api/telemetry/mute-state/" + Uri.EscapeDataString(_slug);
+            string body = "{\"peerId\":\"" + EscapeJson(peerId) + "\",\"muted\":" + (muted ? "true" : "false") + "}";
+            HttpPost(url, body);
+        }
+        catch (Exception ex)
+        {
+            Log("PublishMuteState error: " + ex.Message);
+        }
     }
 
     private void Join()
