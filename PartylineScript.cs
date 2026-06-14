@@ -3452,7 +3452,34 @@ public class PartylineControlPanel : UserControl
         // disconnected (not just removed from the mix) and can reconnect cleanly.
         NewPlugin.KickPeer(cohostId);
 
-        UpdateRowState(cohostId);
+        // Remove the kicked co-host from the status line. (Do NOT repaint the row:
+        // the mixer entry is gone so it would read muted=false and paint green/on-air.)
+        RemoveRow(cohostId);
+    }
+
+    /// <summary>Removes a co-host's row from the status line and reflows the rest.</summary>
+    private void RemoveRow(string cohostId)
+    {
+        if (cohostId == null) return;
+        for (int i = 0; i < _rows.Count; i++)
+        {
+            if (_rows[i].CohostId == cohostId)
+            {
+                CoHostRow row = _rows[i];
+                try { if (row.RowPanel != null) { Controls.Remove(row.RowPanel); row.RowPanel.Dispose(); } } catch { }
+                _rows.RemoveAt(i);
+                break;
+            }
+        }
+        // Reflow remaining rows so there is no gap left behind.
+        int yOffset = 28;
+        for (int i = 0; i < _rows.Count; i++)
+        {
+            if (_rows[i].RowPanel != null)
+                _rows[i].RowPanel.Location = new System.Drawing.Point(4, yOffset);
+            yOffset += 28;
+        }
+        Height = yOffset + 4;
     }
 
     private void OnConfigureClick(object sender, EventArgs e)
