@@ -25,7 +25,7 @@ public class NewPlugin
     // endpoint is not user-configurable — the plugin always talks to this origin.
     private const string SignalingBaseUrl = "https://partyline.compressed.stream";
 
-    private static string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Partyline", "partyline.log");
+    private static string _logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Partyline", "partylinelog.txt");
     private SettingsManager _settingsManager = new SettingsManager();
     private string _stationName = "Partyline Co-Host";
     // Retained settings: the relay URL + station key are now REUSED to derive the

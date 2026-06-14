@@ -7,7 +7,7 @@ using Newtonsoft.Json.Linq;
 namespace Partyline.WebRtcHost
 {
     // Minimal ILogger that routes SIPSorcery's internal logging into our IPC log
-    // frames, so the plugin's partyline.log shows exactly why ICE gathering
+    // frames, so the plugin's partylinelog.txt shows exactly why ICE gathering
     // (STUN/TURN) succeeds or fails. Implemented against the Abstractions package
     // only (no concrete logging dependency).
     internal sealed class HostLoggerFactory : ILoggerFactory
