@@ -1026,10 +1026,23 @@ public class NewPlugin
             NewPlugin.SetCohostRemoteMic(peerId, false);
             Log("Co-host " + peerId + " connected -> live but muted.");
         }
-        else if (s == "failed" || s == "closed" || s == "disconnected")
+        else if (s == "disconnected")
+        {
+            // Transient ICE blip — NOT a teardown trigger. SIPSorcery may recover the
+            // pair (consent re-established) and return to "connected", or escalate to
+            // "failed" if it really died. Tearing down here (remove from mix + force a
+            // re-offer) is what produced the connect storm: a 1-2s blip would kill an
+            // otherwise-recoverable connection and kick off a fresh handshake. So we
+            // keep the peer in place and let it recover or fail on its own.
+            Log("Co-host " + peerId + " disconnected (transient) -> awaiting recovery.");
+        }
+        else if (s == "failed" || s == "closed")
         {
             bool ignored;
             _connectedPeers.TryRemove(peerId, out ignored);
+            // Let the signaling client rebuild on the next offer immediately instead
+            // of waiting out its negotiation grace window (this attempt is dead).
+            if (_webRtcMesh != null) _webRtcMesh.NotePeerTerminated(peerId);
             // Drop any stale quality reading so the strip doesn't show a dead peer.
             CohostNetStat removed;
             _cohostNetStats.TryRemove(peerId, out removed);
@@ -1178,10 +1191,24 @@ public class NewPlugin
         byte[] outBytes = new byte[outputSamples * 2];
         for (int i = 0; i < outputSamples; i++)
         {
-            // Nearest-sample resample dstRate -> srcRate index lookup.
-            int srcIdx = (int)((long)i * srcRate / dstRate);
-            if (srcIdx >= inputSamples) srcIdx = inputSamples - 1;
-            short s = pcm[srcIdx];
+            // Linear-interpolated resample srcRate -> dstRate. Nearest-sample (zero-order
+            // hold) on the 48k->44.1k ratio (~1.088) irregularly drops/duplicates samples,
+            // which adds audible aliasing ("scratchy"/harsh) on voice. Linear interpolation
+            // matches the outbound path (TryReadMainMixFrame) and is clean for program audio.
+            long pos = (long)i * srcRate;          // position in source, scaled by dstRate
+            int srcIdx = (int)(pos / dstRate);
+            int frac = (int)(pos % dstRate);       // 0..dstRate-1 fractional part
+            short s;
+            if (srcIdx >= inputSamples - 1)
+            {
+                s = pcm[inputSamples - 1];
+            }
+            else
+            {
+                short s0 = pcm[srcIdx];
+                short s1 = pcm[srcIdx + 1];
+                s = (short)(s0 + (int)(((long)(s1 - s0) * frac) / dstRate));
+            }
             outBytes[i * 2] = (byte)(s & 0xFF);
             outBytes[i * 2 + 1] = (byte)((s >> 8) & 0xFF);
         }
@@ -3213,6 +3240,8 @@ public class PartylineControlPanel : UserControl
     private SettingsManager _settingsManager;
     private int _pulseCounter;
     private Label _meshStatusLabel;
+    // Width of the brand-logo column down the left of the strip.
+    private const int LOGO_W = 56;
     public PartylineControlPanel(AudioMixer audioMixer, AuthenticationManager authManager, List<CoHostAccount> accounts, SettingsManager settingsManager)
     {
         _audioMixer = audioMixer;
@@ -3245,18 +3274,20 @@ public class PartylineControlPanel : UserControl
         Controls.Clear();
         _rows.Clear();
 
-        // Title panel with darker background (section header style)
+        // Title bar — offset to the right of the left logo column.
         Panel titlePanel = new Panel();
-        titlePanel.Dock = DockStyle.Top;
-        titlePanel.Height = 24;
+        titlePanel.Location = new System.Drawing.Point(LOGO_W, 0);
+        titlePanel.Size = new System.Drawing.Size(Math.Max(10, Width - LOGO_W), 24);
+        titlePanel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         titlePanel.BackColor = System.Drawing.Color.FromArgb(50, 50, 55);
 
+        // "Partyline" wordmark (kept alongside the left logo column).
         Label titleLabel = new Label();
         titleLabel.Text = "Partyline";
         titleLabel.ForeColor = System.Drawing.Color.White;
         titleLabel.Font = new System.Drawing.Font("Segoe UI", 11f, System.Drawing.FontStyle.Regular);
         titleLabel.Dock = DockStyle.Fill;
-        titleLabel.Padding = new Padding(2, 4, 0, 0);
+        titleLabel.Padding = new Padding(6, 4, 0, 0);
         titlePanel.Controls.Add(titleLabel);
 
         Button configBtn = new Button();
@@ -3289,16 +3320,34 @@ public class PartylineControlPanel : UserControl
 
         Controls.Add(titlePanel);
 
-        // 1px bottom border separator
+        // 1px bottom border separator (offset right of the logo column).
         Panel separator = new Panel();
-        separator.Dock = DockStyle.Top;
-        separator.Height = 1;
+        separator.Location = new System.Drawing.Point(LOGO_W, 24);
+        separator.Size = new System.Drawing.Size(Math.Max(10, Width - LOGO_W), 1);
+        separator.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         separator.BackColor = System.Drawing.Color.FromArgb(80, 80, 100);
         Controls.Add(separator);
 
-        // Since Dock=Top adds in reverse visual order, we set BringToFront
-        separator.BringToFront();
-        titlePanel.BringToFront();
+        // Brand logo: a tall column down the LEFT, spanning the title + co-host rows.
+        // Embedded as a manifest resource and loaded at runtime.
+        PictureBox logoBox = new PictureBox();
+        logoBox.SizeMode = PictureBoxSizeMode.Zoom;
+        logoBox.Location = new System.Drawing.Point(4, 4);
+        logoBox.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Bottom;
+        try
+        {
+            var asm = System.Reflection.Assembly.GetExecutingAssembly();
+            using (var ls = asm.GetManifestResourceStream("Partyline.logo.png"))
+            {
+                if (ls != null)
+                {
+                    using (var img = System.Drawing.Image.FromStream(ls))
+                        logoBox.Image = new System.Drawing.Bitmap(img);
+                }
+            }
+        }
+        catch { }
+        Controls.Add(logoBox);
 
         int yOffset = 28;
         for (int i = 0; i < _accounts.Count; i++)
@@ -3310,22 +3359,23 @@ public class PartylineControlPanel : UserControl
         }
 
         Height = yOffset + 4;
+        // Height is now known — size the logo column to span the full strip.
+        logoBox.Size = new System.Drawing.Size(LOGO_W - 8, Math.Max(20, Height - 8));
     }
 
     private CoHostRow CreateRow(CoHostAccount account, int yOffset)
     {
         CoHostRow row = new CoHostRow();
-        // The mesh/worker identity for a co-host is the published invite name
-        // (DisplayName ?? Username), which becomes their peerId — and therefore the
-        // key used by the AudioMixer, connection tracking, telemetry, and quality.
-        // Row id MUST match that (mirrors PublishInvitesOnce) or per-row VU/latency/
-        // connection/quality lookups silently miss.
-        row.CohostId = !string.IsNullOrEmpty(account.DisplayName) ? account.DisplayName : account.Username;
+        // Identity (peerId / mixer key) is the co-host's USER ID, matching the
+        // published invite name and the worker's session id. The display name is
+        // shown to the operator but is NOT the identity.
+        row.CohostId = !string.IsNullOrEmpty(account.Username) ? account.Username
+                       : (!string.IsNullOrEmpty(account.DisplayName) ? account.DisplayName : account.Hash);
 
-        // Row panel
+        // Row panel (offset right of the left logo column).
         Panel rowPanel = new Panel();
-        rowPanel.Location = new System.Drawing.Point(4, yOffset);
-        rowPanel.Size = new System.Drawing.Size(Width - 8, 26);
+        rowPanel.Location = new System.Drawing.Point(LOGO_W + 4, yOffset);
+        rowPanel.Size = new System.Drawing.Size(Math.Max(10, Width - LOGO_W - 8), 26);
         rowPanel.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top;
         rowPanel.BackColor = System.Drawing.Color.FromArgb(60, 60, 70);
         row.RowPanel = rowPanel;
@@ -3342,20 +3392,20 @@ public class PartylineControlPanel : UserControl
         rowPanel.Controls.Add(connIndicator);
         row.ConnectedIndicator = connIndicator;
 
-        // Display name label
+        // Display name label — full name, never truncated.
         Label nameLabel = new Label();
-        nameLabel.Text = account.DisplayName != null ? account.DisplayName : account.Username;
+        nameLabel.Text = !string.IsNullOrEmpty(account.DisplayName) ? account.DisplayName : account.Username;
         nameLabel.ForeColor = System.Drawing.Color.White;
         nameLabel.Font = new System.Drawing.Font("Segoe UI", 9.5f, System.Drawing.FontStyle.Bold);
-        nameLabel.Location = new System.Drawing.Point(66, 4);
-        nameLabel.Size = new System.Drawing.Size(80, 20);
-        nameLabel.AutoEllipsis = true;
+        nameLabel.Location = new System.Drawing.Point(64, 5);
+        nameLabel.AutoSize = true;
+        nameLabel.AutoEllipsis = false;
         rowPanel.Controls.Add(nameLabel);
         _toolTip.SetToolTip(nameLabel, "Co-host display name");
 
         // VU meter container (outer panel)
         Panel vuOuter = new Panel();
-        vuOuter.Location = new System.Drawing.Point(148, 6);
+        vuOuter.Location = new System.Drawing.Point(176, 6);
         vuOuter.Size = new System.Drawing.Size(60, 14);
         vuOuter.BackColor = System.Drawing.Color.FromArgb(40, 40, 50);
         rowPanel.Controls.Add(vuOuter);
@@ -3375,17 +3425,19 @@ public class PartylineControlPanel : UserControl
         latencyLabel.Text = "";
         latencyLabel.ForeColor = System.Drawing.Color.White;
         latencyLabel.Font = new System.Drawing.Font("Segoe UI", 8f);
-        latencyLabel.Location = new System.Drawing.Point(212, 5);
+        latencyLabel.Location = new System.Drawing.Point(240, 5);
         latencyLabel.Size = new System.Drawing.Size(130, 16);
         latencyLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
         rowPanel.Controls.Add(latencyLabel);
         row.LatencyLabel = latencyLabel;
 
-        // Mute button (anchored to right)
+        // GO LIVE / MUTE toggle. Grey "GO LIVE" while the co-host is off air; press
+        // to put them live (turns red, label becomes "MUTE"); press again to take
+        // them off air (turns grey, label back to "GO LIVE"). State set in UpdateRowState.
         Button muteBtn = new Button();
-        muteBtn.Text = "Mute";
+        muteBtn.Text = "GO LIVE";
         muteBtn.FlatStyle = FlatStyle.Flat;
-        muteBtn.Size = new System.Drawing.Size(50, 22);
+        muteBtn.Size = new System.Drawing.Size(66, 22);
         muteBtn.Font = new System.Drawing.Font("Segoe UI", 7.5f);
         muteBtn.ForeColor = System.Drawing.Color.White;
         muteBtn.BackColor = System.Drawing.Color.FromArgb(70, 70, 85);
@@ -3396,7 +3448,7 @@ public class PartylineControlPanel : UserControl
         muteBtn.Click += OnMuteClick;
         rowPanel.Controls.Add(muteBtn);
         row.MuteButton = muteBtn;
-        _toolTip.SetToolTip(muteBtn, "Mute/unmute co-host audio");
+        _toolTip.SetToolTip(muteBtn, "Put co-host on air / take off air");
 
         // Kick button (anchored to right)
         Button kickBtn = new Button();
@@ -3417,7 +3469,7 @@ public class PartylineControlPanel : UserControl
 
         // Position buttons from right edge
         int rightEdge = rowPanel.Width;
-        kickBtn.Location = new System.Drawing.Point(rightEdge - 64, 2);
+        kickBtn.Location = new System.Drawing.Point(rightEdge - 46, 2);
         muteBtn.Location = new System.Drawing.Point(rightEdge - 118, 2);
 
         Controls.Add(rowPanel);
@@ -3476,7 +3528,7 @@ public class PartylineControlPanel : UserControl
         for (int i = 0; i < _rows.Count; i++)
         {
             if (_rows[i].RowPanel != null)
-                _rows[i].RowPanel.Location = new System.Drawing.Point(4, yOffset);
+                _rows[i].RowPanel.Location = new System.Drawing.Point(LOGO_W + 4, yOffset);
             yOffset += 28;
         }
         Height = yOffset + 4;
@@ -3497,16 +3549,16 @@ public class PartylineControlPanel : UserControl
             {
                 bool isMuted = _audioMixer.GetMuted(cohostId);
 
-                // Update mute button
+                // GO LIVE (grey) when off air; MUTE (red) when live to air.
                 if (isMuted)
                 {
-                    row.MuteButton.Text = "Unmute";
-                    row.MuteButton.BackColor = System.Drawing.Color.FromArgb(180, 120, 30);
+                    row.MuteButton.Text = "GO LIVE";
+                    row.MuteButton.BackColor = System.Drawing.Color.FromArgb(70, 70, 85);
                 }
                 else
                 {
-                    row.MuteButton.Text = "Mute";
-                    row.MuteButton.BackColor = System.Drawing.Color.FromArgb(70, 70, 85);
+                    row.MuteButton.Text = "MUTE";
+                    row.MuteButton.BackColor = System.Drawing.Color.FromArgb(200, 60, 60);
                 }
 
                 // Row background reflects on-air state. Co-hosts are always live once
@@ -3669,6 +3721,8 @@ internal class CoHostRow
     private Panel _vuFill;
     private Panel _vuOuter;
     private Button _muteButton;
+    private Button _micOnButton;
+    private Button _micOffButton;
     private Button _kickButton;
     private Label _connectedIndicator;
     private Label _latencyLabel;
@@ -3701,6 +3755,18 @@ internal class CoHostRow
     {
         get { return _muteButton; }
         set { _muteButton = value; }
+    }
+
+    public Button MicOnButton
+    {
+        get { return _micOnButton; }
+        set { _micOnButton = value; }
+    }
+
+    public Button MicOffButton
+    {
+        get { return _micOffButton; }
+        set { _micOffButton = value; }
     }
 
     public Button KickButton
@@ -4227,7 +4293,7 @@ public class WebRtcMeshClient
                     + " (re-enter the co-host password in Configure to publish its link).");
                 continue;
             }
-            string name = !string.IsNullOrEmpty(a.DisplayName) ? a.DisplayName : a.Username;
+            string name = !string.IsNullOrEmpty(a.Username) ? a.Username : a.DisplayName;
             if (string.IsNullOrEmpty(name)) name = a.Hash;
             // The invite id IS the short 6-char code used in the co-host URL.
             string code = NewPlugin.CohostCode(a.Hash);
@@ -4437,6 +4503,30 @@ public class WebRtcMeshClient
     private const int OfferCooldownMs = 8000;
     private readonly ConcurrentDictionary<string, int> _lastOfferAt = new ConcurrentDictionary<string, int>();
 
+    // Inbound-offer (answerer side) negotiation guard. The remote peer re-creates
+    // its RTCPeerConnection and re-offers every few seconds while a link is slow to
+    // come up. Tearing our half-built connection down on each offer restarts ICE
+    // from scratch, so the ~3 s handshake never finishes -> a connect storm. We
+    // record when we last (re)built a connection for a peer and, while that attempt
+    // is still inside the grace window (and not yet declared dead), ignore further
+    // offers so the in-flight negotiation has time to reach "connected". The window
+    // is a touch under the browser's 12 s watchdog so we are ready to rebuild right
+    // as it re-offers if the first attempt is genuinely lost.
+    private const int NegotiationGraceMs = 10000;
+    private readonly ConcurrentDictionary<string, int> _negotiationStartedAt = new ConcurrentDictionary<string, int>();
+
+    /// <summary>
+    /// Called by the host when a peer's WebRTC connection reaches a terminal state
+    /// (failed/closed/disconnected) so the next inbound offer rebuilds immediately
+    /// instead of waiting out the negotiation grace window.
+    /// </summary>
+    public void NotePeerTerminated(string peerId)
+    {
+        if (string.IsNullOrEmpty(peerId)) return;
+        int ignored;
+        _negotiationStartedAt.TryRemove(peerId, out ignored);
+    }
+
     /// <summary>
     /// Offer to a roster peer when we are its initiator and we are NOT already
     /// connected to it. This both makes the first connection AND re-establishes one
@@ -4604,13 +4694,34 @@ public class WebRtcMeshClient
             string sdp = ExtractJsonValue(payload, "sdp");
             if (from == null || sdp == null) return;
             _knownPeers[from] = 1;
-            // A fresh offer means the remote wants a new session. If we are holding a
-            // stale (failed/old) peer connection for them — e.g. this DJ just rejoined
-            // and the co-host is re-offering — tear it down first so we answer on a
-            // clean connection instead of a dead one (CreatePeerConnection no-ops if a
-            // connection already exists).
-            if (!NewPlugin.IsPeerConnected(from)) _peer.ClosePeerConnection(from);
+
+            // Glare/storm guard. The remote re-creates its peer connection and
+            // re-offers periodically while a link is slow to establish. If we are
+            // already connected, or actively negotiating a RECENT attempt, ignore the
+            // re-offer and let the in-flight negotiation complete — tearing it down on
+            // every offer restarts ICE and the handshake never finishes. We only
+            // (re)build when there is no live attempt: no connection AND no negotiation
+            // inside the grace window (the window is cleared early via NotePeerTerminated
+            // when a connection is declared dead, so genuine reconnects are not blocked).
+            int nowTick = Environment.TickCount;
+            bool connected = NewPlugin.IsPeerConnected(from);
+            int startedAt;
+            bool negotiatingRecently = _negotiationStartedAt.TryGetValue(from, out startedAt)
+                && (nowTick - startedAt) >= 0 && (nowTick - startedAt) < NegotiationGraceMs;
+
+            if (connected || negotiatingRecently)
+            {
+                Log("Ignoring re-offer from " + from + " ("
+                    + (connected ? "already connected" : "negotiation in progress") + ").");
+                return;
+            }
+
+            // No live/recent attempt — answer on a clean connection. ClosePeerConnection
+            // is a no-op when nothing exists; it clears a stale/dead one so we negotiate
+            // fresh rather than on top of a dead session.
+            _peer.ClosePeerConnection(from);
             _peer.CreatePeerConnection(from);
+            _negotiationStartedAt[from] = nowTick;
             _peer.ApplyRemoteDescription(from, "offer", sdp);
             string answer = _peer.CreateAnswer(from);
             if (answer != null)
@@ -4646,6 +4757,7 @@ public class WebRtcMeshClient
             _knownPeers.TryRemove(from, out ignored);
             int lastIgnored;
             _lastOfferAt.TryRemove(from, out lastIgnored);
+            _negotiationStartedAt.TryRemove(from, out lastIgnored);
             _peer.ClosePeerConnection(from);
             Log("Peer left: " + from);
         }
@@ -5897,6 +6009,11 @@ namespace Partyline.WebRtc
         private const int MaxDecodeSamples = 5760;      // 120 ms @ 48 kHz mono (max Opus frame)
         private const int OpusPayloadId = 111;          // dynamic payload type used by browsers for Opus
         private const int SdpTimeoutMs = 10000;
+        // Bitrate (bits/sec) for the studio program feed encoded here and sent to
+        // co-hosts ("inbound studio audio" on their side). Kept low — it is a
+        // talk-over monitor feed, not a broadcast master. Independent of each
+        // co-host's outbound mic, which is encoded in their browser.
+        private const int StudioFeedBitrate = 24000;    // 24 kbps mono monitor feed
 
         private readonly object _sync = new object();
         private readonly Dictionary<string, PeerEntry> _peers = new Dictionary<string, PeerEntry>();
@@ -6282,6 +6399,13 @@ namespace Partyline.WebRtc
             try
             {
                 _encoder = OpusEncoder.Create(OpusSampleRate, 1, OpusApplication.OPUS_APPLICATION_VOIP);
+                // The studio program feed sent to co-hosts is monitor-quality only:
+                // co-hosts just need to hear the mix clearly enough to talk over it,
+                // not re-broadcast it. Cap the bitrate well below Opus' mono auto
+                // rate to save the studio's uplink bandwidth. This is independent of
+                // each co-host's OUTBOUND voice (encoded in their browser), so it does
+                // not affect how fast/clean their mic reaches air. Tunable.
+                try { _encoder.Bitrate = StudioFeedBitrate; } catch { }
             }
             catch (Exception ex)
             {

@@ -55,6 +55,16 @@
     <Compile Remove="PartylineStatusStrip.cs" />
   </ItemGroup>
 
+  <!-- Brand logo shown in the control-panel header. Embedded as a manifest
+       resource (LogicalName "Partyline.logo.png") and loaded at runtime via
+       Assembly.GetManifestResourceStream. -->
+  <ItemGroup>
+    <EmbeddedResource Include="logo.png">
+      <LogicalName>Partyline.logo.png</LogicalName>
+      <Visible>false</Visible>
+    </EmbeddedResource>
+  </ItemGroup>
+
   <!--
     Single-file packaging: Costura.Fody embeds all copy-local managed dependency
     DLLs (SIPSorcery, Concentus, Newtonsoft.Json, and their managed closure:

@@ -71,7 +71,14 @@ namespace Partyline.WebRtcHost
             var config = new RTCConfiguration();
             config.iceServers = new List<RTCIceServer>();
             int stunKept = 0, turnKept = 0;
-            const int MaxStun = 1, MaxTurn = 2;
+            // Keep more TURN transports than before. Mobile / CGNAT networks (e.g. an
+            // iPhone on cellular) frequently block plain UDP, so a UDP-only relay never
+            // forms a candidate pair. We now retain TLS (turns:) and TCP relays too, and
+            // prioritise them ahead of UDP so the firewall-friendly transports are never
+            // the ones dropped by the cap.
+            const int MaxStun = 1, MaxTurn = 3;
+
+            var turnCandidates = new List<KeyValuePair<int, RTCIceServer>>(); // (priority, server)
             if (iceServers != null)
             {
                 for (int i = 0; i < iceServers.Length; i++)
@@ -82,23 +89,44 @@ namespace Partyline.WebRtcHost
                     {
                         string url = s.Urls[u];
                         if (string.IsNullOrEmpty(url)) continue;
-                        bool isTurn = url.StartsWith("turn:", StringComparison.OrdinalIgnoreCase)
-                                   || url.StartsWith("turns:", StringComparison.OrdinalIgnoreCase);
-                        if (isTurn) { if (turnKept >= MaxTurn) continue; turnKept++; }
-                        else { if (stunKept >= MaxStun) continue; stunKept++; }
+                        bool isTurns = url.StartsWith("turns:", StringComparison.OrdinalIgnoreCase);
+                        bool isTurn = isTurns || url.StartsWith("turn:", StringComparison.OrdinalIgnoreCase);
 
                         // Resolve the STUN/TURN hostname to an IP ourselves (OS resolver)
                         // so SIPSorcery never relies on its DnsClient auto-detection, which
-                        // often fails on Windows and leaves it gathering ONLY host candidates.
-                        string resolved = ResolveIceHostToIp(url);
+                        // often fails on Windows and leaves it gathering ONLY host
+                        // candidates. EXCEPTION: leave turns: (TLS) as a hostname so the
+                        // server certificate still validates against its name.
+                        string resolved = isTurns ? url : ResolveIceHostToIp(url);
 
                         var srv = new RTCIceServer();
                         srv.urls = resolved;
                         if (s.Username != null) srv.username = s.Username;
                         if (s.Credential != null) srv.credential = s.Credential;
-                        config.iceServers.Add(srv);
+
+                        if (isTurn)
+                        {
+                            bool isTcp = url.IndexOf("transport=tcp", StringComparison.OrdinalIgnoreCase) >= 0;
+                            // Lower = higher priority: TLS first, then TCP, then UDP.
+                            int prio = isTurns ? 0 : (isTcp ? 1 : 2);
+                            turnCandidates.Add(new KeyValuePair<int, RTCIceServer>(prio, srv));
+                        }
+                        else
+                        {
+                            if (stunKept >= MaxStun) continue;
+                            stunKept++;
+                            config.iceServers.Add(srv);
+                        }
                     }
                 }
+            }
+
+            // Keep the highest-priority TURN transports (TLS/TCP before UDP) up to the cap.
+            turnCandidates.Sort((a, b) => a.Key.CompareTo(b.Key));
+            for (int i = 0; i < turnCandidates.Count && turnKept < MaxTurn; i++)
+            {
+                config.iceServers.Add(turnCandidates[i].Value);
+                turnKept++;
             }
 
             List<PeerEntry> existing;
@@ -113,6 +141,20 @@ namespace Partyline.WebRtcHost
                 catch (Exception ex) { HostLog.Write("[SIPSorcery] setConfiguration failed for " + existing[i].PeerId + ": " + ex.Message); }
             }
             HostLog.Write("[SIPSorcery] Applied " + config.iceServers.Count + " ICE server entries (capped: " + stunKept + " STUN, " + turnKept + " TURN).");
+            // Per-server detail so TURN auth issues (e.g. Cloudflare "Create Permission
+            // error") can be diagnosed: log each URL plus whether a username/credential
+            // is present and the credential length. Values themselves are not logged.
+            for (int i = 0; i < config.iceServers.Count; i++)
+            {
+                RTCIceServer srv = config.iceServers[i];
+                string urls = srv.urls != null ? srv.urls.ToString() : "(null)";
+                bool hasUser = !string.IsNullOrEmpty(srv.username);
+                bool hasCred = !string.IsNullOrEmpty(srv.credential);
+                int credLen = srv.credential != null ? srv.credential.Length : 0;
+                HostLog.Write("[SIPSorcery]   ICE[" + i + "] " + urls
+                    + " user=" + (hasUser ? "yes" : "NO")
+                    + " cred=" + (hasCred ? ("yes(" + credLen + ")") : "NO"));
+            }
         }
 
         // --- Connection lifecycle -------------------------------------------
@@ -524,7 +566,7 @@ namespace Partyline.WebRtcHost
                 case RTCPeerConnectionState.connecting: return "connecting";
                 case RTCPeerConnectionState.connected: return "connected";
                 case RTCPeerConnectionState.failed: return "failed";
-                case RTCPeerConnectionState.disconnected: return "failed";
+                case RTCPeerConnectionState.disconnected: return "disconnected";
                 case RTCPeerConnectionState.closed: return "closed";
                 default: return s.ToString().ToLowerInvariant();
             }
