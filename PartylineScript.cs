@@ -3240,8 +3240,8 @@ public class PartylineControlPanel : UserControl
     private SettingsManager _settingsManager;
     private int _pulseCounter;
     private Label _meshStatusLabel;
-    // Width of the brand-logo column down the left of the strip.
-    private const int LOGO_W = 56;
+    // No logo column (set to 0): the title and rows span the full width.
+    private const int LOGO_W = 0;
     public PartylineControlPanel(AudioMixer audioMixer, AuthenticationManager authManager, List<CoHostAccount> accounts, SettingsManager settingsManager)
     {
         _audioMixer = audioMixer;
@@ -3328,27 +3328,6 @@ public class PartylineControlPanel : UserControl
         separator.BackColor = System.Drawing.Color.FromArgb(80, 80, 100);
         Controls.Add(separator);
 
-        // Brand logo: a tall column down the LEFT, spanning the title + co-host rows.
-        // Embedded as a manifest resource and loaded at runtime.
-        PictureBox logoBox = new PictureBox();
-        logoBox.SizeMode = PictureBoxSizeMode.Zoom;
-        logoBox.Location = new System.Drawing.Point(4, 4);
-        logoBox.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Bottom;
-        try
-        {
-            var asm = System.Reflection.Assembly.GetExecutingAssembly();
-            using (var ls = asm.GetManifestResourceStream("Partyline.logo.png"))
-            {
-                if (ls != null)
-                {
-                    using (var img = System.Drawing.Image.FromStream(ls))
-                        logoBox.Image = new System.Drawing.Bitmap(img);
-                }
-            }
-        }
-        catch { }
-        Controls.Add(logoBox);
-
         int yOffset = 28;
         for (int i = 0; i < _accounts.Count; i++)
         {
@@ -3359,8 +3338,6 @@ public class PartylineControlPanel : UserControl
         }
 
         Height = yOffset + 4;
-        // Height is now known — size the logo column to span the full strip.
-        logoBox.Size = new System.Drawing.Size(LOGO_W - 8, Math.Max(20, Height - 8));
     }
 
     private CoHostRow CreateRow(CoHostAccount account, int yOffset)
@@ -3593,8 +3570,8 @@ public class PartylineControlPanel : UserControl
             else if (NewPlugin.IsMeshConnected)
             {
                 _meshStatusLabel.Text = "\u25CF Mesh";
-                _meshStatusLabel.ForeColor = System.Drawing.Color.FromArgb(34, 197, 94);
-                _meshStatusLabel.BackColor = System.Drawing.Color.FromArgb(20, 50, 30);
+                _meshStatusLabel.ForeColor = System.Drawing.Color.White;
+                _meshStatusLabel.BackColor = System.Drawing.Color.FromArgb(34, 197, 94);
             }
             else
             {

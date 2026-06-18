@@ -1,0 +1,18 @@
+{
+  "Title": "Partyline Co-Host",
+  "Label": "Partyline",
+  "ShortDescription": "Bring remote co-hosts, guests and roving reporters on air from any browser — broadcast-quality, low-latency WebRTC audio routed straight into PlayIt Live.",
+  "LongDescription": [
+    "Partyline brings remote co-hosts, guests and roving reporters into your live show with broadcast-quality, low-latency audio — peer-to-peer, zero install, no port forwarding.",
+    "",
+    "Documentation: https://partyline.compressed.stream"
+  ],
+  "AppVersionSpec": "1002+",
+  "AutoStart": true,
+  "UninstallKeepFiles": "partyline.dat",
+  "MachineCode": "",
+  "MachineName": "",
+  "Application": "421eba4e-86ba-46cd-a489-5706225a69c5",
+  "Product": "421eba4e-86ba-46cd-a489-5706225a69c5",
+  "Version": "0.9"
+}
